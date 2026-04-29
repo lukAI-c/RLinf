@@ -111,6 +111,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_uninavid(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.uninavid import get_model
+
+        return get_model(cfg, torch_dtype)
+
     register_model(
         SupportedModel.OPENVLA.value,
         _build_openvla,
@@ -186,6 +191,12 @@ def _register_builtin_models():
     register_model(
         SupportedModel.VALUE_MODEL.value,
         _build_value_model,
+        category="embodied",
+        force=True,
+    )
+    register_model(
+        "uninavid",
+        _build_uninavid,
         category="embodied",
         force=True,
     )

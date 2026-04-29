@@ -1,0 +1,24 @@
+model_type: "uninavid"
+
+model_path: /home/nvme03/lck/genark/model_zoo/uninavid-7b-full-224-video-fps-1-grid-2
+
+precision: "bf16"
+
+# UniNaVid genark source path (for importing the uninavid package)
+uninavid_src_path: "/home/nvme03/lck/genark"
+
+# Inference params — match original genark/configs/uninavid_r2r.yaml GENERATE block
+conv_mode: "vicuna_v1"
+max_new_tokens: 1024
+temperature: 0.5
+do_sample: true
+
+num_action_chunks: 1
+chunk_size: 16          # max envs per batched LLM generate() call (lower = less VRAM, more calls)
+action_dim: 1          # discrete 4-way nav action encoded as single int
+is_lora: false
+attn_implementation: "eager"
+trust_remote_code: true
+
+# Step 3b (training) — not yet implemented
+add_value_head: false

@@ -291,6 +291,13 @@ def prepare_actions(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,
         )
+    elif env_type == SupportedEnvType.GENARK:
+        # Navigation: discrete 4-way action, shape (N, num_action_chunks) → (N,)
+        # UniNaVid outputs int64 scalar per env; take the first chunk action.
+        if hasattr(raw_chunk_actions, "squeeze"):
+            chunk_actions = raw_chunk_actions[:, 0] if raw_chunk_actions.ndim == 2 else raw_chunk_actions
+        else:
+            chunk_actions = np.array(raw_chunk_actions)[:, 0] if np.ndim(raw_chunk_actions) == 2 else np.array(raw_chunk_actions)
     else:
         chunk_actions = raw_chunk_actions
 

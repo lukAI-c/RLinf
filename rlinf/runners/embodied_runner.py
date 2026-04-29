@@ -140,7 +140,8 @@ class EmbodiedRunner:
 
         rollout_handle.wait()
         env_handle.wait()
-        self.actor.init_worker().wait()
+        if self.actor is not None:
+            self.actor.init_worker().wait()
 
         resume_dir = self.cfg.runner.get("resume_dir", None)
         if resume_dir is None:
@@ -266,6 +267,30 @@ class EmbodiedRunner:
         return aggregated_metrics, ranked_metrics_list
 
     def run(self):
+        if self.cfg.runner.get("only_eval", False):
+            eval_metrics = self.evaluate()
+            eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
+            self.metric_logger.log(data=eval_metrics, step=0)
+
+            # Save JSON results (mirrors original GenArk avg_metrics.json)
+            import json, os
+            log_path = self.cfg.runner.logger.get("log_path", ".")
+            os.makedirs(log_path, exist_ok=True)
+            json_path = os.path.join(log_path, "avg_metrics.json")
+            json_data = {k: float(v) if hasattr(v, "item") else v
+                         for k, v in eval_metrics.items()}
+            with open(json_path, "w") as f:
+                json.dump(json_data, f, indent=2)
+            print(f"\n[RLinf] Eval metrics saved → {json_path}", flush=True)
+            for k, v in json_data.items():
+                print(f"  {k}: {v}", flush=True)
+
+            self.metric_logger.finish()
+            self.stop_logging = True
+            self.log_queue.join()
+            self.log_thread.join(timeout=1.0)
+            return
+
         start_step = self.global_step
         start_time = time.time()
         for _step in range(start_step, self.max_steps):

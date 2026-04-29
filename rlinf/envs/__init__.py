@@ -32,6 +32,7 @@ class SupportedEnvType(Enum):
     EMBODICHAIN = "embodichain"
     ROBOVERSE = "roboverse"
     D4RL = "d4rl"
+    GENARK = "genark"
 
 
 def get_env_cls(env_type: str, env_cfg=None):
@@ -128,5 +129,9 @@ def get_env_cls(env_type: str, env_cfg=None):
         from rlinf.envs.d4rl.d4rl_env import D4RLEnv
 
         return D4RLEnv
+    elif env_type == SupportedEnvType.GENARK:
+        from rlinf.envs.genark.genark_env import GenarkVecEnv
+
+        return GenarkVecEnv
     else:
         raise NotImplementedError(f"Environment type {env_type} not implemented")

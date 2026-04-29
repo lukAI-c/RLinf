@@ -41,30 +41,33 @@ def main(cfg) -> None:
     )
     component_placement = HybridComponentPlacement(cfg, cluster)
 
-    # Create actor worker group
-    actor_placement = component_placement.get_strategy("actor")
-
-    if cfg.algorithm.loss_type == "embodied_sac":
-        from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
-
-        actor_worker_cls = EmbodiedSACFSDPPolicy
-    elif cfg.algorithm.loss_type == "embodied_dagger":
-        from rlinf.workers.actor.fsdp_dagger_policy_worker import (
-            EmbodiedDAGGERFSDPPolicy,
-        )
-
-        actor_worker_cls = EmbodiedDAGGERFSDPPolicy
-    elif cfg.algorithm.loss_type == "embodied_nft":
-        from rlinf.workers.actor.fsdp_nft_policy_worker import EmbodiedNFTFSDPPolicy
-
-        actor_worker_cls = EmbodiedNFTFSDPPolicy
+    # Create actor worker group (skipped in eval-only mode)
+    only_eval = cfg.runner.get("only_eval", False)
+    if only_eval:
+        actor_group = None
     else:
-        from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+        actor_placement = component_placement.get_strategy("actor")
+        if cfg.algorithm.loss_type == "embodied_sac":
+            from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
 
-        actor_worker_cls = EmbodiedFSDPActor
-    actor_group = actor_worker_cls.create_group(cfg).launch(
-        cluster, name=cfg.actor.group_name, placement_strategy=actor_placement
-    )
+            actor_worker_cls = EmbodiedSACFSDPPolicy
+        elif cfg.algorithm.loss_type == "embodied_dagger":
+            from rlinf.workers.actor.fsdp_dagger_policy_worker import (
+                EmbodiedDAGGERFSDPPolicy,
+            )
+
+            actor_worker_cls = EmbodiedDAGGERFSDPPolicy
+        elif cfg.algorithm.loss_type == "embodied_nft":
+            from rlinf.workers.actor.fsdp_nft_policy_worker import EmbodiedNFTFSDPPolicy
+
+            actor_worker_cls = EmbodiedNFTFSDPPolicy
+        else:
+            from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+
+            actor_worker_cls = EmbodiedFSDPActor
+        actor_group = actor_worker_cls.create_group(cfg).launch(
+            cluster, name=cfg.actor.group_name, placement_strategy=actor_placement
+        )
 
     # Create rollout worker group
     rollout_placement = component_placement.get_strategy("rollout")

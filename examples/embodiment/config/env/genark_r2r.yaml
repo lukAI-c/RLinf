@@ -1,0 +1,40 @@
+env_type: genark
+
+seed: 0
+group_size: 1
+reward_coef: 1.0
+use_rel_reward: True
+total_num_envs: null
+auto_reset: True
+ignore_terminations: False
+max_steps_per_rollout_epoch: 1200  # 500 steps/ep × num_envs buffer, ensures episodes complete
+max_episode_steps: 500
+
+# Video recording (used by RLinf env worker)
+video_cfg:
+  save_video: True
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+# Genesis simulator params (mirror genark configs/uninavid_r2r.yaml)
+camera_height: 1.25
+step_move: 0.25
+step_turn: 0.5236  # 30 degrees in radians
+allow_sliding: true
+max_step_height: 0.5
+agent_radius: 0.18
+light_scale: 4.0
+fov: 105
+cam_res: [640, 480]
+max_seq_len: 256
+
+# Multi-pass scene traversal offset (rank i picks unique_scenes[(scene_offset+i) % N])
+scene_offset: 0
+
+# Task params
+success_distance: 3.0
+success_bonus: 2.5
+
+init_params:
+  episodes_file: /home/nvme03/lck/genark/data/datasets/OpenNav_R2R-CE_100_bertidx.json
+  scene_datasets: /home/nvme03/lck/genark/scene_datasets
+  glb_cache_dir: /home/clk/workspace/genark/glb_cache
