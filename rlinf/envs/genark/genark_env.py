@@ -286,8 +286,27 @@ class GenarkVecEnv(gym.Env):
         self.success_distance = float(getattr(cfg, "success_distance", 3.0))
         self.success_bonus   = float(getattr(cfg, "success_bonus",   2.5))
         self.use_rel_reward  = bool( getattr(cfg, "use_rel_reward",  True))
+        # Reward mode: "geo_progress" (default, dense d2g delta + success_bonus on stop)
+        #              "ndtw_sr_delta" (per-step nDTW delta + per-step SR delta — RFT)
+        # See docs/genark_rft_caveats.md C4-C6 for known issues with ndtw_sr_delta.
+        self.reward_mode     = str(getattr(cfg, "reward_mode", "geo_progress"))
+        self.ndtw_coef       = float(getattr(cfg, "ndtw_coef", 1.0))
+        self.sr_coef         = float(getattr(cfg, "sr_coef",   10.0))
+        # Format reward: added each step when policy outputs valid JSON (action 0-3).
+        # action=4 (ACTION_PARSE_FAIL sentinel) means parse failed → no format reward.
+        # Breaks cold-start: model learns to output valid JSON before learning navigation.
+        self.format_reward_coef = float(getattr(cfg, "format_reward_coef", 0.0))
+        # 4-direction rendering: when True, in addition to the front view stored
+        # in `main_images`, also render left/right/behind and put them in
+        # `extra_view_images` shape (num_envs, 3, H, W, 3) uint8.
+        # 3× extra render cost per step. Required for QwenNavPolicy lavira-style
+        # 4-dir prompt (see docs/genark_rft_caveats.md C10).
+        self.enable_4dir_render = bool(getattr(cfg, "enable_4dir_render", False))
         self.max_episode_steps = int(getattr(cfg, "max_episode_steps", 500))
         self.auto_reset      = bool( getattr(cfg, "auto_reset",      True))
+        # GRPO: how many envs share one episode. group_size envs get the same
+        # instruction/start so their rewards are comparable within the group.
+        self.group_size      = int(  getattr(cfg, "group_size",       1))
 
         # --- observation params ---
         cam_res              = tuple(getattr(cfg, "cam_res", (640, 480)))
@@ -334,6 +353,11 @@ class GenarkVecEnv(gym.Env):
         self._episodes        = [None] * num_envs
         self._pred_path_lists = [[] for _ in range(num_envs)]
         self._distances_lists = [[] for _ in range(num_envs)]
+        # ndtw_sr_delta reward mode: track per-env previous-step nDTW and SR
+        self._prev_ndtw       = np.zeros(num_envs, dtype=np.float32)
+        self._prev_sr         = np.zeros(num_envs, dtype=np.float32)
+        # 4-dir extras: (num_envs, 3, H, W, 3) uint8 numpy — order [left, right, behind]
+        self._current_rgb_extras = None
         self._stop_called     = [False] * num_envs
         self._current_rgb     = None     # cached last RGB (CPU numpy)
 
@@ -487,12 +511,13 @@ class GenarkVecEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _assign_episodes_to_envs(self, env_idx: Optional[list[int]] = None):
-        """Assign episodes 1:1 to active slots at init. Ghost slots get None."""
+        """Assign episodes to slots. With group_size>1, every group_size consecutive
+        slots share the same episode so GRPO can compare rewards within a group."""
         indices = list(range(self.num_envs)) if env_idx is None else env_idx
-        for slot_pos, i in enumerate(indices):
+        for i in indices:
             if not self._slot_active[i]:
                 continue  # ghost slot — no episode assigned
-            ep_idx = i  # slot i → episode index i (deterministic 1:1)
+            ep_idx = i // self.group_size  # group_size envs share one episode
             if ep_idx < len(self._all_episodes):
                 self._episodes[i] = self._all_episodes[ep_idx]
                 self._instructions[i] = (
@@ -515,6 +540,15 @@ class GenarkVecEnv(gym.Env):
             env_idx = [int(env_idx)]
         else:
             env_idx = list(env_idx)
+
+        # Reset exhaustion flags for the envs being reset so episodes can replay.
+        # _slot_done[i] must be cleared before _assign_episodes_to_envs so that
+        # the exhaustion check in step() doesn't immediately re-enter dormant mode.
+        for i in env_idx:
+            self._slot_done[i] = False
+        if all(not self._slot_done[i] for i in range(self.num_envs)
+               if self._slot_active[i]):
+            self._exhausted = False
 
         self._assign_episodes_to_envs(env_idx)
 
@@ -590,6 +624,9 @@ class GenarkVecEnv(gym.Env):
             self._distances_lists[i] = [d]
             self._pred_path_lists[i] = [init_hab[i].cpu().numpy()]
             self._prev_geo_dist[i]   = d
+            # ndtw_sr_delta mode: reset per-env previous nDTW/SR (initial path = single point → nDTW=1.0)
+            self._prev_ndtw[i] = 1.0
+            self._prev_sr[i]   = 0.0
 
         _update_camera(self._cam, self._cam_pos[:self._active_slot_count], self._cam_yaw[:self._active_slot_count])
 
@@ -618,11 +655,16 @@ class GenarkVecEnv(gym.Env):
         else:
             actions = actions.to(device=device, dtype=torch.long)
 
-        # Mask out done/ghost slots — force STOP so physics skips them
+        # Detect parse-fail sentinel (ACTION_PARSE_FAIL=4) BEFORE clamping.
+        # parse_ok_mask[i]=True means policy output valid JSON for env i.
+        parse_ok_mask = (actions < 4)
+
+        # Clamp parse-fail sentinel to STOP and mask out done/ghost slots
+        actions = actions.clone()
+        actions[actions >= 4] = self.STOP  # treat parse-fail as STOP
         done_or_ghost = torch.tensor(
             self._slot_done | ~self._slot_active, dtype=torch.bool, device=device
         )
-        actions = actions.clone()
         actions[done_or_ghost] = self.STOP
 
         # Only increment elapsed_steps for active+undone slots
@@ -711,6 +753,9 @@ class GenarkVecEnv(gym.Env):
             rgb_batch = rgb_active
         self._current_rgb = rgb_batch.cpu().numpy()  # (num_envs, H, W, 3) uint8
 
+        # 4-dir: render 3 additional views (left/right/behind) and store
+        self._render_extra_3dir()
+
         # --- Metrics ---
         # Metrics only for active slots (geometry tensors are num_envs-shaped but
         # only [:active_slot_count] have valid values from Genesis)
@@ -732,10 +777,34 @@ class GenarkVecEnv(gym.Env):
                 self._distances_lists[i].append(curr_dist_act[i].item())
 
         # --- Reward ---
-        reward = self._prev_geo_dist.to(curr_dist.device) - curr_dist
-        just_succeeded = newly_stopped & (curr_dist < self.success_distance)
-        reward[just_succeeded] += self.success_bonus
+        if self.reward_mode == "ndtw_sr_delta":
+            # Per-step nDTW delta + per-step SR delta (RFT mode).
+            # See docs/genark_rft_caveats.md C4-C6 for known issues.
+            reward = self._compute_ndtw_sr_delta_reward(
+                curr_dist=curr_dist,
+                newly_stopped=newly_stopped,
+                N_act=N_act,
+            )
+        else:
+            # Default: dense d2g progress + sparse success bonus
+            reward = self._prev_geo_dist.to(curr_dist.device) - curr_dist
+            just_succeeded = newly_stopped & (curr_dist < self.success_distance)
+            reward[just_succeeded] += self.success_bonus
         self._prev_geo_dist = curr_dist.clone()
+
+        # --- Format reward (parse-success bonus) ---
+        # Give a small reward whenever the policy output valid JSON (action 0-3).
+        # parse-fail (action=4 sentinel, now clamped to STOP) gets 0.
+        # This breaks the cold-start loop: model gets gradient signal even before
+        # it learns to navigate, guiding it to produce valid JSON first.
+        if self.format_reward_coef > 0:
+            active_mask_t = torch.tensor(self._active_mask, dtype=torch.bool, device=device)
+            format_bonus = torch.where(
+                parse_ok_mask.to(device) & active_mask_t,
+                torch.full((self.num_envs,), self.format_reward_coef, device=device),
+                torch.zeros(self.num_envs, device=device),
+            )
+            reward = reward.to(device) + format_bonus
 
         # --- Termination / truncation (active+undone slots only) ---
         newly_timed_out = torch.tensor(
@@ -805,6 +874,8 @@ class GenarkVecEnv(gym.Env):
                 )
                 rgb_raw = torch.cat([rgb_raw, pad], dim=0)
             self._current_rgb = rgb_raw.cpu().numpy()
+            # Lazy-init render: also produce 4-dir extras if enabled
+            self._render_extra_3dir()
 
         # (N, H, W, 3) → (N, 3, H, W) as uint8 tensor on GPU
         rgb_np  = self._current_rgb
@@ -835,13 +906,22 @@ class GenarkVecEnv(gym.Env):
             self._elapsed_steps.astype(np.float32)
         ).unsqueeze(1).to(device)  # (N,1) float — states format
 
+        # 4-dir extras: (N, 3, H, W, 3) uint8 → put into extra_view_images
+        # Order: [left, right, behind] (front is in main_images)
+        if self._current_rgb_extras is not None:
+            extra_t = torch.from_numpy(
+                np.ascontiguousarray(self._current_rgb_extras)
+            ).to(device)
+        else:
+            extra_t = None
+
         return {
-            "main_images":     rgb_hwc,           # (N, H, W, 3) uint8
+            "main_images":     rgb_hwc,           # (N, H, W, 3) uint8 — front view
             "states":          elapsed_t,          # (N, 1) float — carries elapsed_steps
             "task_descriptions": list(self._instructions),  # list[str], len=N
             # Kept for any direct callers that bypass prepare_observations
             "wrist_images":    None,
-            "extra_view_images": None,
+            "extra_view_images": extra_t,         # (N, 3, H, W, 3) uint8 [L,R,B] or None
         }
 
     def _handle_slot_done(
@@ -967,6 +1047,111 @@ class GenarkVecEnv(gym.Env):
                 arrays[k][i] = float(m.get(k, 0.0))
         return {k: torch.tensor(v, dtype=torch.float32) for k, v in arrays.items()}
 
+    def _render_extra_3dir(self) -> None:
+        """
+        Render 3 additional camera angles (left=+90°, right=-90°, behind=180°)
+        at current cam_pos, store as `self._current_rgb_extras`
+        shape (num_envs, 3, H, W, 3) uint8 numpy.
+
+        Front view is rendered by the caller; we only render the 3 extras here.
+        Camera pose is restored to front yaw afterward.
+
+        Cost: 3× single-direction render. Disabled unless `enable_4dir_render`.
+        """
+        if not self.enable_4dir_render:
+            self._current_rgb_extras = None
+            return
+
+        N_act = self._active_slot_count
+        if N_act == 0:
+            self._current_rgb_extras = None
+            return
+
+        # Yaw deltas for [left, right, behind] (CCW positive, matches TURN_LEFT)
+        deltas = [math.radians(90.0), math.radians(-90.0), math.radians(180.0)]
+
+        extras_np = []
+        front_yaw = self._cam_yaw[:N_act]
+        for d_yaw in deltas:
+            rotated_yaw = front_yaw + d_yaw
+            _update_camera(self._cam, self._cam_pos[:N_act], rotated_yaw)
+            rgb_raw, _, _, _ = self._cam.render(
+                rgb=True, depth=False, segmentation=False, force_render=True
+            )
+            # Apply same light_scale + uint8 conversion as the front render
+            if rgb_raw.dtype == torch.uint8:
+                rgb_float = rgb_raw.float() / 255.0
+            else:
+                rgb_float = rgb_raw
+            rgb_raw = torch.clamp(rgb_float * self.light_scale * 255.0, 0, 255).byte()
+            # Pad ghost slots
+            if N_act < self.num_envs:
+                pad = torch.zeros(
+                    self.num_envs - N_act,
+                    self.cam_h, self.cam_w, 3,
+                    dtype=torch.uint8, device=rgb_raw.device,
+                )
+                rgb_raw = torch.cat([rgb_raw, pad], dim=0)
+            extras_np.append(rgb_raw.cpu().numpy())  # (N, H, W, 3)
+
+        # Restore front camera pose
+        _update_camera(self._cam, self._cam_pos[:N_act], front_yaw)
+
+        # (3, N, H, W, 3) → (N, 3, H, W, 3)
+        self._current_rgb_extras = np.stack(extras_np, axis=1)
+
+    def _compute_ndtw_sr_delta_reward(
+        self,
+        curr_dist: torch.Tensor,
+        newly_stopped: torch.Tensor,
+        N_act: int,
+    ) -> torch.Tensor:
+        """
+        RFT reward = ndtw_coef * (nDTW_t - nDTW_{t-1}) + sr_coef * (SR_t - SR_{t-1}).
+
+        - per-step nDTW: fastdtw on current partial pred_path vs full GT reference_path
+        - per-step SR  : 1 if (just stopped AND d2g < success_distance) else 0
+
+        Both deltas are signed; first step's SR delta is +1 if success on step 1
+        (rare). Reward is computed in CPU, then moved to curr_dist.device.
+
+        Caveats: see docs/genark_rft_caveats.md C4 (per-step nDTW unstable),
+        C5 (SR delta sparse), C6 (scale imbalance).
+        """
+        N = self.num_envs
+        reward_np = np.zeros(N, dtype=np.float32)
+
+        curr_dist_np = curr_dist.detach().cpu().numpy()
+        stopped_np = newly_stopped.detach().cpu().numpy()
+
+        for i in range(N_act):
+            if not self._active_mask[i]:
+                continue
+
+            # SR delta — binary 0→1 at success step
+            curr_sr = 1.0 if (stopped_np[i] and curr_dist_np[i] < self.success_distance) else 0.0
+            sr_delta = curr_sr - self._prev_sr[i]
+            self._prev_sr[i] = curr_sr
+
+            # nDTW delta — fastdtw on partial path vs GT reference
+            ep = self._episodes[i]
+            pred = self._pred_path_lists[i]
+            curr_ndtw = 1.0
+            if ep is not None and len(pred) >= 2:
+                gt = np.array(ep.get("reference_path", [[0, 0, 0]]), dtype=float)
+                pred_arr = np.array(pred)
+                try:
+                    dtw_d = fastdtw(pred_arr, gt, dist=euclidean)[0]
+                    curr_ndtw = float(np.exp(-dtw_d / (len(gt) * self.success_distance)))
+                except Exception:
+                    curr_ndtw = self._prev_ndtw[i]
+            ndtw_delta = curr_ndtw - self._prev_ndtw[i]
+            self._prev_ndtw[i] = curr_ndtw
+
+            reward_np[i] = self.ndtw_coef * ndtw_delta + self.sr_coef * sr_delta
+
+        return torch.from_numpy(reward_np).to(curr_dist.device)
+
     def _compute_episode_metrics(self, env_idx: list[int]) -> dict:
         """Returns {env_idx: metrics_dict} for each done env."""
         metrics = {}
@@ -1036,27 +1221,30 @@ class GenarkVecEnv(gym.Env):
 
     def chunk_step(
         self, chunk_actions: torch.Tensor
-    ) -> tuple[list, None, torch.Tensor, torch.Tensor, list]:
+    ) -> tuple[list, torch.Tensor, torch.Tensor, torch.Tensor, list]:
         """
         RLinf env_worker calls chunk_step(chunk_actions) instead of step().
         chunk_actions shape: (num_envs, num_action_chunks) — for nav, num_action_chunks=1.
-        Returns (obs_list, reward_list, terminations, truncations, infos_list).
+        Returns (obs_list, reward_tensor, terminations, truncations, infos_list).
+        reward_tensor shape: (num_envs, num_action_chunks)
         """
         ndim = chunk_actions.ndim if hasattr(chunk_actions, "ndim") else chunk_actions.dim()
         num_chunks = chunk_actions.shape[1] if ndim == 2 else 1
         obs_list, infos_list = [], []
-        terminations = torch.zeros(self.num_envs, num_chunks, dtype=torch.bool, device="cpu")
-        truncations  = torch.zeros(self.num_envs, num_chunks, dtype=torch.bool, device="cpu")
+        rewards      = torch.zeros(self.num_envs, num_chunks, dtype=torch.float32, device="cpu")
+        terminations = torch.zeros(self.num_envs, num_chunks, dtype=torch.bool,    device="cpu")
+        truncations  = torch.zeros(self.num_envs, num_chunks, dtype=torch.bool,    device="cpu")
 
         for c in range(num_chunks):
             actions_c = chunk_actions[:, c] if ndim == 2 else chunk_actions
-            obs, _, term, trunc, info = self.step(actions_c)
+            obs, reward, term, trunc, info = self.step(actions_c)
             obs_list.append(obs)
             infos_list.append(info)
+            rewards[:, c]      = reward.cpu() if isinstance(reward, torch.Tensor) else torch.tensor(reward, dtype=torch.float32)
             terminations[:, c] = term
             truncations[:, c]  = trunc
 
-        return obs_list, None, terminations, truncations, infos_list
+        return obs_list, rewards, terminations, truncations, infos_list
 
     def render(self, mode="rgb_array"):
         return self._current_rgb

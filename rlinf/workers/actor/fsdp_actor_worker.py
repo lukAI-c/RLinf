@@ -109,6 +109,30 @@ def process_nested_dict_for_adv(nested_dict, rollout_epoch):
     return ret_dict
 
 
+def _index_select_dim1_recursive(obj, idx: torch.Tensor, expected_B: int):
+    """
+    Recursively index_select along dim 1 for every tensor whose shape[1] equals
+    expected_B. Used by FSDPActor._align_rollout_batch_to_groups to drop
+    dormant/tail episodes uniformly across rollout_batch and forward_inputs.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, torch.Tensor):
+        if obj.dim() >= 2 and obj.shape[1] == expected_B:
+            return obj.index_select(1, idx.to(obj.device))
+        return obj
+    if isinstance(obj, dict):
+        return {
+            k: _index_select_dim1_recursive(v, idx, expected_B)
+            for k, v in obj.items()
+        }
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(
+            _index_select_dim1_recursive(v, idx, expected_B) for v in obj
+        )
+    return obj
+
+
 def process_nested_dict_for_train(nested_dict, shuffle_id):
     ret_dict = {}
     for key, value in nested_dict.items():
@@ -1204,7 +1228,68 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             else:
                 rollout_batch["loss_mask"] = reward_filter_mask
 
+        rollout_batch = self._align_rollout_batch_to_groups(rollout_batch)
+
         return rollout_batch
+
+    def _align_rollout_batch_to_groups(
+        self, rollout_batch: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """
+        Tail-drop alignment for GRPO: ensure the batch dim B is a multiple of
+        group_size, AND drop any group whose episodes are all dormant
+        (loss_mask all-zero). Required because env workers can exhaust their
+        scene pool and return fewer / partly-dormant episodes than expected,
+        which otherwise crashes ``calculate_scores``' reshape(-1, group_size).
+        """
+        group_size = int(self.cfg.algorithm.get("group_size", 1))
+        if group_size <= 1:
+            return rollout_batch
+
+        rewards = rollout_batch["rewards"]  # [n_step, B, num_action_chunks]
+        B = rewards.shape[1]
+
+        loss_mask = rollout_batch.get("loss_mask", None)
+        if loss_mask is not None:
+            ep_valid = (
+                loss_mask.reshape(loss_mask.shape[0], B, -1).any(dim=2).any(dim=0)
+            )  # [B]
+        else:
+            ep_valid = torch.ones(B, dtype=torch.bool)
+
+        # Trim tail to a multiple of group_size before grouping
+        n_full = (B // group_size) * group_size
+        if n_full == 0:
+            raise RuntimeError(
+                f"rollout returned B={B} episodes but group_size={group_size}; "
+                f"need at least {group_size} episodes to form one group"
+            )
+        ep_valid = ep_valid[:n_full]
+
+        n_groups = n_full // group_size
+        group_valid = ep_valid.reshape(n_groups, group_size).any(dim=-1)  # [n_groups]
+        valid_group_idx = torch.nonzero(group_valid, as_tuple=False).flatten()
+        if valid_group_idx.numel() == 0:
+            raise RuntimeError(
+                f"all {n_groups} groups are fully dormant; cannot train this rollout"
+            )
+
+        base = valid_group_idx.unsqueeze(1) * group_size  # [n_kept, 1]
+        offsets = torch.arange(group_size).unsqueeze(0)   # [1, group_size]
+        keep_idx = (base + offsets).flatten()             # [n_kept * group_size]
+
+        if keep_idx.numel() == B:
+            return rollout_batch  # nothing to drop
+
+        if self._rank == 0:
+            print(
+                f"[FSDPActor][group-align] B={B} -> kept={keep_idx.numel()} "
+                f"(tail-drop+dormant-group). groups: {n_groups} -> "
+                f"{valid_group_idx.numel()}",
+                flush=True,
+            )
+
+        return _index_select_dim1_recursive(rollout_batch, keep_idx, B)
 
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
         """
@@ -1322,6 +1407,272 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 f"sft_loss_weight={self.sft_loss_weight:.6f}"
             )
 
+    def _debug_actor_ratio(
+        self,
+        output_logprobs: torch.Tensor,
+        prev_logprobs: torch.Tensor,
+        loss_mask: Optional[torch.Tensor],
+        forward_inputs: Optional[dict],
+        global_batch_idx: int,
+        micro_batch_idx: int,
+        printed_count: int,
+    ) -> bool:
+        if self._rank != 0:
+            return False
+
+        action_dim = int(self.cfg.actor.model.get("action_dim", 7))
+        if output_logprobs.numel() == 0 or prev_logprobs.numel() == 0:
+            return False
+
+        with torch.no_grad():
+            log_ratio = (output_logprobs.float() - prev_logprobs.float()).detach()
+            bsz = log_ratio.shape[0]
+            token_mask = None
+            response_ids = None
+            if forward_inputs is not None:
+                token_mask = forward_inputs.get("response_mask")
+                response_ids = forward_inputs.get("response_ids")
+                if token_mask is not None:
+                    token_mask = token_mask.to(log_ratio.device).bool()
+                if response_ids is not None:
+                    response_ids = response_ids.to(log_ratio.device)
+
+            if token_mask is None:
+                token_mask = torch.ones_like(log_ratio, dtype=torch.bool)
+            if token_mask.shape != log_ratio.shape:
+                token_mask = token_mask.reshape(log_ratio.shape)
+
+            valid_log_ratio = log_ratio[token_mask]
+            if valid_log_ratio.numel() == 0:
+                valid_log_ratio = log_ratio.reshape(-1)
+
+            action_log_ratio = log_ratio.reshape(bsz, -1, action_dim).sum(dim=-1)
+            action_ratio = action_log_ratio.exp()
+
+            if loss_mask is None:
+                action_loss_mask = torch.ones_like(action_log_ratio, dtype=torch.bool)
+            else:
+                action_loss_mask = loss_mask.to(action_log_ratio.device).bool()
+                if action_loss_mask.shape != action_log_ratio.shape:
+                    action_loss_mask = action_loss_mask.reshape(action_log_ratio.shape)
+
+            if not action_loss_mask.any():
+                return False
+
+            valid_action_log_ratio = action_log_ratio[action_loss_mask]
+            valid_action_ratio = action_ratio[action_loss_mask]
+            debug_threshold = float(
+                self.cfg.actor.get("ratio_debug_threshold", 100.0)
+            )
+            should_print = printed_count < 8 or valid_action_ratio.max() > debug_threshold
+            if not should_print:
+                return False
+
+            masked_action_log_ratio = action_log_ratio.masked_fill(
+                ~action_loss_mask, float("-inf")
+            )
+            max_flat_idx = int(masked_action_log_ratio.reshape(-1).argmax().item())
+            max_sample_idx = max_flat_idx // action_log_ratio.shape[1]
+            max_chunk_idx = max_flat_idx % action_log_ratio.shape[1]
+
+            old_action_logprob = (
+                prev_logprobs.float()
+                .reshape(bsz, -1, action_dim)
+                .sum(dim=-1)[max_sample_idx, max_chunk_idx]
+            )
+            new_action_logprob = (
+                output_logprobs.float()
+                .reshape(bsz, -1, action_dim)
+                .sum(dim=-1)[max_sample_idx, max_chunk_idx]
+            )
+            mask_sum = token_mask.reshape(bsz, -1, action_dim).sum(dim=-1)
+            max_mask_sum = int(mask_sum[max_sample_idx, max_chunk_idx].item())
+
+            loss_mask_value = float(
+                action_loss_mask.reshape(-1)[max_flat_idx].float().item()
+            )
+
+            token_slice = None
+            if response_ids is not None:
+                token_slice = (
+                    response_ids.reshape(bsz, -1, action_dim)[
+                        max_sample_idx, max_chunk_idx, : min(action_dim, 16)
+                    ]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+
+            print(
+                "[FSDPActor][ratio-debug] "
+                f"gb={global_batch_idx} mb={micro_batch_idx} "
+                f"token_log_ratio(mean/min/max)="
+                f"{valid_log_ratio.mean().item():.4f}/"
+                f"{valid_log_ratio.min().item():.4f}/"
+                f"{valid_log_ratio.max().item():.4f} "
+                f"valid_action_log_ratio(mean/min/max)="
+                f"{valid_action_log_ratio.mean().item():.4f}/"
+                f"{valid_action_log_ratio.min().item():.4f}/"
+                f"{valid_action_log_ratio.max().item():.4f} "
+                f"valid_action_ratio(mean/max)="
+                f"{valid_action_ratio.mean().item():.4e}/"
+                f"{valid_action_ratio.max().item():.4e} "
+                f"max_idx=({max_sample_idx},{max_chunk_idx}) "
+                f"valid_tokens={max_mask_sum} "
+                f"loss_mask={loss_mask_value} "
+                f"old_sum={old_action_logprob.item():.4f} "
+                f"new_sum={new_action_logprob.item():.4f} "
+                f"tokens_head={token_slice}",
+                flush=True,
+            )
+            return True
+
+    @torch.no_grad()
+    def _recompute_prev_logprobs_embodied(self) -> None:
+        """
+        Embodied path: recompute prev_logprobs with the current actor weights in
+        eval+no_grad mode before PPO training. Eliminates the cross-process
+        forward-path divergence between actor (FSDP+PEFT) and rollout (raw HF)
+        that otherwise inflates the PPO ratio.
+
+        Reads:  self.rollout_batch["forward_inputs"], ["prev_logprobs"]
+        Writes: self.rollout_batch["rollout_prev_logprobs"]  (backup of rollout's logprobs)
+                self.rollout_batch["prev_logprobs"]           (actor-recomputed, becomes PPO's old)
+        """
+        if not self.cfg.algorithm.get("recompute_prev_logprobs", False):
+            # Guard: if rollout skipped teacher-forcing, prev_logprobs are zeros.
+            # Training with zero old_logprobs would make ratio=exp(new_lp)≈0 and
+            # produce no gradient signal.  Force the user to enable recompute.
+            rollout_lp = self.rollout_batch.get("prev_logprobs")
+            if rollout_lp is not None and rollout_lp.abs().max().item() < 1e-6:
+                raise RuntimeError(
+                    "[FSDPActor] prev_logprobs from rollout are all zeros but "
+                    "algorithm.recompute_prev_logprobs=False. "
+                    "Either set recompute_prev_logprobs=True or set "
+                    "rollout.model.skip_rollout_logprobs=False."
+                )
+            return
+
+        assert "forward_inputs" in self.rollout_batch, (
+            "recompute_prev_logprobs requires collect_forward_inputs=True at rollout"
+        )
+
+        # Backup rollout-side prev_logprobs (kept for importance_sampling_fix / debug).
+        self.rollout_batch["rollout_prev_logprobs"] = (
+            self.rollout_batch["prev_logprobs"].clone()
+        )
+
+        # rollout_batch tensors are [n_chunk_step, B, ...]. Flatten dim 0&1.
+        n_step, B = self.rollout_batch["prev_logprobs"].shape[:2]
+        rollout_size = n_step * B
+
+        # Skip dormant samples (loss_mask all-zero): no forward needed, their
+        # prev_logprobs stay at 0 and they contribute nothing to PPO loss anyway.
+        loss_mask = self.rollout_batch.get("loss_mask", None)
+        if loss_mask is not None:
+            valid_flat = loss_mask.reshape(rollout_size, -1).any(dim=1)  # [rollout_size]
+            valid_idx = torch.nonzero(valid_flat, as_tuple=False).flatten()
+        else:
+            valid_idx = torch.arange(rollout_size)
+
+        num_valid = valid_idx.numel()
+        if num_valid == 0:
+            if self._rank == 0:
+                print(
+                    "[FSDPActor][recompute] all samples dormant, skipping forward",
+                    flush=True,
+                )
+            return
+
+        micro_bsz = self.cfg.actor.micro_batch_size
+        # Truncate tail so num_valid % micro_bsz == 0 (drop a few valid samples
+        # at the end if needed; they'll keep their rollout prev_logprobs).
+        truncated = (num_valid // micro_bsz) * micro_bsz
+        if truncated == 0:
+            if self._rank == 0:
+                print(
+                    f"[FSDPActor][recompute] num_valid={num_valid} < "
+                    f"micro_batch_size={micro_bsz}, skipping",
+                    flush=True,
+                )
+            return
+        use_idx = valid_idx[:truncated]
+
+        flat_batch = process_nested_dict_for_train(
+            {
+                "forward_inputs": self.rollout_batch["forward_inputs"],
+                "prev_logprobs": self.rollout_batch["prev_logprobs"],
+            },
+            use_idx,
+        )
+
+        num_mbs = truncated // micro_bsz
+        mbs_iter = split_dict_to_chunk(flat_batch, num_mbs)
+
+        was_training = self.model.training
+        self.model.eval()
+
+        recompute_chunks = []
+        try:
+            for mb in mbs_iter:
+                mb = put_tensor_device(
+                    mb,
+                    f"{Worker.torch_device_type}:{int(os.environ['LOCAL_RANK'])}",
+                )
+                with self.amp_context:
+                    out = self.model(
+                        forward_inputs=mb["forward_inputs"],
+                        compute_logprobs=True,
+                        compute_entropy=False,
+                        compute_values=False,
+                        use_cache=False,
+                    )
+                recompute_chunks.append(out["logprobs"].detach().to("cpu"))
+        finally:
+            if was_training:
+                self.model.train()
+
+        # Scatter recompute results back to their original (step, env) positions.
+        # Dormant positions keep their rollout prev_logprobs (zeros when
+        # skip_rollout_logprobs=True), which is correct since loss_mask masks them.
+        recompute_flat_valid = torch.cat(recompute_chunks, dim=0)  # [truncated, max_new]
+        output = (
+            self.rollout_batch["prev_logprobs"]
+            .reshape(rollout_size, *recompute_flat_valid.shape[1:])
+            .clone()
+        )
+        output[use_idx] = recompute_flat_valid
+        self.rollout_batch["prev_logprobs"] = output.view(
+            n_step, B, *recompute_flat_valid.shape[1:]
+        )
+
+        # Free recompute intermediates and defragment before training backward starts.
+        # Without this, hundreds of eval forwards leave fragmented GPU allocator
+        # state that can SIGSEGV / silently kill the worker on the first training
+        # backward when activation memory peaks.
+        del recompute_chunks, recompute_flat_valid, flat_batch, output
+        torch.cuda.empty_cache()
+
+        if self._rank == 0:
+            dormant = rollout_size - num_valid
+            # Diff stats computed on valid samples only (dormant rollout lp = 0
+            # would pollute the stats).
+            new_valid = self.rollout_batch["prev_logprobs"].reshape(
+                rollout_size, -1
+            )[use_idx].float()
+            old_valid = self.rollout_batch["rollout_prev_logprobs"].reshape(
+                rollout_size, -1
+            )[use_idx].float()
+            diff = new_valid - old_valid
+            print(
+                f"[FSDPActor][recompute] valid={num_valid}/{rollout_size} "
+                f"dormant={dormant} "
+                f"mean={diff.mean().item():.4f} "
+                f"std={diff.std().item():.4f} "
+                f"abs_max={diff.abs().max().item():.4f}",
+                flush=True,
+            )
+
     @Worker.timer("run_training")
     def run_training(self) -> None:
         """
@@ -1332,25 +1683,48 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.is_optimizer_offloaded:
             self.load_optimizer(self.device)
 
+        # Actor-side recompute of prev_logprobs (no-op unless algorithm.recompute_prev_logprobs=True).
+        # Must run BEFORE shuffle/training so the recomputed tensor flows through the
+        # same process_nested_dict_for_train path along with rollout_prev_logprobs.
+        self._recompute_prev_logprobs_embodied()
+
         self.model.train()
+        actor_ratio_debug_prints = 0
+
         rollout_size = (
             self.rollout_batch["prev_logprobs"].shape[0]
             * self.rollout_batch["prev_logprobs"].shape[1]
         )
-        g = torch.Generator()
-        g.manual_seed(self.cfg.actor.seed + self._rank)
-        shuffle_id = torch.randperm(rollout_size, generator=g)
-
-        with torch.no_grad():
-            self.rollout_batch = process_nested_dict_for_train(
-                self.rollout_batch, shuffle_id
-            )
-
         assert (
             self.cfg.actor.global_batch_size
             % (self.cfg.actor.micro_batch_size * self._world_size)
             == 0
         ), "global_batch_size is not divisible by micro_batch_size * world_size"
+
+        batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
+        usable_rollout_size = (rollout_size // batch_size_per_rank) * batch_size_per_rank
+        if usable_rollout_size == 0:
+            raise ValueError(
+                f"rollout_size={rollout_size} is smaller than "
+                f"batch_size_per_rank={batch_size_per_rank}"
+            )
+        if usable_rollout_size != rollout_size and self._rank == 0:
+            print(
+                "[FSDPActor] Dropping tail rollout samples for static global batch: "
+                f"rollout_size={rollout_size}, usable={usable_rollout_size}, "
+                f"dropped={rollout_size - usable_rollout_size}, "
+                f"batch_size_per_rank={batch_size_per_rank}",
+                flush=True,
+            )
+
+        g = torch.Generator()
+        g.manual_seed(self.cfg.actor.seed + self._rank)
+        shuffle_id = torch.randperm(rollout_size, generator=g)[:usable_rollout_size]
+
+        with torch.no_grad():
+            self.rollout_batch = process_nested_dict_for_train(
+                self.rollout_batch, shuffle_id
+            )
 
         self.gradient_accumulation = (
             self.cfg.actor.global_batch_size
@@ -1361,7 +1735,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         rollout_size = self.rollout_batch["prev_logprobs"].size(0)
-        batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
         assert rollout_size % batch_size_per_rank == 0, (
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
         )
@@ -1372,7 +1745,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 self.rollout_batch,
                 rollout_size // batch_size_per_rank,
             )
-            for train_global_batch in rollout_dataloader_iter:
+            for global_batch_idx, train_global_batch in enumerate(
+                rollout_dataloader_iter
+            ):
                 # split batch into micro_batches
                 train_global_batch_size = train_global_batch["prev_logprobs"].shape[0]
                 assert (
@@ -1456,6 +1831,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "prev_values": prev_values,
                         "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
                         "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                        "clip_log_ratio_min": self.cfg.algorithm.get("clip_log_ratio_min", None),
+                        "clip_log_ratio_max": self.cfg.algorithm.get("clip_log_ratio_max", None),
                         "value_clip": self.cfg.algorithm.get("value_clip", None),
                         "huber_delta": self.cfg.algorithm.get("huber_delta", None),
                         "loss_mask": loss_mask,
@@ -1466,6 +1843,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         < self.critic_warmup_steps,
                     }
                     loss, metrics_data = policy_loss(**kwargs)
+                    if self._debug_actor_ratio(
+                        output_logprobs=output_dict["logprobs"],
+                        prev_logprobs=prev_logprobs,
+                        loss_mask=loss_mask,
+                        forward_inputs=forward_inputs,
+                        global_batch_idx=global_batch_idx,
+                        micro_batch_idx=idx,
+                        printed_count=actor_ratio_debug_prints,
+                    ):
+                        actor_ratio_debug_prints += 1
 
                     entropy_loss = torch.tensor(
                         0.0, device=Worker.torch_platform.current_device()

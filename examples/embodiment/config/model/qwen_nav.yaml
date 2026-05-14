@@ -1,0 +1,47 @@
+model_type: "qwen_nav"
+
+# Local Qwen3.5-4B VL checkpoint (architecture: Qwen3_5ForConditionalGeneration)
+model_path: /home/clk/workspace/model_zoo/Qwen/Qwen3.5-4B
+
+precision: "bf16"
+trust_remote_code: true
+attn_implementation: "flash_attention_2"
+
+# Generation params (lavira-aligned: do_sample=True, mid temperature)
+max_new_tokens: 512
+temperature: 1.0
+do_sample: true
+
+# Lavira-style single-turn prompt history config
+# every_k=5, max_frames=8: sample every 5 steps, no effective cap within 40-step episodes
+# (ceil(40/5)=8 frames max → matches lavira "no limit" intent)
+# n_images = 8 history + 4 current = 12 total
+history_every_k: 5                  # sample 1 frame per 5 steps (was: 4)
+history_max_frames: 8               # = ceil(max_episode_steps/every_k), no effective cap
+use_4dir: true                      # build 4 view labels in prompt
+                                    # (env currently renders front only — see caveat C10)
+
+# Fixed image resolution (W, H) fed to the VLM processor.
+# Must match the blank images used in _init_padding_params.
+# All env renders and history images are resized to this before tokenisation.
+image_size: [448, 448]
+
+# Inference batching (lower = less VRAM, more generate calls)
+chunk_size: 4 # 4
+
+# Action space: discrete 4-way (encoded as single int per timestep)
+#   0=stop  1=forward  2=turn_left  3=turn_right
+action_dim: 1
+num_action_chunks: 1   # one response per step (required by validate_embodied_cfg)
+is_lora: false
+add_value_head: false
+
+# Training mode: set true in GRPO config to enable forward_inputs + prev_logprobs.
+# Disables macro-action buffering (pending_actions) so every step runs inference.
+collect_forward_inputs: false
+
+# Skip rollout-side teacher-forcing logprobs. Actor will recompute prev_logprobs
+# via eval forward before PPO training (requires recompute_prev_logprobs=True).
+# Reduces rollout time by ~35% (removes one full VLM forward per step).
+# MUST keep algorithm.recompute_prev_logprobs=True when this is True.
+skip_rollout_logprobs: false

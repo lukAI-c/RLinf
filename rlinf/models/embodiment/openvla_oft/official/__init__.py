@@ -35,9 +35,12 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     from transformers import (
         AutoConfig,
         AutoImageProcessor,
-        AutoModelForVision2Seq,
         AutoProcessor,
     )
+    try:
+        from transformers import AutoModelForVision2Seq
+    except ImportError:
+        from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 
     from rlinf.models.embodiment.openvla_oft.official.openvla_oft_action_model import (
         OpenVLAOFTForRLActionPrediction,

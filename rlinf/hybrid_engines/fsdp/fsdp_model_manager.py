@@ -23,7 +23,12 @@ from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
+from transformers import AutoConfig, AutoModelForCausalLM
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    # transformers ≥ 5.0 removed Vision2Seq, replaced by ImageTextToText
+    from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 
 from rlinf.config import SupportedModel, torch_dtype_from_precision
 from rlinf.data.tokenizers import hf_tokenizer

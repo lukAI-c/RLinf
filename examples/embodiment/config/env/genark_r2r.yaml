@@ -34,6 +34,15 @@ scene_offset: 0
 success_distance: 3.0
 success_bonus: 2.5
 
+# Reward mode: "geo_progress" (default) | "ndtw_sr_delta" (RFT, see caveats C4-C6)
+reward_mode: "geo_progress"
+ndtw_coef: 1.0
+sr_coef:   10.0
+
+# 4-dir rendering: render left/right/behind in addition to front (3× cost).
+# Required by QwenNavPolicy lavira-style prompt; outputs go to extra_view_images.
+enable_4dir_render: false
+
 init_params:
   episodes_file: /home/nvme03/lck/genark/data/datasets/OpenNav_R2R-CE_100_bertidx.json
   scene_datasets: /home/nvme03/lck/genark/scene_datasets
