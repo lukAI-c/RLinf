@@ -269,6 +269,8 @@ class RolloutResult:
     save_flags: torch.Tensor = None  # [B, num_action_chunks]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
+    is_decision: torch.Tensor = None  # [B] bool — True=new LLM inference, False=macro replay
+    is_last_decision: bool = False  # True on the bootstrap result: signals env to exit main loop
 
     def __post_init__(self):
         if self.actions is not None:
@@ -285,6 +287,8 @@ class RolloutResult:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
         if self.versions is not None:
             self.versions = self.versions.cpu().contiguous()
+        if self.is_decision is not None:
+            self.is_decision = self.is_decision.cpu().contiguous()
 
     @staticmethod
     def merge_rollout_results(
@@ -309,6 +313,7 @@ class RolloutResult:
         merged_bootstrap_values = _merge_optional_tensor("bootstrap_values")
         merged_save_flags = _merge_optional_tensor("save_flags")
         merged_versions = _merge_optional_tensor("versions")
+        merged_is_decision = _merge_optional_tensor("is_decision")
 
         forward_inputs_list = [
             rollout_result.forward_inputs for rollout_result in rollout_results
@@ -317,6 +322,9 @@ class RolloutResult:
             merged_forward_inputs = {}
         else:
             merged_forward_inputs = cat_list_of_dict_tensor(forward_inputs_list)
+        merged_is_last_decision = any(
+            getattr(r, "is_last_decision", False) for r in rollout_results
+        )
         return RolloutResult(
             actions=merged_actions,
             prev_logprobs=merged_prev_logprobs,
@@ -325,6 +333,8 @@ class RolloutResult:
             save_flags=merged_save_flags,
             forward_inputs=merged_forward_inputs,
             versions=merged_versions,
+            is_decision=merged_is_decision,
+            is_last_decision=merged_is_last_decision,
         )
 
 

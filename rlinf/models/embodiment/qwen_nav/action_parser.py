@@ -205,3 +205,49 @@ def _fallback(err: str) -> ParsedAction:
         ok=False,
         err=err,
     )
+
+
+# ---------------------------------------------------------------------------
+# Stop double-check parser (Lavira-style second LLM call)
+# ---------------------------------------------------------------------------
+
+class ParsedStopCheck:
+    """Result of the stop double-check LLM call."""
+    __slots__ = ("analysis", "decision", "ok")
+
+    def __init__(self, analysis: str, decision: str, ok: bool):
+        self.analysis = analysis
+        self.decision = decision   # "STOP" or "CONTINUE"
+        self.ok = ok
+
+
+def parse_stop_check_json(text: str) -> ParsedStopCheck:
+    """
+    Parse the stop-check model response.
+    Expected: {"analysis": "...", "decision": "STOP" or "CONTINUE"}
+    Falls back to CONTINUE on any parse failure (conservative: don't stop if unsure).
+    """
+    if not text:
+        return ParsedStopCheck(analysis="", decision="CONTINUE", ok=False)
+
+    json_str = _extract_json_string(text)
+    if json_str is None:
+        return ParsedStopCheck(analysis="", decision="CONTINUE", ok=False)
+
+    try:
+        obj = json.loads(json_str)
+    except json.JSONDecodeError:
+        return ParsedStopCheck(analysis="", decision="CONTINUE", ok=False)
+
+    if not isinstance(obj, dict):
+        return ParsedStopCheck(analysis="", decision="CONTINUE", ok=False)
+
+    decision = str(obj.get("decision", "CONTINUE")).strip().upper()
+    if decision not in ("STOP", "CONTINUE"):
+        decision = "CONTINUE"
+
+    return ParsedStopCheck(
+        analysis=str(obj.get("analysis", ""))[:512],
+        decision=decision,
+        ok=True,
+    )

@@ -79,6 +79,10 @@ class MultiStepRolloutWorker(Worker):
             cfg.env.train.max_steps_per_rollout_epoch
             // cfg.actor.model.num_action_chunks
         )
+        self.max_decisions_per_rollout_epoch = cfg.env.train.get(
+            "max_decisions_per_rollout_epoch",
+            self.n_train_chunk_steps,  # fall back to step-based count for backward compat
+        )
         self.n_eval_chunk_steps = (
             cfg.env.eval.max_steps_per_rollout_epoch
             // cfg.actor.model.num_action_chunks
@@ -391,10 +395,54 @@ class MultiStepRolloutWorker(Worker):
     @Worker.timer("generate_one_epoch")
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
         self.update_dagger_beta()
-        for _ in range(self.n_train_chunk_steps):
-            for _ in range(self.num_pipeline_stages):
+        max_dec = self.max_decisions_per_rollout_epoch
+        # Safety upper bound: each decision may expand to at most 10 low-level env steps
+        # (e.g. "navigate to behind" → 7 steps).  Add pipeline_stages to cover priming.
+        safety_steps = max_dec * 10 + self.num_pipeline_stages
+
+        # Per-stage, per-env decision counters: incremented each time is_decision[i]=True.
+        # List index = pipeline stage; each entry is a [train_batch_size] int64 tensor.
+        decision_counts = [
+            torch.zeros(self.train_batch_size, dtype=torch.long)
+            for _ in range(self.num_pipeline_stages)
+        ]
+        # Track last seen dormant mask per stage for the post-inner-loop termination check.
+        last_env_dormant = [
+            torch.zeros(self.train_batch_size, dtype=torch.bool)
+            for _ in range(self.num_pipeline_stages)
+        ]
+
+        step = 0
+        while step < safety_steps:
+            for stage_idx in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
                 actions, result = self.predict(env_output["obs"])
+
+                # is_decision: [B] bool — True means the model ran a new LLM inference.
+                # Falls back to all-True when the policy doesn't emit is_decision
+                # (e.g. non-qwen_nav models or older checkpoints).
+                is_decision = result.get(
+                    "is_decision",
+                    torch.ones(actions.shape[0], dtype=torch.bool),
+                )
+
+                # Detect dormant envs: instruction == "" means env finished its episode
+                # and is waiting.  Dormant envs cannot reach max_dec so we exclude them
+                # from the termination check.
+                task_descs = env_output.get("obs", {}).get("task_descriptions", None)
+                if task_descs is not None:
+                    env_dormant = torch.tensor(
+                        [desc == "" for desc in task_descs], dtype=torch.bool
+                    )
+                else:
+                    env_dormant = torch.zeros(actions.shape[0], dtype=torch.bool)
+                last_env_dormant[stage_idx] = env_dormant
+
+                # Increment counters only for active envs that haven't exceeded max_dec
+                active_and_decided = (
+                    is_decision & (~env_dormant) & (decision_counts[stage_idx] < max_dec)
+                )
+                decision_counts[stage_idx] += active_and_decided.long()
 
                 save_flags = None
                 if result.get("expert_label_flag", False):
@@ -422,8 +470,23 @@ class MultiStepRolloutWorker(Worker):
                         float(self.version),
                         dtype=torch.float32,
                     ),
+                    is_decision=is_decision,
                 )
                 self.send_rollout_result(output_channel, rollout_result, mode="train")
+
+            step += 1
+
+            # Termination: all active envs across all stages have completed max_dec decisions.
+            # Dormant envs that ended early do not block termination.
+            all_done = all(
+                not ((decision_counts[s] < max_dec) & (~last_env_dormant[s])).any()
+                for s in range(self.num_pipeline_stages)
+            )
+            if all_done:
+                break
+
+        # Bootstrap step: one final recv+predict to provide the value estimate for the
+        # last observation.  This mirrors the original fixed-loop bootstrap.
         for _ in range(self.num_pipeline_stages):
             env_output = await self.recv_env_output(input_channel)
             actions, result = self.predict(env_output["obs"])
@@ -434,6 +497,8 @@ class MultiStepRolloutWorker(Worker):
                 bootstrap_values=self.get_bootstrap_values(
                     env_output.get("final_obs", None)
                 ),
+                is_decision=torch.zeros(actions.shape[0], dtype=torch.bool),
+                is_last_decision=True,
             )
             self.send_rollout_result(output_channel, rollout_result, mode="train")
 
@@ -634,6 +699,7 @@ class MultiStepRolloutWorker(Worker):
         split_bootstrap_values = _split_optional_tensor(rollout_result.bootstrap_values)
         split_save_flags = _split_optional_tensor(rollout_result.save_flags)
         split_versions = _split_optional_tensor(rollout_result.versions)
+        split_is_decision = _split_optional_tensor(rollout_result.is_decision)
         split_forward_inputs = (
             [{} for _ in sizes]
             if not rollout_result.forward_inputs
@@ -655,6 +721,8 @@ class MultiStepRolloutWorker(Worker):
                 save_flags=split_save_flags[idx],
                 forward_inputs=split_forward_inputs[idx],
                 versions=split_versions[idx],
+                is_decision=split_is_decision[idx],
+                is_last_decision=rollout_result.is_last_decision,
             )
             for idx in range(len(sizes))
         ]

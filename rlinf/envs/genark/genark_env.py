@@ -286,16 +286,43 @@ class GenarkVecEnv(gym.Env):
         self.success_distance = float(getattr(cfg, "success_distance", 3.0))
         self.success_bonus   = float(getattr(cfg, "success_bonus",   2.5))
         self.use_rel_reward  = bool( getattr(cfg, "use_rel_reward",  True))
-        # Reward mode: "geo_progress" (default, dense d2g delta + success_bonus on stop)
-        #              "ndtw_sr_delta" (per-step nDTW delta + per-step SR delta — RFT)
+        # Reward mode: "geo_progress"  — dense d2g delta + success_bonus on stop
+        #              "ndtw_sr_delta" — per-step nDTW delta + SR delta (RFT)
+        #              "geo_ndtw"      — geo_progress + decision-level nDTW + SR (recommended for RFT)
+        #                  geo_progress creates within-group variance for random policies;
+        #                  nDTW refines path quality; SR rewards success.
+        #              "decision_nav"  — decision-level DTG + decision-level nDTW + SR (no step-level geo)
+        #                  DTG reward = clip(DTG_before - DTG_after, -dtg_clip, dtg_clip) per decision,
+        #                  with asymmetric scaling (backward penalized at 0.5×) to preserve exploration.
         # See docs/genark_rft_caveats.md C4-C6 for known issues with ndtw_sr_delta.
         self.reward_mode     = str(getattr(cfg, "reward_mode", "geo_progress"))
+        self.geo_coef        = float(getattr(cfg, "geo_coef",  1.0))
         self.ndtw_coef       = float(getattr(cfg, "ndtw_coef", 1.0))
         self.sr_coef         = float(getattr(cfg, "sr_coef",   10.0))
+        # decision_nav mode params
+        self.decision_dtg_coef  = float(getattr(cfg, "decision_dtg_coef",  1.0))
+        self.decision_dtg_clip  = float(getattr(cfg, "decision_dtg_clip",  2.0))
+        # decision_level_ndtw: when True and reward_mode="ndtw_sr_delta", skip per-step
+        # nDTW computation in step(). nDTW delta is computed once per LLM decision via
+        # compute_decision_ndtw_reward(), called by env_worker at decision flush time.
+        # SR delta is still computed per env step (it accumulates correctly via summation).
+        # Benefit: 1 fastdtw call per decision instead of N_macro calls; credit assignment
+        # granularity matches LLM decision granularity.
+        self.decision_level_ndtw = bool(getattr(cfg, "decision_level_ndtw", False))
         # Format reward: added each step when policy outputs valid JSON (action 0-3).
         # action=4 (ACTION_PARSE_FAIL sentinel) means parse failed → no format reward.
         # Breaks cold-start: model learns to output valid JSON before learning navigation.
         self.format_reward_coef = float(getattr(cfg, "format_reward_coef", 0.0))
+        # --- Penalties to discourage premature / illegal terminations ---
+        # parse_fail_penalty: applied when the model fails to produce valid JSON.
+        # The action is clamped to MOVE_FORWARD (episode continues) but a negative
+        # reward signals "your output was malformed, fix it".
+        self.parse_fail_penalty = float(getattr(cfg, "parse_fail_penalty", -1.0))
+        # wrong_stop_penalty: applied when the model calls STOP but is still far
+        # from the goal (DTG > success_distance * wrong_stop_dist_factor).
+        # Episode still ends (STOP is honored); penalty makes "give-up stop" costly.
+        self.wrong_stop_penalty = float(getattr(cfg, "wrong_stop_penalty", -0.5))
+        self.wrong_stop_dist_factor = float(getattr(cfg, "wrong_stop_dist_factor", 1.5))
         # 4-direction rendering: when True, in addition to the front view stored
         # in `main_images`, also render left/right/behind and put them in
         # `extra_view_images` shape (num_envs, 3, H, W, 3) uint8.
@@ -307,6 +334,12 @@ class GenarkVecEnv(gym.Env):
         # GRPO: how many envs share one episode. group_size envs get the same
         # instruction/start so their rewards are comparable within the group.
         self.group_size      = int(  getattr(cfg, "group_size",       1))
+        # cyclic_episode_sampling: when True, the episode pool is reshuffled and
+        # replayed from the start once exhausted (train mode).  When False, groups
+        # enter dormant once the pool is exhausted (eval / single-pass mode).
+        self.cyclic_episode_sampling = bool(
+            getattr(cfg, "cyclic_episode_sampling", False)
+        )
 
         # --- observation params ---
         cam_res              = tuple(getattr(cfg, "cam_res", (640, 480)))
@@ -361,6 +394,15 @@ class GenarkVecEnv(gym.Env):
         self._stop_called     = [False] * num_envs
         self._current_rgb     = None     # cached last RGB (CPU numpy)
 
+        # --- Episode-end diagnostic trackers ---
+        # Raw action history per env (includes PARSE_FAIL=4 sentinel, NOT clamped).
+        # Cleared on every episode (re)start; used to classify termination reason.
+        self._action_history: list[list[int]] = [[] for _ in range(num_envs)]
+        # Start distance-to-goal for success_type classification in ep-diag.
+        self._start_dtg: list[float] = [0.0] * num_envs
+        # Toggle: set GENARK_EP_DIAG=0 to silence per-episode diagnostic line.
+        self._ep_diag_enabled = os.environ.get("GENARK_EP_DIAG", "1") != "0"
+
         # Option A — single-pass: each active slot runs exactly one episode.
         # _slot_active[i]: this slot has a real episode (first active_slot_count slots).
         # _slot_done[i]:   this slot has completed its episode (stop or timeout).
@@ -391,10 +433,10 @@ class GenarkVecEnv(gym.Env):
         pinned_scene = unique_scenes[(scene_offset + seed_offset) % len(unique_scenes)]
         scene_eps = [e for e in all_episodes if e["scene_id"] == pinned_scene]
 
-        # Stable shuffle within scene (same seed across workers — order is
-        # deterministic per scene, not per worker)
-        rng = np.random.default_rng(seed=42)
-        rng.shuffle(scene_eps)
+        # Persistent RNG — used for initial shuffle and subsequent cyclic reshuffles.
+        # seed_offset makes each worker use a different sequence.
+        self._rng = np.random.default_rng(seed=42 + seed_offset)
+        self._rng.shuffle(scene_eps)
 
         self._all_episodes    = scene_eps
         self._pinned_scene_id = pinned_scene
@@ -407,6 +449,20 @@ class GenarkVecEnv(gym.Env):
               f"({len(self._all_episodes)} eps, "
               f"active_slots={active_slot_count}/{num_envs}, "
               f"{len(unique_scenes)} unique scenes total)", flush=True)
+
+        # Group-level reset state.
+        # When group_size>1, envs in the same group share one episode.
+        # When ALL envs in a group finish, the group is reset together to the
+        # next episode in the pool (preserving GRPO group semantics).
+        # _next_ep_idx: index into _all_episodes for the next group reset.
+        #   Initially = number of episodes already assigned (one per group).
+        #   Incremented by 1 each time a group resets.
+        # _group_done_counts: group_id → number of done envs waiting for group-mates.
+        gs = max(self.group_size, 1)
+        n_initial_groups = (active_slot_count + gs - 1) // gs  # ceil division
+        self._next_ep_idx: int = n_initial_groups
+        self._group_done_counts: dict[int, int] = {}
+        self._episode_cycle: int = 0  # incremented on each cyclic reshuffle
 
         # Pick initial scene and episodes, then build Genesis scene
         self._current_scene_id = None
@@ -566,6 +622,7 @@ class GenarkVecEnv(gym.Env):
             self._stop_called[i] = False
             self._pred_path_lists[i] = []
             self._distances_lists[i] = []
+            self._action_history[i] = []
 
         # Initialise tensors for active slots only
         self._init_agent_poses(active_idx)
@@ -583,7 +640,9 @@ class GenarkVecEnv(gym.Env):
             self._current_tri_idx = torch.zeros(N,    dtype=torch.long,    device=device)
             self._active_mask     = torch.ones(N,     dtype=torch.bool,    device=device)
             self._goal_pos_t      = torch.zeros(N, 3, dtype=torch.float32, device=device)
-            self._prev_geo_dist   = torch.zeros(N,    dtype=torch.float32, device=device)
+            self._prev_geo_dist        = torch.zeros(N, dtype=torch.float32, device=device)
+            self._last_parse_ok        = torch.zeros(N, dtype=torch.bool,    device=device)
+            self._dtg_decision_start   = torch.zeros(N, dtype=torch.float32, device=device)
 
         for i in env_idx:
             ep   = self._episodes[i]
@@ -624,6 +683,8 @@ class GenarkVecEnv(gym.Env):
             self._distances_lists[i] = [d]
             self._pred_path_lists[i] = [init_hab[i].cpu().numpy()]
             self._prev_geo_dist[i]   = d
+            self._start_dtg[i]       = d
+            self._dtg_decision_start[i] = d
             # ndtw_sr_delta mode: reset per-env previous nDTW/SR (initial path = single point → nDTW=1.0)
             self._prev_ndtw[i] = 1.0
             self._prev_sr[i]   = 0.0
@@ -658,10 +719,25 @@ class GenarkVecEnv(gym.Env):
         # Detect parse-fail sentinel (ACTION_PARSE_FAIL=4) BEFORE clamping.
         # parse_ok_mask[i]=True means policy output valid JSON for env i.
         parse_ok_mask = (actions < 4)
+        # Store for compute_decision_ndtw_reward() to use as format bonus gate.
+        self._last_parse_ok = parse_ok_mask.to(dtype=torch.bool, device=self._last_parse_ok.device)
 
-        # Clamp parse-fail sentinel to STOP and mask out done/ghost slots
+        # Record raw action (incl. parse-fail sentinel) into per-env history,
+        # for episode-end termination-reason diagnostics.
+        if self._ep_diag_enabled:
+            raw_acts_cpu = actions.detach().cpu().tolist()
+            active_undone_pre = self._slot_active & ~self._slot_done
+            for _i, _a in enumerate(raw_acts_cpu):
+                if active_undone_pre[_i]:
+                    self._action_history[_i].append(int(_a))
+
+        # Parse-fail policy (Lavira-style): keep navigating, do NOT terminate.
+        # Sentinel ACTION_PARSE_FAIL=4 is clamped to MOVE_FORWARD so the episode
+        # continues and the agent has a chance to self-recover. The negative reward
+        # for parse_fail is applied later in the reward block. Done/ghost slots
+        # still go to STOP (they must not move further).
         actions = actions.clone()
-        actions[actions >= 4] = self.STOP  # treat parse-fail as STOP
+        actions[actions >= 4] = self.MOVE_FORWARD  # parse-fail → default forward
         done_or_ghost = torch.tensor(
             self._slot_done | ~self._slot_active, dtype=torch.bool, device=device
         )
@@ -778,12 +854,37 @@ class GenarkVecEnv(gym.Env):
 
         # --- Reward ---
         if self.reward_mode == "ndtw_sr_delta":
-            # Per-step nDTW delta + per-step SR delta (RFT mode).
-            # See docs/genark_rft_caveats.md C4-C6 for known issues.
+            # Per-step SR delta (always); nDTW delta only when not decision_level_ndtw.
+            # When decision_level_ndtw=True, nDTW is computed once per LLM decision
+            # via compute_decision_ndtw_reward(), called by env_worker at flush time.
             reward = self._compute_ndtw_sr_delta_reward(
                 curr_dist=curr_dist,
                 newly_stopped=newly_stopped,
                 N_act=N_act,
+                include_ndtw=not self.decision_level_ndtw,
+            )
+        elif self.reward_mode == "geo_ndtw":
+            # Combined: dense geo_progress (per step) + SR delta (per step)
+            # + decision-level nDTW (deferred to env_worker flush via compute_decision_ndtw_reward).
+            # geo_progress creates within-group variance even for random policies,
+            # preventing zero-gradient cold-start; nDTW shapes path quality.
+            geo_reward = self.geo_coef * (self._prev_geo_dist.to(curr_dist.device) - curr_dist)
+            sr_and_ndtw = self._compute_ndtw_sr_delta_reward(
+                curr_dist=curr_dist,
+                newly_stopped=newly_stopped,
+                N_act=N_act,
+                include_ndtw=False,  # nDTW deferred to decision flush
+            )
+            reward = geo_reward + sr_and_ndtw
+        elif self.reward_mode == "decision_nav":
+            # Decision-level DTG + decision-level nDTW + SR. No step-level geo_progress.
+            # DTG reward is deferred to compute_decision_ndtw_reward() alongside nDTW.
+            # Per-step: only SR delta (so episode termination is still rewarded on the correct step).
+            reward = self._compute_ndtw_sr_delta_reward(
+                curr_dist=curr_dist,
+                newly_stopped=newly_stopped,
+                N_act=N_act,
+                include_ndtw=False,  # both DTG and nDTW deferred to decision flush
             )
         else:
             # Default: dense d2g progress + sparse success bonus
@@ -792,19 +893,24 @@ class GenarkVecEnv(gym.Env):
             reward[just_succeeded] += self.success_bonus
         self._prev_geo_dist = curr_dist.clone()
 
-        # --- Format reward (parse-success bonus) ---
-        # Give a small reward whenever the policy output valid JSON (action 0-3).
-        # parse-fail (action=4 sentinel, now clamped to STOP) gets 0.
-        # This breaks the cold-start loop: model gets gradient signal even before
-        # it learns to navigate, guiding it to produce valid JSON first.
-        if self.format_reward_coef > 0:
-            active_mask_t = torch.tensor(self._active_mask, dtype=torch.bool, device=device)
-            format_bonus = torch.where(
-                parse_ok_mask.to(device) & active_mask_t,
-                torch.full((self.num_envs,), self.format_reward_coef, device=device),
-                torch.zeros(self.num_envs, device=device),
+        # --- Parse-fail penalty (episode continues, malformed output costs) ---
+        if self.parse_fail_penalty != 0.0:
+            active_undone_t = torch.tensor(
+                active_undone_np, dtype=torch.bool, device=reward.device,
             )
-            reward = reward.to(device) + format_bonus
+            pf_mask = (~self._last_parse_ok.to(reward.device)) & active_undone_t
+            if pf_mask.any():
+                reward[pf_mask] += self.parse_fail_penalty
+
+        # --- Wrong-stop penalty (STOP issued when still far from goal) ---
+        # Penalty scales with DTG: penalty = -wrong_stop_penalty * (DTG / success_distance)
+        # e.g. DTG=10m, success=5m → -2.0; DTG=5m → -1.0; DTG=2m → -0.4
+        if self.wrong_stop_penalty != 0.0:
+            ws_mask = newly_stopped & (curr_dist.to(newly_stopped.device) > self.success_distance)
+            if ws_mask.any():
+                dist_ratio = curr_dist.to(reward.device) / max(self.success_distance, 1e-6)
+                scaled_penalty = -abs(self.wrong_stop_penalty) * dist_ratio
+                reward[ws_mask.to(reward.device)] += scaled_penalty[ws_mask.to(reward.device)]
 
         # --- Termination / truncation (active+undone slots only) ---
         newly_timed_out = torch.tensor(
@@ -831,6 +937,13 @@ class GenarkVecEnv(gym.Env):
                           if self._slot_active[i] and not self._slot_done[i]]
         if newly_done_idx:
             obs, info = self._handle_slot_done(newly_done_idx, self._build_obs(), info)
+            # Group-level reset: when all envs in a group are done, immediately
+            # reset the whole group to the next episode (same scene, next pool entry).
+            # This runs BEFORE the exhaustion check so reset envs clear _slot_done
+            # and the exhaustion flag is not set prematurely.
+            if self.group_size > 1:
+                self._maybe_reset_complete_groups(newly_done_idx)
+                obs = self._build_obs()  # rebuild after potential pose reset
         else:
             obs = self._build_obs()
 
@@ -952,6 +1065,55 @@ class GenarkVecEnv(gym.Env):
                 flush=True,
             )
 
+            # --- Episode-end termination-reason diagnostic ---
+            if self._ep_diag_enabled:
+                acts = self._action_history[i]
+                last = acts[-1] if acts else None
+                n_pf = sum(1 for a in acts if a >= 4)
+                # Classify termination cause. Parse-fail no longer terminates the
+                # episode (it is clamped to MOVE_FORWARD); only real STOP or
+                # max_episode_steps timeout end an episode.
+                if last == self.STOP:
+                    cause = "stop"
+                else:
+                    cause = "timeout"
+                # Classify success type for post-hoc quality analysis.
+                success_val = int(m.get('success', 0))
+                start_dtg = self._start_dtg[i]
+                if success_val:
+                    if start_dtg < self.success_distance:
+                        success_type = "lucky_start"   # started within threshold
+                    elif n_pf > 0:
+                        success_type = "recovered"     # success despite parse_fails
+                    else:
+                        success_type = "clean"         # success with all valid actions
+                else:
+                    success_type = "wrong_stop" if cause == "stop" else "no_stop"
+                # Compact action string: STOP=S FWD=F LEFT=L RIGHT=R PARSE=P
+                _LET = {0: "S", 1: "F", 2: "L", 3: "R", 4: "P"}
+                seq = "".join(_LET.get(min(a, 4), "?") for a in acts)
+                if len(seq) > 60:
+                    seq = seq[:30] + "..." + seq[-15:]
+                # Compact DTG curve: 5 sample points
+                dists = self._distances_lists[i]
+                if dists:
+                    n = len(dists)
+                    samp_idx = [0, n // 4, n // 2, (3 * n) // 4, n - 1]
+                    dtg_str = "→".join(f"{dists[k]:.2f}" for k in samp_idx)
+                else:
+                    dtg_str = "(no dist data)"
+                print(
+                    f"[GenArk][ep-diag] env={i} ep={ep_id} "
+                    f"cause={cause} success_type={success_type} "
+                    f"steps={len(acts)} parse_fail={n_pf} "
+                    f"start_dtg={start_dtg:.2f}m "
+                    f"final_dtg={m.get('distance_to_goal', 0):.2f}m "
+                    f"ndtw={m.get('ndtw', 0):.3f} "
+                    f"dtg_curve=[{dtg_str}] "
+                    f"acts={seq}",
+                    flush=True,
+                )
+
         episode_info = self._build_episode_tensors(done_idx, ep_metrics_by_env)
         info["episode"]        = episode_info
         saved_info["episode"]  = episode_info
@@ -961,6 +1123,101 @@ class GenarkVecEnv(gym.Env):
             np.arange(self.num_envs), done_idx
         ).astype(bool)
         return final_obs, info
+
+    def _maybe_reset_complete_groups(self, newly_done_idx: list[int]) -> None:
+        """Group-level reset: when all envs in a GRPO group finish their episode,
+        reset the entire group to the next episode from the pool.
+
+        Each group of `group_size` envs shares one episode so GRPO can compare
+        rewards within the group. Resetting them together to a NEW episode
+        (same scene, different task) preserves this invariant across resets.
+
+        If the episode pool is exhausted, the group stays dormant (existing behavior).
+        """
+        for env_i in newly_done_idx:
+            group_id = env_i // self.group_size
+            self._group_done_counts[group_id] = (
+                self._group_done_counts.get(group_id, 0) + 1
+            )
+
+            # Count active envs in this group (may be < group_size at scene edge)
+            group_start = group_id * self.group_size
+            group_envs = [
+                j for j in range(group_start, group_start + self.group_size)
+                if j < self.num_envs and self._slot_active[j]
+            ]
+            n_active_in_group = len(group_envs)
+
+            if self._group_done_counts[group_id] < n_active_in_group:
+                continue  # still waiting for group-mates
+
+            # All active envs in the group are done
+            del self._group_done_counts[group_id]
+
+            if self._next_ep_idx >= len(self._all_episodes):
+                if self.cyclic_episode_sampling:
+                    # Reshuffle and restart the pool (train mode).
+                    # Avoid immediately repeating the episode the group just ran.
+                    last_ep_id = (self._episodes[group_envs[0]] or {}).get(
+                        "episode_id", None
+                    )
+                    self._rng.shuffle(self._all_episodes)
+                    if (
+                        last_ep_id is not None
+                        and len(self._all_episodes) > 1
+                        and self._all_episodes[0].get("episode_id") == last_ep_id
+                    ):
+                        self._all_episodes = (
+                            self._all_episodes[1:] + self._all_episodes[:1]
+                        )
+                    self._next_ep_idx = 0
+                    self._episode_cycle += 1
+                    # Print per-scene summary on each cycle so we can compare scenes.
+                    summ = self._summarize_episode_log()
+                    print(
+                        f"[GenArk][episode-cycle] scene={self._pinned_scene_id} "
+                        f"cycle={self._episode_cycle} "
+                        f"reshuffled {len(self._all_episodes)} episodes | "
+                        f"sr={summ.get('success', 0):.3f} "
+                        f"spl={summ.get('spl', 0):.3f} "
+                        f"ndtw={summ.get('ndtw', 0):.3f} "
+                        f"n={summ.get('num_episodes', 0)}",
+                        flush=True,
+                    )
+                else:
+                    # Single-pass mode (eval) — group enters dormant permanently.
+                    print(
+                        f"[GenArk][group-reset] group={group_id} pool exhausted "
+                        f"(next_ep_idx={self._next_ep_idx}, "
+                        f"pool_size={len(self._all_episodes)}); entering dormant.",
+                        flush=True,
+                    )
+                    continue
+
+            # Assign the next pooled episode to all envs in the group
+            next_ep = self._all_episodes[self._next_ep_idx]
+            ep_id = next_ep.get("episode_id", self._next_ep_idx)
+            self._next_ep_idx += 1
+
+            for j in group_envs:
+                self._episodes[j]     = next_ep
+                self._instructions[j] = next_ep["instruction"]["instruction_text"]
+                self._slot_done[j]    = False   # clear done → no longer dormant
+                self._elapsed_steps[j] = 0
+                self._stop_called[j]  = False
+                self._action_history[j] = []
+                self._pred_path_lists[j] = []
+                self._distances_lists[j] = []
+
+            # Re-initialise agent poses and metrics for the reset group
+            self._init_agent_poses(group_envs)
+
+            print(
+                f"[GenArk][group-reset] group={group_id} → ep={ep_id} "
+                f"envs={group_envs} "
+                f"(pool remaining: {len(self._all_episodes) - self._next_ep_idx})",
+                flush=True,
+            )
 
     def _dormant_step(self) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """Cheap no-op step issued after the worker's episode pool is exhausted.
@@ -975,12 +1232,19 @@ class GenarkVecEnv(gym.Env):
             dummy_rgb = torch.zeros((N, self.cam_h, self.cam_w, 3),
                                     dtype=torch.uint8, device=gs.device)
             dummy_states = torch.zeros((N, 1), dtype=torch.float32, device=gs.device)
+            # extra_view_images: (N, 3, H, W, 3) uint8 when enable_4dir_render, else None.
+            # wrist_images: GenArk has no wrist camera → always None.
+            dummy_extra = (
+                torch.zeros((N, 3, self.cam_h, self.cam_w, 3),
+                            dtype=torch.uint8, device=gs.device)
+                if self.enable_4dir_render else None
+            )
             self._dummy_obs_cache = {
                 "main_images":       dummy_rgb,
                 "states":            dummy_states,
                 "task_descriptions": [""] * N,
                 "wrist_images":      None,
-                "extra_view_images": None,
+                "extra_view_images": dummy_extra,
             }
         reward     = torch.zeros(N, dtype=torch.float32, device="cpu")
         # IMPORTANT: terminated=False, truncated=False — we do NOT signal
@@ -1105,15 +1369,16 @@ class GenarkVecEnv(gym.Env):
         curr_dist: torch.Tensor,
         newly_stopped: torch.Tensor,
         N_act: int,
+        include_ndtw: bool = True,
     ) -> torch.Tensor:
         """
         RFT reward = ndtw_coef * (nDTW_t - nDTW_{t-1}) + sr_coef * (SR_t - SR_{t-1}).
 
-        - per-step nDTW: fastdtw on current partial pred_path vs full GT reference_path
         - per-step SR  : 1 if (just stopped AND d2g < success_distance) else 0
-
-        Both deltas are signed; first step's SR delta is +1 if success on step 1
-        (rare). Reward is computed in CPU, then moved to curr_dist.device.
+        - per-step nDTW: fastdtw on current partial pred_path vs full GT reference_path
+                         (skipped when include_ndtw=False, i.e. decision_level_ndtw=True;
+                          nDTW delta is instead computed once per decision via
+                          compute_decision_ndtw_reward())
 
         Caveats: see docs/genark_rft_caveats.md C4 (per-step nDTW unstable),
         C5 (SR delta sparse), C6 (scale imbalance).
@@ -1128,14 +1393,59 @@ class GenarkVecEnv(gym.Env):
             if not self._active_mask[i]:
                 continue
 
-            # SR delta — binary 0→1 at success step
+            # SR delta — binary 0→1 at success step (always computed per env step)
             curr_sr = 1.0 if (stopped_np[i] and curr_dist_np[i] < self.success_distance) else 0.0
             sr_delta = curr_sr - self._prev_sr[i]
             self._prev_sr[i] = curr_sr
 
-            # nDTW delta — fastdtw on partial path vs GT reference
+            if include_ndtw:
+                # nDTW delta — fastdtw on partial path vs GT reference
+                ep = self._episodes[i]
+                pred = self._pred_path_lists[i]
+                curr_ndtw = 1.0
+                if ep is not None and len(pred) >= 2:
+                    gt = np.array(ep.get("reference_path", [[0, 0, 0]]), dtype=float)
+                    pred_arr = np.array(pred)
+                    try:
+                        dtw_d = fastdtw(pred_arr, gt, dist=euclidean)[0]
+                        curr_ndtw = float(np.exp(-dtw_d / (len(gt) * self.success_distance)))
+                    except Exception:
+                        curr_ndtw = self._prev_ndtw[i]
+                ndtw_delta = curr_ndtw - self._prev_ndtw[i]
+                self._prev_ndtw[i] = curr_ndtw
+            else:
+                ndtw_delta = 0.0  # deferred to compute_decision_ndtw_reward()
+
+            reward_np[i] = self.ndtw_coef * ndtw_delta + self.sr_coef * sr_delta
+
+        return torch.from_numpy(reward_np).to(curr_dist.device)
+
+    def compute_decision_ndtw_reward(self, env_indices: list[int]) -> torch.Tensor:
+        """
+        Compute decision-level rewards (nDTW delta + optional DTG delta + format bonus)
+        once per LLM decision for the given env indices.
+
+        Called by env_worker at decision flush time (when is_decision=True).
+        At that point _pred_path_lists[i] already contains all positions from the
+        last decision up to the current env step, including intermediate macro steps.
+        This means detours within a macro action are correctly captured by DTW.
+
+        For reward_mode="decision_nav", also computes decision-level DTG reward:
+            delta = DTG_before_decision - DTG_after_decision
+            reward = clip(delta * dtg_coef, -dtg_clip, dtg_clip), asymmetric:
+                     positive delta (progress) × 1.0, negative delta (regress) × 0.5
+
+        Updates self._prev_ndtw[i] and self._dtg_decision_start[i] for each env.
+        Returns a [num_envs] float tensor; envs not in env_indices get 0.
+        """
+        reward_np = np.zeros(self.num_envs, dtype=np.float32)
+        for i in env_indices:
+            if not self._active_mask[i]:
+                continue
             ep = self._episodes[i]
             pred = self._pred_path_lists[i]
+
+            # --- nDTW delta ---
             curr_ndtw = 1.0
             if ep is not None and len(pred) >= 2:
                 gt = np.array(ep.get("reference_path", [[0, 0, 0]]), dtype=float)
@@ -1145,12 +1455,28 @@ class GenarkVecEnv(gym.Env):
                     curr_ndtw = float(np.exp(-dtw_d / (len(gt) * self.success_distance)))
                 except Exception:
                     curr_ndtw = self._prev_ndtw[i]
-            ndtw_delta = curr_ndtw - self._prev_ndtw[i]
+            ndtw_r = self.ndtw_coef * (curr_ndtw - self._prev_ndtw[i])
             self._prev_ndtw[i] = curr_ndtw
 
-            reward_np[i] = self.ndtw_coef * ndtw_delta + self.sr_coef * sr_delta
+            # --- decision-level DTG reward (decision_nav mode only) ---
+            dtg_r = 0.0
+            if self.reward_mode == "decision_nav":
+                dists = self._distances_lists[i]
+                curr_dtg = float(dists[-1]) if dists else float(self._dtg_decision_start[i])
+                dtg_before = float(self._dtg_decision_start[i])
+                delta = dtg_before - curr_dtg  # positive = made progress toward goal
+                scaled = delta * self.decision_dtg_coef if delta > 0 else 0.5 * delta * self.decision_dtg_coef
+                dtg_r = float(np.clip(scaled, -self.decision_dtg_clip, self.decision_dtg_clip))
+                self._dtg_decision_start[i] = curr_dtg  # update for next decision
 
-        return torch.from_numpy(reward_np).to(curr_dist.device)
+            # --- format reward (one bonus per valid LLM decision) ---
+            fmt_r = (
+                self.format_reward_coef
+                if (self.format_reward_coef > 0 and bool(self._last_parse_ok[i]))
+                else 0.0
+            )
+            reward_np[i] = ndtw_r + dtg_r + fmt_r
+        return torch.from_numpy(reward_np).float()
 
     def _compute_episode_metrics(self, env_idx: list[int]) -> dict:
         """Returns {env_idx: metrics_dict} for each done env."""

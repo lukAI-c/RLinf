@@ -171,8 +171,12 @@ def seq_mean_token_mean(values: torch.Tensor, mask: torch.Tensor, dim: int = -1)
 def masked_mean_ratio(
     values: torch.Tensor, mask: torch.Tensor, loss_mask_ratio: torch.Tensor
 ):
-    # for embodied tasks
-    return (values / loss_mask_ratio * mask).mean()
+    # For embodied tasks. Some padded/done samples have loss_mask_ratio == 0;
+    # mask them before reduction so division by zero cannot create NaN.
+    safe_ratio = torch.clamp(loss_mask_ratio, min=1e-6)
+    scaled_values = values / safe_ratio
+    scaled_values = torch.where(mask.bool(), scaled_values, torch.zeros_like(values))
+    return scaled_values.mean()
 
 
 def get_loss_agg_func(

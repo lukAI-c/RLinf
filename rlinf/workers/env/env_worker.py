@@ -917,12 +917,62 @@ class EnvWorker(Worker):
         *,
         cooperative_yield: bool,
     ) -> dict[str, torch.Tensor]:
-        self.rollout_results: list[EmbodiedRolloutResult] = [
-            EmbodiedRolloutResult(
-                max_episode_length=self.cfg.env.train.max_episode_steps,
-            )
-            for _ in range(self.stage_num)
-        ]
+        # Determine whether to use decision-level rollout.
+        max_dec = self.cfg.env.train.get(
+            "max_decisions_per_rollout_epoch",
+            None,
+        )
+        use_decision_rollout = max_dec is not None
+
+        if use_decision_rollout:
+            # Per-env EmbodiedRolloutResult: each env accumulates its own decision steps.
+            # Indexed as rollout_results_per_env[stage_id][env_i].
+            rollout_results_per_env: list[list[EmbodiedRolloutResult]] = [
+                [
+                    EmbodiedRolloutResult(
+                        max_episode_length=self.cfg.env.train.max_episode_steps,
+                    )
+                    for _ in range(self.train_num_envs_per_stage)
+                ]
+                for _ in range(self.stage_num)
+            ]
+            # Per-stage reward/done accumulators (accumulated between decisions).
+            # Explicitly on CPU: env_worker may run with a CUDA default device, so
+            # torch.zeros() without device= would create CUDA tensors.
+            _cpu = torch.device("cpu")
+            acc_rewards = [
+                torch.zeros(self.train_num_envs_per_stage, 1, device=_cpu)
+                for _ in range(self.stage_num)
+            ]
+            acc_dones = [
+                torch.zeros(self.train_num_envs_per_stage, 1, dtype=torch.bool, device=_cpu)
+                for _ in range(self.stage_num)
+            ]
+            acc_terminations = [
+                torch.zeros(self.train_num_envs_per_stage, 1, dtype=torch.bool, device=_cpu)
+                for _ in range(self.stage_num)
+            ]
+            acc_truncations = [
+                torch.zeros(self.train_num_envs_per_stage, 1, dtype=torch.bool, device=_cpu)
+                for _ in range(self.stage_num)
+            ]
+            decision_counts = [
+                torch.zeros(self.train_num_envs_per_stage, dtype=torch.long, device=_cpu)
+                for _ in range(self.stage_num)
+            ]
+            # Per-env pending forward_inputs/logprobs/versions for the current decision
+            pending_decision_data: list[list[dict | None]] = [
+                [None] * self.train_num_envs_per_stage
+                for _ in range(self.stage_num)
+            ]
+        else:
+            self.rollout_results: list[EmbodiedRolloutResult] = [
+                EmbodiedRolloutResult(
+                    max_episode_length=self.cfg.env.train.max_episode_steps,
+                )
+                for _ in range(self.stage_num)
+            ]
+
         env_metrics = defaultdict(list)
 
         for epoch in range(self.rollout_epoch):
@@ -938,13 +988,421 @@ class EnvWorker(Worker):
                     },
                 )
 
-            for chunk_step_idx in range(self.n_train_chunk_steps):
-                for stage_id in range(self.stage_num):
-                    if cooperative_yield:
-                        await asyncio.sleep(0)
+            if use_decision_rollout:
+                # ── Decision-level rollout loop ──────────────────────────────
+                # Safety bound: max_dec decisions × up to 10 env steps each + pipeline priming
+                safety_steps = max_dec * 10 + self.stage_num + 1
+                step = 0
+                received_bootstrap = False
+                # Track last seen env dormant state per stage for termination check
+                last_env_dormant = [
+                    torch.zeros(self.train_num_envs_per_stage, dtype=torch.bool, device=_cpu)
+                    for _ in range(self.stage_num)
+                ]
 
+                while step < safety_steps:
+                    for stage_id in range(self.stage_num):
+                        if cooperative_yield:
+                            await asyncio.sleep(0)
+
+                        env_output = env_outputs[stage_id]
+                        curr_obs = env_output.obs
+
+                        reward_model_output = None
+                        if reward_channel is not None and step != 0:
+                            reward_model_output = self.get_reward_model_output(
+                                env_output,
+                                send_channel=reward_channel,
+                                recv_channel=input_channel,
+                            )
+                            if reward_model_output is not None:
+                                env_metrics["reward_model_output"].append(
+                                    reward_model_output.detach().float().reshape(-1).cpu()
+                                )
+
+                        rollout_result = self.recv_rollout_results(
+                            input_channel, mode="train"
+                        )
+
+                        if rollout_result.is_last_decision:
+                            # Bootstrap result received inline — rollout has exited its main loop.
+                            # Handle intervene_actions and append bootstrap step, then exit.
+                            if env_output.intervene_actions is not None:
+                                for env_i in range(self.train_num_envs_per_stage):
+                                    if len(rollout_results_per_env[stage_id][env_i].actions) > 0:
+                                        rollout_results_per_env[stage_id][env_i].update_last_actions(
+                                            env_output.intervene_actions[env_i:env_i + 1],
+                                            env_output.intervene_flags[env_i:env_i + 1],
+                                        )
+                            for env_i in range(self.train_num_envs_per_stage):
+                                bootstrap_step_result = ChunkStepResult(
+                                    prev_values=(
+                                        rollout_result.prev_values[env_i:env_i + 1]
+                                        if self.collect_prev_infos and rollout_result.prev_values is not None
+                                        else None
+                                    ),
+                                    dones=env_output.dones[env_i:env_i + 1] if env_output.dones is not None else None,
+                                    truncations=env_output.truncations[env_i:env_i + 1] if env_output.truncations is not None else None,
+                                    terminations=env_output.terminations[env_i:env_i + 1] if env_output.terminations is not None else None,
+                                )
+                                rollout_results_per_env[stage_id][env_i].append_step_result(bootstrap_step_result)
+                            received_bootstrap = True
+                            break  # break inner for loop; outer while exits below
+
+                        rewards = self.compute_bootstrap_rewards(
+                            env_output, rollout_result.bootstrap_values, reward_model_output
+                        )
+
+                        # is_decision[i]: True = new LLM inference, False = macro replay
+                        is_dec = rollout_result.is_decision
+                        if is_dec is None:
+                            is_dec = torch.ones(
+                                self.train_num_envs_per_stage, dtype=torch.bool, device=_cpu
+                            )
+                        else:
+                            is_dec = is_dec.cpu()
+
+                        # Detect dormant envs from task_descriptions
+                        task_descs = env_output.obs.get("task_descriptions", None)
+                        if task_descs is not None:
+                            env_dormant = torch.tensor(
+                                [desc == "" for desc in task_descs], dtype=torch.bool, device=_cpu
+                            )
+                        else:
+                            env_dormant = torch.zeros(
+                                self.train_num_envs_per_stage, dtype=torch.bool, device=_cpu
+                            )
+                        last_env_dormant[stage_id] = env_dormant
+
+                        # Accumulate rewards (with γ=1 across macro steps)
+                        if rewards is not None:
+                            # rewards shape: [B, num_action_chunks] or [B, 1]
+                            # Sum across chunk dim to get [B, 1]
+                            step_reward = rewards.sum(dim=-1, keepdim=True) if rewards.dim() > 1 else rewards
+                            acc_rewards[stage_id] += step_reward.cpu()
+                        # Accumulate done/term/trunc: any-done within the macro
+                        if env_output.dones is not None:
+                            step_done = env_output.dones.any(dim=-1, keepdim=True) if env_output.dones.dim() > 1 else env_output.dones
+                            acc_dones[stage_id] |= step_done.cpu()
+                        if env_output.terminations is not None:
+                            step_term = env_output.terminations.any(dim=-1, keepdim=True) if env_output.terminations.dim() > 1 else env_output.terminations
+                            acc_terminations[stage_id] |= step_term.cpu()
+                        if env_output.truncations is not None:
+                            step_trunc = env_output.truncations.any(dim=-1, keepdim=True) if env_output.truncations.dim() > 1 else env_output.truncations
+                            acc_truncations[stage_id] |= step_trunc.cpu()
+
+                        # On decision steps: save current forward_inputs/logprobs for this env
+                        for env_i in range(self.train_num_envs_per_stage):
+                            if not is_dec[env_i]:
+                                continue
+                            # Extract per-env slices
+                            env_fi = {
+                                k: v[env_i:env_i + 1]
+                                for k, v in rollout_result.forward_inputs.items()
+                            } if rollout_result.forward_inputs else {}
+                            pending_decision_data[stage_id][env_i] = {
+                                "forward_inputs": env_fi,
+                                "prev_logprobs": (
+                                    rollout_result.prev_logprobs[env_i:env_i + 1]
+                                    if self.collect_prev_infos and rollout_result.prev_logprobs is not None
+                                    else None
+                                ),
+                                "prev_values": (
+                                    rollout_result.prev_values[env_i:env_i + 1]
+                                    if self.collect_prev_infos and rollout_result.prev_values is not None
+                                    else None
+                                ),
+                                "versions": (
+                                    rollout_result.versions[env_i:env_i + 1]
+                                    if rollout_result.versions is not None
+                                    else None
+                                ),
+                                "actions": (
+                                    env_fi["action"]
+                                    if "action" in env_fi
+                                    else rollout_result.actions[env_i:env_i + 1]
+                                    if rollout_result.actions is not None
+                                    else None
+                                ),
+                            }
+
+                        # Decision-level nDTW: compute once per decision for all
+                        # flushing envs, then add to acc_rewards before flush.
+                        # This avoids per-step fastdtw calls and aligns credit
+                        # assignment with LLM decision granularity.
+                        _env = self.env_list[stage_id]
+                        if hasattr(_env, "compute_decision_ndtw_reward"):
+                            _flush_indices = [
+                                env_i
+                                for env_i in range(self.train_num_envs_per_stage)
+                                if (
+                                    is_dec[env_i]
+                                    and not env_dormant[env_i]
+                                    and decision_counts[stage_id][env_i] < max_dec
+                                    and pending_decision_data[stage_id][env_i] is not None
+                                )
+                            ]
+                            if _flush_indices:
+                                _ndtw_r = _env.compute_decision_ndtw_reward(_flush_indices)
+                                for _ei in _flush_indices:
+                                    acc_rewards[stage_id][_ei] += float(_ndtw_r[_ei])
+
+                        # Flush accumulated data on decision steps (for envs not yet at max_dec)
+                        for env_i in range(self.train_num_envs_per_stage):
+                            if not is_dec[env_i]:
+                                continue
+                            if env_dormant[env_i]:
+                                continue
+                            if decision_counts[stage_id][env_i] >= max_dec:
+                                continue
+
+                            pdata = pending_decision_data[stage_id][env_i]
+                            if pdata is None:
+                                continue
+
+                            chunk_step_result = ChunkStepResult(
+                                actions=pdata["actions"],
+                                prev_logprobs=pdata["prev_logprobs"],
+                                prev_values=pdata["prev_values"],
+                                forward_inputs=pdata["forward_inputs"],
+                                versions=pdata["versions"],
+                                dones=acc_dones[stage_id][env_i:env_i + 1],
+                                truncations=acc_truncations[stage_id][env_i:env_i + 1],
+                                terminations=acc_terminations[stage_id][env_i:env_i + 1],
+                                rewards=acc_rewards[stage_id][env_i:env_i + 1],
+                            )
+                            rollout_results_per_env[stage_id][env_i].append_step_result(
+                                chunk_step_result
+                            )
+                            decision_counts[stage_id][env_i] += 1
+
+                            # Reset accumulators for this env
+                            acc_rewards[stage_id][env_i] = 0.0
+                            acc_dones[stage_id][env_i] = False
+                            acc_terminations[stage_id][env_i] = False
+                            acc_truncations[stage_id][env_i] = False
+                            pending_decision_data[stage_id][env_i] = None
+
+                        if rollout_result.save_flags is not None:
+                            # Mark last step for any env that just appended
+                            for env_i in range(self.train_num_envs_per_stage):
+                                if is_dec[env_i] and not env_dormant[env_i]:
+                                    n = len(rollout_results_per_env[stage_id][env_i].actions)
+                                    if n > 0:
+                                        rollout_results_per_env[stage_id][env_i].mark_last_step_with_flags(
+                                            rollout_result.save_flags[env_i:env_i + 1]
+                                        )
+
+                        env_output, env_info = self.env_interact_step(
+                            rollout_result.actions, stage_id
+                        )
+                        env_batch = env_output.to_dict()
+                        self.send_env_batch(
+                            rollout_channel,
+                            {
+                                "obs": env_batch["obs"],
+                                "final_obs": env_batch["final_obs"],
+                            },
+                        )
+                        env_outputs[stage_id] = env_output
+                        self.record_env_metrics(env_metrics, env_info, epoch)
+
+                    if received_bootstrap:
+                        break
+                    step += 1
+
+                # Bootstrap step: consume one more rollout result for value estimation.
+                # Skipped (via early break) when is_last_decision was received inline.
+                for stage_id in range(self.stage_num):
+                    if received_bootstrap:
+                        break
                     env_output = env_outputs[stage_id]
-                    curr_obs = env_output.obs
+                    if env_output.intervene_actions is not None:
+                        # Apply any pending interventions to the last recorded action
+                        for env_i in range(self.train_num_envs_per_stage):
+                            if len(rollout_results_per_env[stage_id][env_i].actions) > 0:
+                                rollout_results_per_env[stage_id][env_i].update_last_actions(
+                                    env_output.intervene_actions[env_i:env_i + 1],
+                                    env_output.intervene_flags[env_i:env_i + 1],
+                                )
+
+                    reward_model_output = None
+                    if reward_channel is not None:
+                        last_run = epoch == self.rollout_epoch - 1
+                        reward_model_output = self.get_reward_model_output(
+                            env_output,
+                            send_channel=reward_channel,
+                            recv_channel=input_channel,
+                            last_run=last_run,
+                        )
+                        if reward_model_output is not None:
+                            env_metrics["reward_model_output"].append(
+                                reward_model_output.detach().float().reshape(-1).cpu()
+                            )
+                    rollout_result = self.recv_rollout_results(input_channel, mode="train")
+                    rewards = self.compute_bootstrap_rewards(
+                        env_output, rollout_result.bootstrap_values, reward_model_output
+                    )
+                    # Bootstrap step: only dones/truncations/terminations (no rewards).
+                    # Mirrors the step-based path where the initial bootstrap obs has
+                    # rewards=None (no action yet) → not appended, making dones have
+                    # exactly one more entry than rewards for GAE computation.
+                    # Result: rewards[0..D-1] (D entries), dones[0..D] (D+1 entries).
+                    for env_i in range(self.train_num_envs_per_stage):
+                        bootstrap_step_result = ChunkStepResult(
+                            prev_values=(
+                                rollout_result.prev_values[env_i:env_i + 1]
+                                if self.collect_prev_infos and rollout_result.prev_values is not None
+                                else None
+                            ),
+                            dones=env_output.dones[env_i:env_i + 1] if env_output.dones is not None else None,
+                            truncations=env_output.truncations[env_i:env_i + 1] if env_output.truncations is not None else None,
+                            terminations=env_output.terminations[env_i:env_i + 1] if env_output.terminations is not None else None,
+                            # rewards intentionally omitted: bootstrap provides terminal done for GAE only.
+                        )
+                        rollout_results_per_env[stage_id][env_i].append_step_result(
+                            bootstrap_step_result
+                        )
+
+                # Pad short trajectories (dormant envs or early-termination envs)
+                # to exactly max_dec decision steps so rollout_size = max_dec*B is stable.
+                # Blank padding steps:
+                #   - dones=True → compute_loss_mask masks them out (loss_mask=False), so
+                #     they contribute 0 to PPO loss and are skipped in recompute.
+                #   - forward_inputs / actions / prev_logprobs / etc are cloned from the
+                #     last real decision so all tensor lists have len = max_dec. This keeps
+                #     forward_inputs and rewards dim-aligned (required by
+                #     process_nested_dict_for_train's reshape+shuffle_id indexing).
+                #   - Cloning (rather than zero-filling pixel_values) avoids ~23GB CPU
+                #     memory blowup for blank pixel tensors.
+                for stage_id in range(self.stage_num):
+                    refs = [r for r in rollout_results_per_env[stage_id] if r.actions]
+                    if not refs:
+                        print(
+                            "[EnvWorker][decision-rollout] no valid decisions for "
+                            f"stage {stage_id}; skipping this stage."
+                        )
+                        continue
+                    stage_ref = refs[0]
+
+                    for env_i in range(self.train_num_envs_per_stage):
+                        result = rollout_results_per_env[stage_id][env_i]
+                        n_decisions = len(result.actions) if result.actions else 0
+                        ref_source = result if n_decisions > 0 else stage_ref
+                        ref_fi = ref_source.forward_inputs[-1] if ref_source.forward_inputs else None
+                        ref_act = ref_source.actions[-1] if ref_source.actions else None
+                        ref_iflag = (
+                            ref_source.intervene_flags[-1]
+                            if ref_source.intervene_flags
+                            else None
+                        )
+                        ref_lp = ref_source.prev_logprobs[-1] if ref_source.prev_logprobs else None
+                        ref_pv = ref_source.prev_values[-1] if ref_source.prev_values else None
+                        ref_ver = ref_source.versions[-1] if ref_source.versions else None
+                        while n_decisions < max_dec:
+                            blank = ChunkStepResult(
+                                # dones=True → loss_mask=False for this and all later steps.
+                                dones=torch.ones(1, 1, dtype=torch.bool),
+                                truncations=torch.zeros(1, 1, dtype=torch.bool),
+                                terminations=torch.ones(1, 1, dtype=torch.bool),
+                                rewards=torch.zeros(1, 1),
+                                actions=ref_act.clone() if ref_act is not None else None,
+                                prev_logprobs=ref_lp.clone() if ref_lp is not None else None,
+                                prev_values=ref_pv.clone() if ref_pv is not None else None,
+                                versions=ref_ver.clone() if ref_ver is not None else None,
+                                forward_inputs={k: v.clone() for k, v in ref_fi.items()} if ref_fi else None,
+                            )
+                            result.append_step_result(blank)
+                            # append_step_result auto-appends zeros_like(actions) for intervene_flags;
+                            # overwrite with the real ref so all lists stay aligned.
+                            if ref_iflag is not None and result.intervene_flags:
+                                result.intervene_flags[-1] = ref_iflag.clone()
+                            n_decisions += 1
+
+            else:
+                # ── Original step-based rollout loop (backward compat) ──────
+                for chunk_step_idx in range(self.n_train_chunk_steps):
+                    for stage_id in range(self.stage_num):
+                        if cooperative_yield:
+                            await asyncio.sleep(0)
+
+                        env_output = env_outputs[stage_id]
+                        curr_obs = env_output.obs
+                        if env_output.intervene_actions is not None:
+                            self.rollout_results[stage_id].update_last_actions(
+                                env_output.intervene_actions,
+                                env_output.intervene_flags,
+                            )
+
+                        reward_model_output = None
+                        if reward_channel is not None and chunk_step_idx != 0:
+                            reward_model_output = self.get_reward_model_output(
+                                env_output,
+                                send_channel=reward_channel,
+                                recv_channel=input_channel,
+                            )
+                            if reward_model_output is not None:
+                                env_metrics["reward_model_output"].append(
+                                    reward_model_output.detach().float().reshape(-1).cpu()
+                                )
+
+                        rollout_result = self.recv_rollout_results(
+                            input_channel, mode="train"
+                        )
+                        rewards = self.compute_bootstrap_rewards(
+                            env_output, rollout_result.bootstrap_values, reward_model_output
+                        )
+                        chunk_step_result = ChunkStepResult(
+                            actions=rollout_result.forward_inputs.get("action", None),
+                            prev_logprobs=(
+                                rollout_result.prev_logprobs
+                                if self.collect_prev_infos
+                                else None
+                            ),
+                            prev_values=(
+                                rollout_result.prev_values
+                                if self.collect_prev_infos
+                                else None
+                            ),
+                            forward_inputs=rollout_result.forward_inputs,
+                            versions=rollout_result.versions,
+                            dones=env_output.dones,
+                            truncations=env_output.truncations,
+                            terminations=env_output.terminations,
+                            rewards=rewards,
+                        )
+                        self.rollout_results[stage_id].append_step_result(chunk_step_result)
+                        if rollout_result.save_flags is not None:
+                            self.rollout_results[stage_id].mark_last_step_with_flags(
+                                rollout_result.save_flags
+                            )
+
+                        env_output, env_info = self.env_interact_step(
+                            rollout_result.actions, stage_id
+                        )
+                        env_batch = env_output.to_dict()
+                        self.send_env_batch(
+                            rollout_channel,
+                            {
+                                "obs": env_batch["obs"],
+                                "final_obs": env_batch["final_obs"],
+                            },
+                        )
+                        if self.collect_transitions:
+                            next_obs = (
+                                env_output.final_obs
+                                if env_output.dones.any() and self.cfg.env.train.auto_reset
+                                else env_output.obs
+                            )
+                            self.rollout_results[stage_id].append_transitions(
+                                curr_obs, next_obs
+                            )
+
+                        env_outputs[stage_id] = env_output
+                        self.record_env_metrics(env_metrics, env_info, epoch)
+
+                for stage_id in range(self.stage_num):
+                    env_output = env_outputs[stage_id]
                     if env_output.intervene_actions is not None:
                         self.rollout_results[stage_id].update_last_actions(
                             env_output.intervene_actions,
@@ -952,116 +1410,177 @@ class EnvWorker(Worker):
                         )
 
                     reward_model_output = None
-                    if reward_channel is not None and chunk_step_idx != 0:
+                    if reward_channel is not None:
+                        last_run = epoch == self.rollout_epoch - 1
                         reward_model_output = self.get_reward_model_output(
                             env_output,
                             send_channel=reward_channel,
                             recv_channel=input_channel,
+                            last_run=last_run,
                         )
                         if reward_model_output is not None:
                             env_metrics["reward_model_output"].append(
                                 reward_model_output.detach().float().reshape(-1).cpu()
                             )
-
-                    rollout_result = self.recv_rollout_results(
-                        input_channel, mode="train"
-                    )
+                    rollout_result = self.recv_rollout_results(input_channel, mode="train")
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
                     )
                     chunk_step_result = ChunkStepResult(
-                        actions=rollout_result.forward_inputs.get("action", None),
-                        prev_logprobs=(
-                            rollout_result.prev_logprobs
-                            if self.collect_prev_infos
-                            else None
-                        ),
                         prev_values=(
-                            rollout_result.prev_values
-                            if self.collect_prev_infos
-                            else None
+                            rollout_result.prev_values if self.collect_prev_infos else None
                         ),
-                        forward_inputs=rollout_result.forward_inputs,
-                        versions=rollout_result.versions,
                         dones=env_output.dones,
                         truncations=env_output.truncations,
                         terminations=env_output.terminations,
                         rewards=rewards,
                     )
                     self.rollout_results[stage_id].append_step_result(chunk_step_result)
-                    if rollout_result.save_flags is not None:
-                        self.rollout_results[stage_id].mark_last_step_with_flags(
-                            rollout_result.save_flags
-                        )
-
-                    env_output, env_info = self.env_interact_step(
-                        rollout_result.actions, stage_id
-                    )
-                    env_batch = env_output.to_dict()
-                    self.send_env_batch(
-                        rollout_channel,
-                        {
-                            "obs": env_batch["obs"],
-                            "final_obs": env_batch["final_obs"],
-                        },
-                    )
-                    if self.collect_transitions:
-                        next_obs = (
-                            env_output.final_obs
-                            if env_output.dones.any() and self.cfg.env.train.auto_reset
-                            else env_output.obs
-                        )
-                        self.rollout_results[stage_id].append_transitions(
-                            curr_obs, next_obs
-                        )
-
-                    env_outputs[stage_id] = env_output
-                    self.record_env_metrics(env_metrics, env_info, epoch)
-
-            for stage_id in range(self.stage_num):
-                env_output = env_outputs[stage_id]
-                if env_output.intervene_actions is not None:
-                    self.rollout_results[stage_id].update_last_actions(
-                        env_output.intervene_actions,
-                        env_output.intervene_flags,
-                    )
-
-                reward_model_output = None
-                if reward_channel is not None:
-                    last_run = epoch == self.rollout_epoch - 1
-                    reward_model_output = self.get_reward_model_output(
-                        env_output,
-                        send_channel=reward_channel,
-                        recv_channel=input_channel,
-                        last_run=last_run,
-                    )
-                    if reward_model_output is not None:
-                        env_metrics["reward_model_output"].append(
-                            reward_model_output.detach().float().reshape(-1).cpu()
-                        )
-                rollout_result = self.recv_rollout_results(input_channel, mode="train")
-                rewards = self.compute_bootstrap_rewards(
-                    env_output, rollout_result.bootstrap_values, reward_model_output
-                )
-                chunk_step_result = ChunkStepResult(
-                    prev_values=(
-                        rollout_result.prev_values if self.collect_prev_infos else None
-                    ),
-                    dones=env_output.dones,
-                    truncations=env_output.truncations,
-                    terminations=env_output.terminations,
-                    rewards=rewards,
-                )
-                self.rollout_results[stage_id].append_step_result(chunk_step_result)
 
             self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()
 
         if actor_channel is not None:
-            for stage_id in range(self.stage_num):
-                await self.send_rollout_trajectories(
-                    self.rollout_results[stage_id], actor_channel
-                )
+            if use_decision_rollout:
+                # Merge per-env trajectories into a single EmbodiedRolloutResult per stage,
+                # then send as normal.  Each env has max_dec decision steps + 1 bootstrap
+                # appended to its EmbodiedRolloutResult list.  We merge by building a
+                # combined EmbodiedRolloutResult where each list entry is a batch tensor
+                # formed by stacking across envs.
+                for stage_id in range(self.stage_num):
+                    # Convert each per-env result to a Trajectory, then cat across envs
+                    # using to_splited_trajectories with split_num=1 to get a single batch.
+                    # Simpler: build a merged EmbodiedRolloutResult by cat-ing per-env lists.
+                    per_env_results = rollout_results_per_env[stage_id]
+                    n_envs = len(per_env_results)
+                    if n_envs == 0:
+                        continue
+                    if not any(r.actions for r in per_env_results):
+                        continue
+                    ref_result = next(r for r in per_env_results if r.actions)
+                    n_steps = int(max_dec)
+                    assert all(len(r.rewards) == n_steps for r in per_env_results), (
+                        "decision rollout padding incomplete: rewards length mismatch"
+                    )
+                    assert all(len(r.actions) == n_steps for r in per_env_results), (
+                        "decision rollout padding incomplete: actions length mismatch"
+                    )
+                    assert all(
+                        len(r.forward_inputs) == n_steps for r in per_env_results
+                    ), "decision rollout padding incomplete: forward_inputs length mismatch"
+                    if ref_result.prev_logprobs:
+                        assert all(
+                            len(r.prev_logprobs) == n_steps for r in per_env_results
+                        ), "decision rollout padding incomplete: prev_logprobs length mismatch"
+                    if ref_result.versions:
+                        assert all(
+                            len(r.versions) == n_steps for r in per_env_results
+                        ), "decision rollout padding incomplete: versions length mismatch"
+
+                    merged = EmbodiedRolloutResult(
+                        max_episode_length=self.cfg.env.train.max_episode_steps,
+                    )
+                    # Stack each time step across envs to form batch tensors.
+                    # rewards: n_steps entries. dones: n_steps+1 entries (bootstrap done).
+                    # This matches the step-based path invariant required by
+                    # compute_loss_mask and preprocess_embodied_advantages_inputs.
+                    for t in range(n_steps):
+                        rewards_t = [
+                            r.rewards[t] if t < len(r.rewards) else torch.zeros(1, 1)
+                            for r in per_env_results
+                        ]
+                        dones_t = [
+                            r.dones[t] if t < len(r.dones) else torch.zeros(1, 1, dtype=torch.bool)
+                            for r in per_env_results
+                        ]
+                        terminations_t = [
+                            r.terminations[t] if t < len(r.terminations) else torch.zeros(1, 1, dtype=torch.bool)
+                            for r in per_env_results
+                        ]
+                        truncations_t = [
+                            r.truncations[t] if t < len(r.truncations) else torch.zeros(1, 1, dtype=torch.bool)
+                            for r in per_env_results
+                        ]
+                        merged.rewards.append(torch.cat(rewards_t, dim=0))
+                        merged.dones.append(torch.cat(dones_t, dim=0))
+                        merged.terminations.append(torch.cat(terminations_t, dim=0))
+                        merged.truncations.append(torch.cat(truncations_t, dim=0))
+
+                        # actions / prev_logprobs / versions / forward_inputs
+                        if ref_result.actions and t < len(ref_result.actions):
+                            actions_t = [
+                                r.actions[t] if t < len(r.actions) else torch.zeros_like(ref_result.actions[0])
+                                for r in per_env_results
+                            ]
+                            merged.actions.append(torch.cat(actions_t, dim=0))
+                            merged.intervene_flags.append(
+                                torch.cat(
+                                    [
+                                        r.intervene_flags[t] if t < len(r.intervene_flags) else torch.zeros_like(ref_result.intervene_flags[0])
+                                        for r in per_env_results
+                                    ],
+                                    dim=0,
+                                )
+                            )
+
+                        if ref_result.prev_logprobs and t < len(ref_result.prev_logprobs):
+                            lp_t = [
+                                r.prev_logprobs[t] if t < len(r.prev_logprobs) else torch.zeros_like(ref_result.prev_logprobs[0])
+                                for r in per_env_results
+                            ]
+                            merged.prev_logprobs.append(torch.cat(lp_t, dim=0))
+
+                        if ref_result.prev_values and t < len(ref_result.prev_values):
+                            pv_t = [
+                                r.prev_values[t] if t < len(r.prev_values) else torch.zeros_like(ref_result.prev_values[0])
+                                for r in per_env_results
+                            ]
+                            merged.prev_values.append(torch.cat(pv_t, dim=0))
+
+                        if ref_result.versions and t < len(ref_result.versions):
+                            ver_t = [
+                                r.versions[t] if t < len(r.versions) else torch.zeros_like(ref_result.versions[0])
+                                for r in per_env_results
+                            ]
+                            merged.versions.append(torch.cat(ver_t, dim=0))
+
+                        if ref_result.forward_inputs and t < len(ref_result.forward_inputs):
+                            fi_t = {}
+                            ref_fi = ref_result.forward_inputs[0]
+                            for k in ref_fi.keys():
+                                fi_t[k] = torch.cat(
+                                    [
+                                        r.forward_inputs[t][k] if t < len(r.forward_inputs) else torch.zeros_like(ref_fi[k])
+                                        for r in per_env_results
+                                    ],
+                                    dim=0,
+                                )
+                            merged.forward_inputs.append(fi_t)
+
+                    # Append the extra bootstrap done (index n_steps) so dones has n_steps+1
+                    # entries — required by compute_loss_mask(dones) which uses shape[0]-1.
+                    bootstrap_dones_t = [
+                        r.dones[n_steps] if n_steps < len(r.dones) else torch.zeros(1, 1, dtype=torch.bool)
+                        for r in per_env_results
+                    ]
+                    bootstrap_terms_t = [
+                        r.terminations[n_steps] if n_steps < len(r.terminations) else torch.zeros(1, 1, dtype=torch.bool)
+                        for r in per_env_results
+                    ]
+                    bootstrap_trunc_t = [
+                        r.truncations[n_steps] if n_steps < len(r.truncations) else torch.zeros(1, 1, dtype=torch.bool)
+                        for r in per_env_results
+                    ]
+                    merged.dones.append(torch.cat(bootstrap_dones_t, dim=0))
+                    merged.terminations.append(torch.cat(bootstrap_terms_t, dim=0))
+                    merged.truncations.append(torch.cat(bootstrap_trunc_t, dim=0))
+
+                    await self.send_rollout_trajectories(merged, actor_channel)
+            else:
+                for stage_id in range(self.stage_num):
+                    await self.send_rollout_trajectories(
+                        self.rollout_results[stage_id], actor_channel
+                    )
 
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()

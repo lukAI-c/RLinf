@@ -20,6 +20,7 @@ See docs/genark_rft_caveats.md for known design caveats (C1-C11).
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 
 import numpy as np
@@ -31,8 +32,16 @@ from PIL import Image
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 
-from .prompts import SYSTEM_PROMPT, build_user_content_text, expected_image_count
-from .action_parser import ParsedAction, parse_lavira_json, ACTION_STOP, ACTION_PARSE_FAIL
+from .prompts import (
+    SYSTEM_PROMPT, STOP_CHECK_SYSTEM_PROMPT,
+    build_user_content_text, build_stop_check_text,
+    expected_image_count, USER_STOP_REJECTED,
+)
+from .action_parser import (
+    ParsedAction, ParsedStopCheck,
+    parse_lavira_json, parse_stop_check_json,
+    ACTION_STOP, ACTION_PARSE_FAIL,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +62,7 @@ class _HistoryCache:
     __slots__ = (
         "history_images", "pending_actions", "step_count",
         "last_parse_ok", "last_err", "last_bbox",
+        "stop_failure_count", "stop_rejection_feedback",
     )
 
     def __init__(self):
@@ -62,6 +72,9 @@ class _HistoryCache:
         self.last_parse_ok: bool = True
         self.last_err: Optional[str] = None
         self.last_bbox: Optional[list[float]] = None
+        # Stop double-check state (Lavira-style)
+        self.stop_failure_count: int = 0        # consecutive rejected STOPs
+        self.stop_rejection_feedback: str = ""  # injected into next prompt if non-empty
 
     def reset(self):
         self.history_images.clear()
@@ -70,6 +83,8 @@ class _HistoryCache:
         self.last_parse_ok = True
         self.last_err = None
         self.last_bbox = None
+        self.stop_failure_count = 0
+        self.stop_rejection_feedback = ""
 
     def push_image(self, img: Image.Image):
         self.history_images.append(img)
@@ -148,6 +163,15 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         # Training-mode flag: when True, compute prev_logprobs + forward_inputs
         # and disable macro-action buffering (pending_actions).
         self.collect_forward_inputs = bool(getattr(cfg, "collect_forward_inputs", False))
+        # Per-call action distribution logger. Flushes a one-line summary every
+        # `_action_stats_flush_every` policy-inference batches that contained at
+        # least one decision env. Set env QWEN_NAV_ACTION_STATS_EVERY=0 to disable.
+        self._action_stats_flush_every = int(os.environ.get("QWEN_NAV_ACTION_STATS_EVERY", "10"))
+        self._action_stats_counter = 0
+        self._action_stats = {
+            "forward": 0, "left": 0, "right": 0, "behind": 0,
+            "stop": 0, "parse_fail": 0, "total": 0,
+        }
         # When True, skip teacher-forcing logprobs at rollout time.
         # Safe only when actor.recompute_prev_logprobs=True; actor will overwrite
         # prev_logprobs with its own eval forward before PPO training.
@@ -362,6 +386,7 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         current_view: Image.Image,
         extra_views: Optional[list[Image.Image]] = None,
         pad_history_to: Optional[int] = None,
+        stop_rejection_feedback: str = "",
     ) -> tuple[str, list[Image.Image]]:
         """
         Build Qwen-VL chat-template prompt + ordered image list.
@@ -381,6 +406,8 @@ class QwenNavPolicy(nn.Module, BasePolicy):
             instruction=instruction,
             history_step_indices=history_step_indices,
         )
+        if stop_rejection_feedback:
+            user_text = user_text + stop_rejection_feedback
 
         if self.use_4dir:
             if extra_views is not None and len(extra_views) == 3:
@@ -596,10 +623,90 @@ class QwenNavPolicy(nn.Module, BasePolicy):
 
         return token_logprobs.cpu(), token_entropy.cpu()
 
+    # Regex spans for narrow PPO loss mask.  We only train on the JSON *value*
+    # tokens for "action" (always) and "stop" (when LOSS_MASK_INCLUDE_STOP).
+    # The reasoning / progress_analysis / bbox / stair tokens are excluded so
+    # the PPO ratio doesn't accumulate drift over ~200 long-text tokens.
+    _ACTION_VALUE_RE = re.compile(
+        r'"action"\s*:\s*"(navigate to (?:forward|left|right|behind))"'
+    )
+    _STOP_VALUE_RE = re.compile(r'"stop"\s*:\s*(true|false)')
+
+    def _compute_action_loss_mask(
+        self,
+        decoded_text: str,
+        resp_len: int,
+    ) -> torch.Tensor:
+        """
+        Build a (max_new_tokens,) bool mask that is True only on tokens
+        belonging to the `action` value (and optionally `stop` value) inside
+        the JSON response. Falls back to all-True over the response length
+        on any failure so behavior degrades gracefully.
+
+        Implementation: re-tokenize prefix text up to each char span boundary;
+        the prefix token count gives the boundary token index. Assumes the
+        underlying BPE tokenizer is mostly prefix-stable (Qwen / GPT-2 family
+        satisfy this for our JSON payloads).
+        """
+        full_mask = torch.zeros(self.max_new_tokens, dtype=torch.bool)
+        if resp_len <= 0 or not decoded_text:
+            return full_mask
+
+        try:
+            tok = self.processor.tokenizer
+        except Exception:
+            full_mask[:resp_len] = True
+            return full_mask
+
+        include_stop = os.environ.get(
+            "QWEN_NAV_LOSS_MASK_INCLUDE_STOP", "1"
+        ) not in ("0", "false", "False")
+
+        spans: list[tuple[int, int]] = []
+        m = self._ACTION_VALUE_RE.search(decoded_text)
+        if m:
+            spans.append(m.span(1))   # group 1 = "navigate to X" (without quotes)
+        if include_stop:
+            m2 = self._STOP_VALUE_RE.search(decoded_text)
+            if m2:
+                spans.append(m2.span(1))   # "true" / "false" literal
+
+        if not spans:
+            # No recognizable action span — fall back to full response so
+            # the sample still contributes some signal rather than zeroing out.
+            full_mask[:resp_len] = True
+            return full_mask
+
+        # Fast tokenizer offset_mapping gives a stable char→token map.
+        try:
+            enc = tok(
+                decoded_text, add_special_tokens=False, return_offsets_mapping=True
+            )
+            offsets = enc["offset_mapping"]
+        except Exception:
+            full_mask[:resp_len] = True
+            return full_mask
+
+        any_set = False
+        for ch_start, ch_end in spans:
+            # First token whose end > ch_start, first token whose start >= ch_end.
+            t_start = next((i for i, (a, b) in enumerate(offsets) if b > ch_start), len(offsets))
+            t_end = next((i for i, (a, b) in enumerate(offsets) if a >= ch_end), len(offsets))
+            t_start = max(0, min(t_start, resp_len))
+            t_end = max(0, min(t_end, resp_len))
+            if t_end > t_start:
+                full_mask[t_start:t_end] = True
+                any_set = True
+
+        if not any_set:
+            full_mask[:resp_len] = True
+        return full_mask
+
     def _build_forward_inputs_for_env(
         self,
         inputs_single: "BatchEncoding",   # processor output for 1 sample
         response_ids: torch.Tensor,        # (1, resp_len)
+        decoded_text: Optional[str] = None,
     ) -> dict[str, torch.Tensor]:
         """
         Build a fixed-shape forward_inputs dict for one env step.
@@ -661,6 +768,13 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         else:
             padded_ttids = torch.zeros(self._prompt_len, dtype=torch.long)
 
+        # Narrow PPO loss mask: True only on action (+stop) value tokens.
+        # Falls back to full resp_mask when decoded_text not provided.
+        if decoded_text is not None:
+            loss_mask = self._compute_action_loss_mask(decoded_text, resp_len)
+        else:
+            loss_mask = resp_mask.clone()
+
         return {
             "input_ids":          padded_ids.unsqueeze(0),     # (1, prompt_len)
             "attention_mask":     padded_attn.unsqueeze(0),     # (1, prompt_len)
@@ -669,6 +783,7 @@ class QwenNavPolicy(nn.Module, BasePolicy):
             "image_grid_thw":     grid.unsqueeze(0),            # (1, max_images, 3)
             "response_ids":       padded_resp.unsqueeze(0),     # (1, max_new_tokens)
             "response_mask":      resp_mask.unsqueeze(0),       # (1, max_new_tokens)
+            "ppo_token_loss_mask": loss_mask.unsqueeze(0),      # (1, max_new_tokens)
         }
 
     # ------------------------------------------------------------------
@@ -742,19 +857,27 @@ class QwenNavPolicy(nn.Module, BasePolicy):
             current_pils[i] = _to_pil(rgb_np[i])
             self._get_cache(i).push_image(current_pils[i])
 
-        # Phase 1: dispatch buffered actions (eval mode only)
+        # Phase 1: dispatch buffered actions
         actions: list[Optional[int]] = [None] * num_envs
         need_infer: list[int] = []
+        # Track which envs are making a new LLM decision vs replaying cached actions.
+        # Dormant envs (no instruction) count as non-decision steps.
+        is_decision_per_env: list[bool] = [False] * num_envs
         for i in range(num_envs):
             if not instructions[i]:
                 actions[i] = ACTION_PARSE_FAIL  # dormant env, no instruction
+                is_decision_per_env[i] = False
                 continue
             cache = self._get_cache(i)
-            # In training mode, always run inference (no macro buffering)
-            if not self.collect_forward_inputs and cache.pending_actions:
+            # Dispatch cached macro actions if available (both train and eval).
+            # Episode resets automatically clear pending_actions via reset_env_cache
+            # (triggered when elapsed_steps == 0 at the top of this method).
+            if cache.pending_actions:
                 actions[i] = cache.pending_actions.pop(0)
+                is_decision_per_env[i] = False  # replaying cached action, not a new decision
             else:
                 need_infer.append(i)
+                is_decision_per_env[i] = True  # new LLM inference required
 
         # Phase 2: build prompts + run batched generate
         per_env_forward_inputs: dict[int, dict] = {}
@@ -764,6 +887,8 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         if need_infer:
             prompts: list[str] = []
             img_lists: list[list[Image.Image]] = []
+            # Store current 4-dir views per env for reuse in stop double-check
+            current_views_per_env: dict[int, list[Image.Image]] = {}
             pad_h = self.history_max_frames if self.collect_forward_inputs else None
 
             for env_i in need_infer:
@@ -777,7 +902,13 @@ class QwenNavPolicy(nn.Module, BasePolicy):
                 extra_views = None
                 if extras_np is not None:
                     extra_views = [_to_pil(extras_np[env_i, k]) for k in range(3)]
+                # Store current 4-dir views for potential stop double-check
+                if self.use_4dir and extra_views is not None:
+                    current_views_per_env[env_i] = [current_pils[env_i]] + extra_views
+                else:
+                    current_views_per_env[env_i] = [current_pils[env_i]] * 4
 
+                cache_i = self._get_cache(env_i)
                 prompt_text, ordered_imgs = self._build_prompt(
                     instruction=instructions[env_i],
                     history_imgs=sampled,
@@ -785,6 +916,7 @@ class QwenNavPolicy(nn.Module, BasePolicy):
                     current_view=current_pils[env_i],
                     extra_views=extra_views,
                     pad_history_to=pad_h,
+                    stop_rejection_feedback=cache_i.stop_rejection_feedback,
                 )
                 prompts.append(prompt_text)
                 img_lists.append(ordered_imgs)
@@ -803,7 +935,9 @@ class QwenNavPolicy(nn.Module, BasePolicy):
                     )
                     resp_ids = gen_ids_list[idx]  # (1, resp_len)
 
-                    fi = self._build_forward_inputs_for_env(single_inputs, resp_ids)
+                    fi = self._build_forward_inputs_for_env(
+                        single_inputs, resp_ids, decoded_text=decoded[idx]
+                    )
                     per_env_forward_inputs[env_i] = fi
 
                     if self.skip_rollout_logprobs:
@@ -838,21 +972,137 @@ class QwenNavPolicy(nn.Module, BasePolicy):
                         per_env_logprobs[env_i] = lp    # (max_new_tokens,)
                         per_env_entropy[env_i] = ent
 
+            # Phase 3a: parse JSON responses
+            parsed_actions: dict[int, ParsedAction] = {}
             for env_i, text in zip(need_infer, decoded):
                 parsed: ParsedAction = parse_lavira_json(text)
                 cache = self._get_cache(env_i)
                 cache.last_parse_ok = parsed.ok
                 cache.last_err = parsed.err
                 cache.last_bbox = parsed.bbox
+                parsed_actions[env_i] = parsed
 
+            # Phase 3b: stop double-check (Lavira-style, eval-only)
+            # Skip during training rollout (collect_forward_inputs=True) to avoid
+            # extra LLM latency and training signal mismatch from action override.
+            STOP_CHECK_MAX_FAILURES = 3
+            stop_check_env_ids = (
+                [
+                    env_i for env_i in need_infer
+                    if parsed_actions[env_i].ok and parsed_actions[env_i].stop
+                    and self._get_cache(env_i).stop_failure_count < STOP_CHECK_MAX_FAILURES
+                ]
+                if not self.collect_forward_inputs  # eval only
+                else []
+            )
+            if stop_check_env_ids:
+                sc_prompts: list[str] = []
+                sc_img_lists: list[list[Image.Image]] = []
+                for env_i in stop_check_env_ids:
+                    sc_text = build_stop_check_text(instructions[env_i])
+                    views_4dir = current_views_per_env[env_i]  # [front, left, right, behind]
+                    views_resized = [img.resize(self.image_size) for img in views_4dir]
+                    sc_msgs = [
+                        {"role": "system", "content": [{"type": "text", "text": STOP_CHECK_SYSTEM_PROMPT}]},
+                        {"role": "user", "content": (
+                            [{"type": "image", "image": img} for img in views_resized]
+                            + [{"type": "text", "text": sc_text}]
+                        )},
+                    ]
+                    try:
+                        sc_prompt_text = self.processor.apply_chat_template(
+                            sc_msgs, tokenize=False, add_generation_prompt=True,
+                            enable_thinking=False,
+                        )
+                    except TypeError:
+                        sc_prompt_text = self.processor.apply_chat_template(
+                            sc_msgs, tokenize=False, add_generation_prompt=True,
+                        )
+                    sc_prompts.append(sc_prompt_text)
+                    sc_img_lists.append(views_resized)
+
+                sc_decoded, _ = self._batch_generate(sc_prompts, sc_img_lists)
+                for env_i, sc_text_out in zip(stop_check_env_ids, sc_decoded):
+                    sc_result: ParsedStopCheck = parse_stop_check_json(sc_text_out)
+                    cache = self._get_cache(env_i)
+                    if sc_result.decision == "STOP":
+                        # Confirmed — reset failure count, proceed with stop
+                        cache.stop_failure_count = 0
+                        cache.stop_rejection_feedback = ""
+                    else:
+                        # Rejected — override stop decision, inject feedback for next step
+                        cache.stop_failure_count += 1
+                        cache.stop_rejection_feedback = USER_STOP_REJECTED.format(
+                            count=cache.stop_failure_count
+                        )
+                        # Override: change parsed action to forward (keep exploring)
+                        parsed_actions[env_i] = ParsedAction(
+                            actions=[ACTION_FORWARD],
+                            bbox=None, stop=False, stair=False,
+                            progress=parsed_actions[env_i].progress,
+                            reasoning=f"[stop rejected #{cache.stop_failure_count}] " + parsed_actions[env_i].reasoning,
+                            raw_dir="navigate to forward", ok=True, err=None,
+                        )
+
+            # Phase 3c: force stop after max failures (regardless of model output)
+            for env_i in need_infer:
+                cache = self._get_cache(env_i)
+                if cache.stop_failure_count >= STOP_CHECK_MAX_FAILURES:
+                    parsed_actions[env_i] = ParsedAction(
+                        actions=[ACTION_STOP], bbox=None, stop=True, stair=False,
+                        progress="", reasoning="[forced stop after max rejections]",
+                        raw_dir=None, ok=True, err=None,
+                    )
+                    cache.stop_failure_count = 0
+                    cache.stop_rejection_feedback = ""
+
+            # Phase 3d: apply final actions
+            for env_i in need_infer:
+                parsed = parsed_actions[env_i]
                 act_seq = parsed.actions if parsed.actions else [ACTION_STOP]
-                # Use ACTION_PARSE_FAIL (4) as sentinel so genark_env can
-                # distinguish intentional stop from parse-failure stop, enabling
-                # format_reward computation without any side-channel.
                 actions[env_i] = ACTION_PARSE_FAIL if not parsed.ok else act_seq[0]
-                # Macro buffering only in eval mode
-                if not self.collect_forward_inputs and len(act_seq) > 1:
+                if len(act_seq) > 1:
+                    cache = self._get_cache(env_i)
                     cache.pending_actions.extend(act_seq[1:])
+                # Clear rejection feedback once a non-stop action is taken
+                if not parsed.stop:
+                    self._get_cache(env_i).stop_rejection_feedback = ""
+
+        # ---- Action distribution logger (per inference batch) ----
+        if self._action_stats_flush_every > 0 and need_infer:
+            for env_i in need_infer:
+                p = parsed_actions.get(env_i)
+                if p is None:
+                    continue
+                self._action_stats["total"] += 1
+                if not p.ok:
+                    self._action_stats["parse_fail"] += 1
+                    continue
+                if p.stop:
+                    self._action_stats["stop"] += 1
+                    continue
+                rd = (p.raw_dir or "").replace("navigate to ", "").strip()
+                if rd in ("forward", "left", "right", "behind"):
+                    self._action_stats[rd] += 1
+            self._action_stats_counter += 1
+            if self._action_stats_counter >= self._action_stats_flush_every:
+                tot = max(self._action_stats["total"], 1)
+                mode = "train" if self.collect_forward_inputs else "eval"
+                pct = lambda k: 100.0 * self._action_stats[k] / tot
+                print(
+                    f"[QwenNav][action-dist][{mode}] batches={self._action_stats_counter} "
+                    f"decisions={self._action_stats['total']} | "
+                    f"fwd={self._action_stats['forward']}({pct('forward'):.1f}%) "
+                    f"left={self._action_stats['left']}({pct('left'):.1f}%) "
+                    f"right={self._action_stats['right']}({pct('right'):.1f}%) "
+                    f"behind={self._action_stats['behind']}({pct('behind'):.1f}%) "
+                    f"stop={self._action_stats['stop']}({pct('stop'):.1f}%) "
+                    f"parse_fail={self._action_stats['parse_fail']}({pct('parse_fail'):.1f}%)",
+                    flush=True,
+                )
+                self._action_stats_counter = 0
+                for k in self._action_stats:
+                    self._action_stats[k] = 0
 
         # Build output tensor + diagnostics
         action_t = torch.tensor(actions, dtype=torch.long).unsqueeze(-1)  # (N, 1)
@@ -904,6 +1154,11 @@ class QwenNavPolicy(nn.Module, BasePolicy):
             diagnostics["prev_logprobs"] = torch.zeros(num_envs, 1)
             diagnostics["forward_inputs"] = {}
 
+        # Signal which envs made a new LLM inference decision this step.
+        # Non-decision envs (macro replay or dormant) contribute blank forward_inputs
+        # and zero logprobs above, so downstream GRPO training safely ignores them.
+        diagnostics["is_decision"] = torch.tensor(is_decision_per_env, dtype=torch.bool)  # (N,)
+
         return action_t, diagnostics
 
     def _make_blank_forward_inputs(self) -> dict[str, torch.Tensor]:
@@ -918,6 +1173,7 @@ class QwenNavPolicy(nn.Module, BasePolicy):
             "image_grid_thw":    torch.zeros(1, self._n_images_fixed, 3, dtype=torch.long),
             "response_ids":      torch.full((1, self.max_new_tokens), pad_id, dtype=torch.long),
             "response_mask":     torch.zeros(1, self.max_new_tokens, dtype=torch.bool),
+            "ppo_token_loss_mask": torch.zeros(1, self.max_new_tokens, dtype=torch.bool),
         }
 
     # ------------------------------------------------------------------
@@ -947,9 +1203,25 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         Returns:
           logprobs (B, max_new_tokens)  — per-token log_probs (0 for padded positions)
           entropy  (B, max_new_tokens)  — per-token entropy (0 for padded positions)
+
+        Note on train/eval mode:
+          Qwen3.5's hybrid architecture uses SDPA for standard attention layers.
+          PyTorch's SDPA selects different backends (flash / efficient / math) based on
+          tensor properties AND training mode, which can cause numerically different
+          float accumulation in BF16. Since (a) all dropout is 0.0 and (b) the
+          teacher-forcing path is the same regardless of mode, we force train() here so
+          that recompute (called under model.eval() by fsdp_actor_worker) and the PPO
+          forward pass both use the same SDPA backend → identical logprobs → ratio=1.0.
         """
         if forward_inputs is None:
             raise ValueError("forward_inputs is required for default_forward")
+
+        # Force train mode for numerical consistency: SDPA backend is mode-sensitive
+        # even when all dropout rates are 0. Since lora_dropout=0 and attention_dropout=0,
+        # train mode is fully deterministic and matches the PPO forward path exactly.
+        _was_training = self.model.training
+        if not _was_training:
+            self.model.train()
 
         dev = self._model_device
         bsz = forward_inputs["input_ids"].shape[0]
@@ -1042,6 +1314,9 @@ class QwenNavPolicy(nn.Module, BasePolicy):
 
         if compute_values:
             out["values"] = None  # value head not implemented (add_value_head=False)
+
+        if not _was_training:
+            self.model.eval()
 
         return out
 
