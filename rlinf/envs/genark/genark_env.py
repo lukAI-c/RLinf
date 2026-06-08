@@ -47,152 +47,13 @@ import torch
 from fastdtw import fastdtw
 from scipy.spatial.distance import euclidean
 
-# Genesis is a heavy import; fail loudly if missing so the error message
-# is clear rather than a cryptic AttributeError later.
-try:
-    import genesis as gs
-except ImportError as e:
-    raise ImportError(
-        "GenarkVecEnv requires the Genesis simulator. "
-        "Install it following the GenArk README before using this env."
-    ) from e
-
-
-# ---------------------------------------------------------------------------
-# NavMesh physics helpers  (ported verbatim from genark/env_worker.py)
-# ---------------------------------------------------------------------------
-
-def _batch_cross_2d(a, b):
-    return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
-
-
-def _batch_is_point_in_triangle(pt, v0, v1, v2):
-    def sign(p1, p2, p3):
-        return (
-            (p1[..., 0] - p3[..., 0]) * (p2[..., 1] - p3[..., 1])
-            - (p2[..., 0] - p3[..., 0]) * (p1[..., 1] - p3[..., 1])
-        )
-    d1, d2, d3 = sign(pt, v0, v1), sign(pt, v1, v2), sign(pt, v2, v0)
-    has_neg = (d1 < 0) | (d2 < 0) | (d3 < 0)
-    has_pos = (d1 > 0) | (d2 > 0) | (d3 > 0)
-    return ~(has_neg & has_pos)
-
-
-def _batch_get_z_on_triangle(v0, v1, v2, x, y):
-    edge1  = v1 - v0
-    edge2  = v2 - v0
-    normal = torch.cross(edge1, edge2, dim=-1)
-    mask   = torch.abs(normal[..., 2]) < 1e-6
-    d_x    = x - v0[..., 0]
-    d_y    = y - v0[..., 1]
-    num    = normal[..., 0] * d_x + normal[..., 1] * d_y
-    den    = normal[..., 2]
-    den    = torch.where(torch.abs(den) < 1e-6, torch.ones_like(den), den)
-    z      = v0[..., 2] - num / den
-    return torch.where(mask.expand_as(z), torch.full_like(z, float("inf")), z)
-
-
-def _batch_find_floor(
-    pos_2d, current_floor_z,
-    tri_v0_2d, tri_v1_2d, tri_v2_2d,
-    tri_v0_3d, tri_v1_3d, tri_v2_3d,
-    max_step_height: float = 0.5,
-):
-    pt    = pos_2d.unsqueeze(1)
-    v0_2  = tri_v0_2d.unsqueeze(0)
-    v1_2  = tri_v1_2d.unsqueeze(0)
-    v2_2  = tri_v2_2d.unsqueeze(0)
-    inside = _batch_is_point_in_triangle(pt, v0_2, v1_2, v2_2)
-
-    v0_3  = tri_v0_3d.unsqueeze(0)
-    v1_3  = tri_v1_3d.unsqueeze(0)
-    v2_3  = tri_v2_3d.unsqueeze(0)
-    z_vals = _batch_get_z_on_triangle(v0_3, v1_3, v2_3, pt[..., 0], pt[..., 1])
-
-    z_diff     = torch.abs(z_vals - current_floor_z.unsqueeze(1))
-    valid_cand = inside & (z_diff < max_step_height)
-    z_diff_m   = torch.where(valid_cand, z_diff, torch.full_like(z_diff, float("inf")))
-
-    min_dist, best_idx = torch.min(z_diff_m, dim=1)
-    valid_mask = min_dist != float("inf")
-    best_z     = torch.gather(z_vals, 1, best_idx.unsqueeze(1)).squeeze(1)
-    return valid_mask, best_z, best_idx
-
-
-def _batch_get_sliding_position(
-    current_pos, desired_pos, current_tri_idx,
-    tri_v0_2d, tri_v1_2d, tri_v2_2d,
-    agent_radius: float = 0.0,
-):
-    p0 = tri_v0_2d[current_tri_idx]
-    p1 = tri_v1_2d[current_tri_idx]
-    p2 = tri_v2_2d[current_tri_idx]
-
-    edge_starts = torch.stack([p0, p1, p2], dim=1)
-    edge_ends   = torch.stack([p1, p2, p0], dim=1)
-    edge_vecs   = edge_ends - edge_starts
-
-    p_des  = desired_pos.unsqueeze(1)
-    p_cur  = current_pos.unsqueeze(1)
-    cp1    = _batch_cross_2d(edge_vecs, p_des - edge_starts)
-    cp0    = _batch_cross_2d(edge_vecs, p_cur - edge_starts)
-    crossing = (cp1 * cp0) < 0
-
-    v_ap  = p_des - edge_starts
-    dot   = (v_ap * edge_vecs).sum(dim=-1)
-    sq    = (edge_vecs * edge_vecs).sum(dim=-1)
-    sq_s  = torch.where(sq < 1e-6, torch.ones_like(sq), sq)
-    t     = torch.clamp(dot / sq_s, 0.0, 1.0)
-    candidates = edge_starts + t.unsqueeze(-1) * edge_vecs
-
-    if agent_radius > 0.0:
-        centroid  = ((p0 + p1 + p2) / 3.0).unsqueeze(1)
-        perp_a    = torch.stack([-edge_vecs[..., 1], edge_vecs[..., 0]], dim=-1)
-        perp_b    = -perp_a
-        to_ctr    = centroid - edge_starts
-        dot_a     = (perp_a * to_ctr).sum(dim=-1)
-        inward    = torch.where(dot_a.unsqueeze(-1) > 0, perp_a, perp_b)
-        inward_len = torch.norm(inward, dim=-1, keepdim=True).clamp_min(1e-6)
-        inward_unit = inward / inward_len
-        candidates  = candidates + inward_unit * agent_radius
-
-    has_crossing, first_idx = torch.max(crossing.long(), dim=1)
-    selected = torch.gather(
-        candidates, 1, first_idx.view(-1, 1, 1).expand(-1, 1, 2)
-    ).squeeze(1)
-    return torch.where(has_crossing.view(-1, 1).bool(), selected, current_pos)
-
-
-def _calculate_initial_yaw(rotations: torch.Tensor) -> torch.Tensor:
-    """Habitat quaternion [x,y,z,w] → Genesis yaw (radians)."""
-    x, y, z, w = rotations[:, 0], rotations[:, 1], rotations[:, 2], rotations[:, 3]
-    dir_x_g =  -2 * w * y
-    dir_y_g = -(y * y - w * w)
-    return torch.atan2(dir_y_g, dir_x_g)
-
-
-def _hab_to_genesis(pos):
-    x, y, z = pos[0], pos[1], pos[2]
-    return x, -z, y
-
-
-def _genesis_to_hab(cam_pos_gen: torch.Tensor, camera_height: float) -> torch.Tensor:
-    x = cam_pos_gen[:, 0]
-    y = cam_pos_gen[:, 2] - camera_height
-    z = -cam_pos_gen[:, 1]
-    return torch.stack([x, y, z], dim=1)
-
-
-def _update_camera(cam, cam_pos: torch.Tensor, cam_yaw: torch.Tensor):
-    dir_x  = torch.cos(cam_yaw)
-    dir_y  = torch.sin(cam_yaw)
-    lookat = cam_pos.clone()
-    lookat[:, 0] += dir_x
-    lookat[:, 1] += dir_y
-    lookat[:, 2]  = cam_pos[:, 2]
-    up = torch.zeros_like(cam_pos)
-    up[:, 2] = 1.0
-    cam.set_pose(pos=cam_pos, lookat=lookat, up=up)
+from rlinf.envs.genark.genesis_backend import (
+    GenesisSimBackend,
+    GenesisLocalBackend,
+    _calculate_initial_yaw,
+    _hab_to_genesis,
+    _genesis_to_hab,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +129,7 @@ class GenarkVecEnv(gym.Env):
         seed_offset: int,
         total_num_processes: int,
         worker_info=None,
+        backend: GenesisSimBackend = None,
     ):
         super().__init__()
         self.cfg                 = cfg
@@ -373,14 +235,13 @@ class GenarkVecEnv(gym.Env):
         })
         self.action_space = S.Discrete(4)
 
-        # --- internal state (initialised in _init_genesis) ---
+        # --- internal state ---
         self._gs_ready        = False
-        self._cam_pos         = None     # (num_envs, 3) on gs.device
-        self._cam_yaw         = None     # (num_envs,)   on gs.device
-        self._current_tri_idx = None     # (num_envs,)   on gs.device
-        self._active_mask     = None     # (num_envs,)   bool on gs.device
-        self._goal_pos_t      = None     # (num_envs, 3) habitat coords on gs.device
-        self._prev_geo_dist   = None     # (num_envs,)   float32 on gs.device
+        # cam_pos, cam_yaw, current_tri_idx are owned by _sim (backend);
+        # GenarkVecEnv accesses them via self._sim.cam_pos etc.
+        self._active_mask     = None     # (num_envs,) bool on backend device — set after backend init
+        self._goal_pos_t      = None     # (num_envs, 3) habitat coords on backend device
+        self._prev_geo_dist   = None     # (num_envs,) float32 on backend device
         self._elapsed_steps   = np.zeros(num_envs, dtype=np.int32)
         self._instructions    = [""] * num_envs
         self._episodes        = [None] * num_envs
@@ -412,10 +273,6 @@ class GenarkVecEnv(gym.Env):
         self._episode_log: list[dict] = []
         self._exhausted = False
         self._dummy_obs_cache = None
-
-        # navmesh geometry tensors — set in _load_scene
-        self._tri_v0_2d = self._tri_v1_2d = self._tri_v2_2d = None
-        self._tri_v0_3d = self._tri_v1_3d = self._tri_v2_3d = None
 
         # Load episode list and group by scene.
         # Genesis builds ONE scene per process — all envs share it.
@@ -464,101 +321,42 @@ class GenarkVecEnv(gym.Env):
         self._group_done_counts: dict[int, int] = {}
         self._episode_cycle: int = 0  # incremented on each cyclic reshuffle
 
+        # Initialise backend.  Caller can pass a backend= explicitly, or set
+        # cfg.genesis_backend = "remote" to use GenesisRemoteBackend (Ray).
+        if backend is None:
+            genesis_backend_type = str(getattr(cfg, "genesis_backend", "local"))
+            if genesis_backend_type == "remote":
+                from rlinf.envs.genark.genesis_server import (
+                    GenesisServerPool,
+                    GenesisRemoteBackend,
+                )
+                import torch
+                pool = GenesisServerPool(
+                    cfg,
+                    {self._pinned_scene_id: min(num_envs, len(self._all_episodes))},
+                )
+                backend = GenesisRemoteBackend(
+                    pool,
+                    scene_id=self._pinned_scene_id,
+                    num_envs=num_envs,
+                    device=torch.device("cuda"),
+                )
+            else:
+                backend = GenesisLocalBackend(cfg, num_envs)
+        self._sim: GenesisSimBackend = backend
+
         # Pick initial scene and episodes, then build Genesis scene
         self._current_scene_id = None
         self._scene_episode_pool: list[dict] = []
-        self._init_genesis()
         self._assign_episodes_to_envs()
 
     # ------------------------------------------------------------------
-    # Genesis initialisation  (called once — Genesis init is global)
+    # Scene loading — delegates to backend
     # ------------------------------------------------------------------
 
-    def _init_genesis(self):
-        if not gs._initialized:
-            gs.init(backend=gs.cuda)
-        self._renderer = gs.renderers.BatchRenderer(use_rasterizer=True)
-        self._gs_scene = gs.Scene(
-            renderer=self._renderer,
-            show_viewer=False,
-            vis_options=gs.options.VisOptions(
-                ambient_light=(1.0, 1.0, 1.0),
-                plane_reflection=False,
-            ),
-        )
-        # Camera is created once; pose updated each step
-        self._cam = self._gs_scene.add_camera(
-            res=(self.cam_w, self.cam_h),
-            fov=self.fov,
-            GUI=False,
-        )
-
     def _load_scene(self, scene_id: str):
-        """Load mesh + navmesh for a new scene into the existing Genesis scene.
-
-        scene_id is a Habitat-style path like "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb".
-        Mesh lookup order:
-          1. <glb_cache_dir>/<scan_name>.glb   (pre-converted GLB, fastest)
-          2. <scene_datasets>/<scan_name>/matterport_mesh/*.obj  (fallback)
-        """
-        scan_name = os.path.basename(os.path.dirname(scene_id))
-
-        # 1. GLB cache (original genark uses /home/clk/workspace/genark/glb_cache)
-        glb_cache_dir = getattr(self.cfg.init_params, "glb_cache_dir",
-                                "/home/clk/workspace/genark/glb_cache")
-        glb_path = os.path.join(glb_cache_dir, f"{scan_name}.glb")
-        if os.path.exists(glb_path):
-            mesh_path = glb_path
-        else:
-            # 2. Fallback: OBJ in matterport_mesh subdirectory
-            obj_dir   = os.path.join(self.scene_datasets, scan_name, "matterport_mesh")
-            obj_files = [f for f in os.listdir(obj_dir) if f.endswith(".obj")]
-            if not obj_files:
-                raise FileNotFoundError(
-                    f"No mesh for '{scan_name}'. Tried:\n"
-                    f"  {glb_path}\n  {obj_dir}/*.obj"
-                )
-            mesh_path = os.path.join(obj_dir, obj_files[0])
-
-        if self._gs_ready:
-            # Genesis does not support modifying a built scene.
-            # All episodes are pinned to one scene_id, so this should never fire.
-            raise RuntimeError(
-                f"Attempted to switch Genesis scene from '{self._current_scene_id}' "
-                f"to '{scene_id}'. Genesis does not support scene rebuilding. "
-                "All episodes must share the same scene_id."
-            )
-
-        self._gs_scene.add_entity(morph=gs.morphs.Mesh(
-            file=mesh_path, fixed=True, collision=False,
-            # GLB converted from OBJ preserves original Habitat coords (Y-up).
-            # Tell Genesis NOT to apply its automatic Y-UP → Z-UP rotation.
-            file_meshes_are_zup=True,
-        ))
-
-        # Load navmesh
-        navmesh_path = os.path.join(
-            self.scene_datasets, scan_name, "navmesh.npz"
-        )
-        nm    = np.load(navmesh_path)
-        device = gs.device
-        V_hab  = torch.tensor(nm["verts"], device=device, dtype=torch.float32)
-        F_idx  = torch.tensor(nm["faces"], device=device, dtype=torch.long)
-
-        V_gen            = torch.zeros_like(V_hab)
-        V_gen[:, 0]      =  V_hab[:, 0]
-        V_gen[:, 1]      = -V_hab[:, 2]
-        V_gen[:, 2]      =  V_hab[:, 1]
-
-        self._tri_v0_3d  = V_gen[F_idx[:, 0]]
-        self._tri_v1_3d  = V_gen[F_idx[:, 1]]
-        self._tri_v2_3d  = V_gen[F_idx[:, 2]]
-        self._tri_v0_2d  = self._tri_v0_3d[:, :2]
-        self._tri_v1_2d  = self._tri_v1_3d[:, :2]
-        self._tri_v2_2d  = self._tri_v2_3d[:, :2]
-
-        # Build only active_slot_count envs — ghost slots don't need Genesis VRAM
-        self._gs_scene.build(n_envs=self._active_slot_count, env_spacing=(0.0, 0.0))
+        """Load mesh + navmesh via backend, then mark scene as ready."""
+        self._sim.load_scene(scene_id, n_active_envs=self._active_slot_count)
         self._gs_ready = True
         self._current_scene_id = scene_id
 
@@ -631,53 +429,43 @@ class GenarkVecEnv(gym.Env):
         return obs, {}
 
     def _init_agent_poses(self, env_idx: list[int]):
-        device = gs.device
+        device = self._sim.device
         N      = self.num_envs
 
-        if self._cam_pos is None:
-            self._cam_pos         = torch.zeros(N, 3, dtype=torch.float32, device=device)
-            self._cam_yaw         = torch.zeros(N,    dtype=torch.float32, device=device)
-            self._current_tri_idx = torch.zeros(N,    dtype=torch.long,    device=device)
-            self._active_mask     = torch.ones(N,     dtype=torch.bool,    device=device)
-            self._goal_pos_t      = torch.zeros(N, 3, dtype=torch.float32, device=device)
-            self._prev_geo_dist        = torch.zeros(N, dtype=torch.float32, device=device)
-            self._last_parse_ok        = torch.zeros(N, dtype=torch.bool,    device=device)
-            self._dtg_decision_start   = torch.zeros(N, dtype=torch.float32, device=device)
+        # Lazy-init GRPO metric tensors (owned by GenarkVecEnv, not backend)
+        if self._active_mask is None:
+            self._active_mask          = torch.ones(N,     dtype=torch.bool,    device=device)
+            self._goal_pos_t           = torch.zeros(N, 3, dtype=torch.float32, device=device)
+            self._prev_geo_dist        = torch.zeros(N,    dtype=torch.float32, device=device)
+            self._last_parse_ok        = torch.zeros(N,    dtype=torch.bool,    device=device)
+            self._dtg_decision_start   = torch.zeros(N,    dtype=torch.float32, device=device)
 
-        for i in env_idx:
-            ep   = self._episodes[i]
-            if ep is None:
-                continue  # ghost slot — no episode assigned, skip
-            sp   = ep["start_position"]
+        # Build position/yaw tensors from episode data for valid slots
+        valid_idx = [i for i in env_idx if self._episodes[i] is not None]
+        if not valid_idx:
+            return
+
+        positions = torch.zeros(len(valid_idx), 3, dtype=torch.float32)
+        yaws      = torch.zeros(len(valid_idx),    dtype=torch.float32)
+
+        for j, i in enumerate(valid_idx):
+            ep  = self._episodes[i]
+            sp  = ep["start_position"]
             gx, gy, gz = _hab_to_genesis(sp)
-            self._cam_pos[i]   = torch.tensor(
-                [gx, gy, gz + self.camera_height], dtype=torch.float32, device=device
-            )
-            rot = torch.tensor(ep["start_rotation"], dtype=torch.float32, device=device)
-            self._cam_yaw[i]   = _calculate_initial_yaw(rot.unsqueeze(0))[0]
-            goal_p             = ep["goals"][0]["position"]
+            positions[j] = torch.tensor([gx, gy, gz + self.camera_height])
+            rot          = torch.tensor(ep["start_rotation"], dtype=torch.float32)
+            yaws[j]      = _calculate_initial_yaw(rot.unsqueeze(0))[0]
+
+            goal_p = ep["goals"][0]["position"]
             self._goal_pos_t[i] = torch.tensor(goal_p, dtype=torch.float32, device=device)
             self._active_mask[i] = True
 
-        # Snap active envs to navmesh floor (skip ghost slots that have no pose)
-        valid_idx = [i for i in env_idx if self._episodes[i] is not None]
-        if not valid_idx:
-            _update_camera(self._cam, self._cam_pos[:self._active_slot_count], self._cam_yaw[:self._active_slot_count])
-            return
+        # Backend: set poses + snap to navmesh + update Genesis camera
+        self._sim.set_agent_poses(valid_idx, positions, yaws)
 
-        idx_t  = torch.tensor(valid_idx, device=device)
-        valid, new_z, tri_idx = _batch_find_floor(
-            self._cam_pos[idx_t, :2],
-            self._cam_pos[idx_t, 2] - self.camera_height,
-            self._tri_v0_2d, self._tri_v1_2d, self._tri_v2_2d,
-            self._tri_v0_3d, self._tri_v1_3d, self._tri_v2_3d,
-            self.max_step_height,
-        )
-        self._cam_pos[idx_t, 2]      = new_z + self.camera_height
-        self._current_tri_idx[idx_t] = tri_idx
-
-        # Record initial distances for active slots only
-        init_hab = _genesis_to_hab(self._cam_pos, self.camera_height)
+        # Read back snapped positions for metric initialisation
+        cam_pos = self._sim.cam_pos
+        init_hab = _genesis_to_hab(cam_pos, self.camera_height)
         for i in valid_idx:
             d = torch.norm(init_hab[i] - self._goal_pos_t[i]).item()
             self._distances_lists[i] = [d]
@@ -685,11 +473,8 @@ class GenarkVecEnv(gym.Env):
             self._prev_geo_dist[i]   = d
             self._start_dtg[i]       = d
             self._dtg_decision_start[i] = d
-            # ndtw_sr_delta mode: reset per-env previous nDTW/SR (initial path = single point → nDTW=1.0)
             self._prev_ndtw[i] = 1.0
             self._prev_sr[i]   = 0.0
-
-        _update_camera(self._cam, self._cam_pos[:self._active_slot_count], self._cam_yaw[:self._active_slot_count])
 
     def step(
         self,
@@ -710,7 +495,7 @@ class GenarkVecEnv(gym.Env):
         if self._exhausted:
             return self._dormant_step()
 
-        device = gs.device
+        device = self._sim.device
         if not isinstance(actions, torch.Tensor):
             actions = torch.tensor(actions, dtype=torch.long, device=device)
         else:
@@ -754,89 +539,16 @@ class GenarkVecEnv(gym.Env):
             if self._slot_active[i] and not self._slot_done[i]:
                 self._stop_called[i] = True
 
-        # --- Rotation ---
-        self._cam_yaw[(actions == self.TURN_LEFT)  & self._active_mask] += self.step_turn
-        self._cam_yaw[(actions == self.TURN_RIGHT) & self._active_mask] -= self.step_turn
+        # --- Physics: rotation + forward movement via backend (NavMesh collision) ---
+        self._sim.step_physics(actions, self._active_mask, self._active_slot_count)
 
-        # --- Forward movement with NavMesh collision ---
-        fwd_m = (actions == self.MOVE_FORWARD) & self._active_mask
-        if fwd_m.any():
-            fwd_idx = fwd_m.nonzero(as_tuple=True)[0]
-            dx = torch.cos(self._cam_yaw[fwd_idx])
-            dy = torch.sin(self._cam_yaw[fwd_idx])
-            desired = torch.stack([
-                self._cam_pos[fwd_idx, 0] + dx * self.step_move,
-                self._cam_pos[fwd_idx, 1] + dy * self.step_move,
-            ], dim=1)
-            cur_floor_z = self._cam_pos[fwd_idx, 2] - self.camera_height
-
-            valid, new_z, new_tri = _batch_find_floor(
-                desired, cur_floor_z,
-                self._tri_v0_2d, self._tri_v1_2d, self._tri_v2_2d,
-                self._tri_v0_3d, self._tri_v1_3d, self._tri_v2_3d,
-                self.max_step_height,
-            )
-
-            if self.allow_sliding:
-                invalid = ~valid
-                if invalid.any():
-                    inv_local = invalid.nonzero(as_tuple=True)[0]
-                    slide_pos = _batch_get_sliding_position(
-                        self._cam_pos[fwd_idx[inv_local], :2],
-                        desired[inv_local],
-                        self._current_tri_idx[fwd_idx[inv_local]],
-                        self._tri_v0_2d, self._tri_v1_2d, self._tri_v2_2d,
-                        self.agent_radius,
-                    )
-                    sv, sz, st = _batch_find_floor(
-                        slide_pos, cur_floor_z[inv_local],
-                        self._tri_v0_2d, self._tri_v1_2d, self._tri_v2_2d,
-                        self._tri_v0_3d, self._tri_v1_3d, self._tri_v2_3d,
-                        self.max_step_height,
-                    )
-                    if sv.any():
-                        can_slide       = inv_local[sv]
-                        desired[can_slide]  = slide_pos[sv]
-                        new_z[can_slide]    = sz[sv]
-                        new_tri[can_slide]  = st[sv]
-                        valid[can_slide]    = True
-
-            moved = fwd_idx[valid]
-            self._cam_pos[moved, 0]     = desired[valid, 0]
-            self._cam_pos[moved, 1]     = desired[valid, 1]
-            self._cam_pos[moved, 2]     = new_z[valid] + self.camera_height
-            self._current_tri_idx[moved] = new_tri[valid]
-
-        # --- Render (active slots only; pad ghost slots with zeros) ---
-        _update_camera(self._cam, self._cam_pos[:self._active_slot_count], self._cam_yaw[:self._active_slot_count])
-        rgb_active, _, _, _ = self._cam.render(
-            rgb=True, depth=False, segmentation=False, force_render=True
-        )  # (active_slot_count, H, W, 3)
-        if rgb_active.dtype == torch.uint8:
-            rgb_float = rgb_active.float() / 255.0
-        else:
-            rgb_float = rgb_active
-        rgb_active = torch.clamp(rgb_float * self.light_scale * 255.0, 0, 255).byte()
-        # Pad ghost slots with zeros so output shape is always (num_envs, H, W, 3)
-        if self._active_slot_count < self.num_envs:
-            pad = torch.zeros(
-                self.num_envs - self._active_slot_count,
-                self.cam_h, self.cam_w, 3,
-                dtype=torch.uint8, device=rgb_active.device,
-            )
-            rgb_batch = torch.cat([rgb_active, pad], dim=0)
-        else:
-            rgb_batch = rgb_active
-        self._current_rgb = rgb_batch.cpu().numpy()  # (num_envs, H, W, 3) uint8
-
-        # 4-dir: render 3 additional views (left/right/behind) and store
-        self._render_extra_3dir()
+        # --- Render via backend ---
+        self._current_rgb        = self._sim.render_main(self._active_slot_count)
+        self._current_rgb_extras = self._sim.render_4dir(self._active_slot_count)
 
         # --- Metrics ---
-        # Metrics only for active slots (geometry tensors are num_envs-shaped but
-        # only [:active_slot_count] have valid values from Genesis)
         N_act = self._active_slot_count
-        curr_hab_act = _genesis_to_hab(self._cam_pos[:N_act], self.camera_height)
+        curr_hab_act = _genesis_to_hab(self._sim.cam_pos[:N_act], self.camera_height)
         curr_dist_act = torch.norm(
             curr_hab_act - self._goal_pos_t[:N_act].to(curr_hab_act.device), dim=1
         )
@@ -965,30 +677,12 @@ class GenarkVecEnv(gym.Env):
 
     def _build_obs(self) -> dict:
         """Assemble observation tensors from current state."""
-        device = gs.device
+        device = self._sim.device
 
-        # RGB from last render (or zeros on first reset before render)
+        # RGB from last render (or first render after reset)
         if self._current_rgb is None:
-            # Initial render after reset — active slots only, pad ghost slots
-            _update_camera(self._cam, self._cam_pos[:self._active_slot_count], self._cam_yaw[:self._active_slot_count])
-            rgb_raw, _, _, _ = self._cam.render(
-                rgb=True, depth=False, segmentation=False, force_render=True
-            )
-            if rgb_raw.dtype == torch.uint8:
-                rgb_float = rgb_raw.float() / 255.0
-            else:
-                rgb_float = rgb_raw
-            rgb_raw = torch.clamp(rgb_float * self.light_scale * 255.0, 0, 255).byte()
-            if self._active_slot_count < self.num_envs:
-                pad = torch.zeros(
-                    self.num_envs - self._active_slot_count,
-                    self.cam_h, self.cam_w, 3,
-                    dtype=torch.uint8, device=rgb_raw.device,
-                )
-                rgb_raw = torch.cat([rgb_raw, pad], dim=0)
-            self._current_rgb = rgb_raw.cpu().numpy()
-            # Lazy-init render: also produce 4-dir extras if enabled
-            self._render_extra_3dir()
+            self._current_rgb        = self._sim.render_main(self._active_slot_count)
+            self._current_rgb_extras = self._sim.render_4dir(self._active_slot_count)
 
         # (N, H, W, 3) → (N, 3, H, W) as uint8 tensor on GPU
         rgb_np  = self._current_rgb
@@ -1229,14 +923,15 @@ class GenarkVecEnv(gym.Env):
         N = self.num_envs
         # Build / reuse a tiny dummy obs in the same key layout as _build_obs.
         if self._dummy_obs_cache is None:
+            dev = self._sim.device
             dummy_rgb = torch.zeros((N, self.cam_h, self.cam_w, 3),
-                                    dtype=torch.uint8, device=gs.device)
-            dummy_states = torch.zeros((N, 1), dtype=torch.float32, device=gs.device)
+                                    dtype=torch.uint8, device=dev)
+            dummy_states = torch.zeros((N, 1), dtype=torch.float32, device=dev)
             # extra_view_images: (N, 3, H, W, 3) uint8 when enable_4dir_render, else None.
             # wrist_images: GenArk has no wrist camera → always None.
             dummy_extra = (
                 torch.zeros((N, 3, self.cam_h, self.cam_w, 3),
-                            dtype=torch.uint8, device=gs.device)
+                            dtype=torch.uint8, device=dev)
                 if self.enable_4dir_render else None
             )
             self._dummy_obs_cache = {
@@ -1310,59 +1005,6 @@ class GenarkVecEnv(gym.Env):
             for k in keys:
                 arrays[k][i] = float(m.get(k, 0.0))
         return {k: torch.tensor(v, dtype=torch.float32) for k, v in arrays.items()}
-
-    def _render_extra_3dir(self) -> None:
-        """
-        Render 3 additional camera angles (left=+90°, right=-90°, behind=180°)
-        at current cam_pos, store as `self._current_rgb_extras`
-        shape (num_envs, 3, H, W, 3) uint8 numpy.
-
-        Front view is rendered by the caller; we only render the 3 extras here.
-        Camera pose is restored to front yaw afterward.
-
-        Cost: 3× single-direction render. Disabled unless `enable_4dir_render`.
-        """
-        if not self.enable_4dir_render:
-            self._current_rgb_extras = None
-            return
-
-        N_act = self._active_slot_count
-        if N_act == 0:
-            self._current_rgb_extras = None
-            return
-
-        # Yaw deltas for [left, right, behind] (CCW positive, matches TURN_LEFT)
-        deltas = [math.radians(90.0), math.radians(-90.0), math.radians(180.0)]
-
-        extras_np = []
-        front_yaw = self._cam_yaw[:N_act]
-        for d_yaw in deltas:
-            rotated_yaw = front_yaw + d_yaw
-            _update_camera(self._cam, self._cam_pos[:N_act], rotated_yaw)
-            rgb_raw, _, _, _ = self._cam.render(
-                rgb=True, depth=False, segmentation=False, force_render=True
-            )
-            # Apply same light_scale + uint8 conversion as the front render
-            if rgb_raw.dtype == torch.uint8:
-                rgb_float = rgb_raw.float() / 255.0
-            else:
-                rgb_float = rgb_raw
-            rgb_raw = torch.clamp(rgb_float * self.light_scale * 255.0, 0, 255).byte()
-            # Pad ghost slots
-            if N_act < self.num_envs:
-                pad = torch.zeros(
-                    self.num_envs - N_act,
-                    self.cam_h, self.cam_w, 3,
-                    dtype=torch.uint8, device=rgb_raw.device,
-                )
-                rgb_raw = torch.cat([rgb_raw, pad], dim=0)
-            extras_np.append(rgb_raw.cpu().numpy())  # (N, H, W, 3)
-
-        # Restore front camera pose
-        _update_camera(self._cam, self._cam_pos[:N_act], front_yaw)
-
-        # (3, N, H, W, 3) → (N, 3, H, W, 3)
-        self._current_rgb_extras = np.stack(extras_np, axis=1)
 
     def _compute_ndtw_sr_delta_reward(
         self,

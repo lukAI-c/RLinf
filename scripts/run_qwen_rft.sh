@@ -8,10 +8,14 @@
 #   ./scripts/run_qwen_rft.sh lora               # LoRA 微调（~10 min/step）
 #   RESUME_DIR=/path/ckpt ./scripts/run_qwen_rft.sh  # 从 checkpoint 继续
 #
-# GPU 分配（支持 3/4/6 卡）：
-#   GPUS=4,5,6,0,1,7 SCENE_OFFSET=3 ./scripts/run_qwen_rft.sh lora  # 6 卡：dual-scene
+# GPU 分配（支持 3/4/6/7/8 卡）：
+#   GPUS=4,5,6,7,0,1,2,3 SCENE_OFFSET=7 ./scripts/run_qwen_rft.sh lora  # 8 卡：quad-scene + 2-rank rollout
+#     → actor=4-5(2-rank), rollout=6-7(2-rank), env=0-3(4 workers)
+#   GPUS=4,5,6,0,1,2,3 SCENE_OFFSET=7 ./scripts/run_qwen_rft.sh lora    # 7 卡：quad-scene，GPU7 idle
+#     → actor=4-5(2-rank), rollout=6, env=0-3(4 workers)
+#   GPUS=4,5,6,0,1,7 SCENE_OFFSET=3 ./scripts/run_qwen_rft.sh lora       # 6 卡：dual-scene
 #     → actor=4-5(2-rank), rollout=6, env=0-1(dual), GPU7 idle
-#     ⚠️  注意：GPUS 顺序必须保证 [0-1]=actor(连续), [2]=rollout, [3-4]=env(连续)
+#     ⚠️  注意：GPUS 顺序必须保证 [0-1]=actor(连续), [2]=rollout或rollout起始, env(连续)
 #         env 区间 end>=start，否则 assert end_rank>=start_rank 崩溃
 #   GPUS=2,3,4,5 ./scripts/run_qwen_rft.sh      # 4 卡：env 独占第 4 张
 #   GPUS=3,4,5   ./scripts/run_qwen_rft.sh      # 3 卡：rollout+env 共享
@@ -28,11 +32,20 @@ GPUS=${GPUS:-2,3,4,5}    # 默认 4 卡
 MODE=${1:-full}
 RESUME_DIR=${RESUME_DIR:-}
 SCENE_OFFSET=${SCENE_OFFSET:-0}   # env.train/eval.scene_offset — 控制 worker→scene 分配
+GENESIS_BACKEND=${GENESIS_BACKEND:-local}   # "local" | "remote" (Ray actor per scene)
 
 # GPU 分配
 IFS=',' read -ra GPU_ARR <<< "$GPUS"
 NUM_GPUS=${#GPU_ARR[@]}
-if [ "$NUM_GPUS" -ge 7 ]; then
+if [ "$NUM_GPUS" -ge 8 ]; then
+  # 8 卡 quad-scene + 2-rank rollout：actor=2-rank, rollout=2-rank, env=4 workers
+  # rollout_ws=2 加速：48 envs → 每 rank 处理 24 envs → 2 chunks/decision（并行）→ ~1.5x 加速
+  ACTOR_GPUS="${GPU_ARR[0]}-${GPU_ARR[1]}"   # 前两张给 actor (FSDP 2-rank)
+  ROLLOUT_GPU="${GPU_ARR[2]}-${GPU_ARR[3]}"  # 第三/四张给 rollout (2-rank)
+  ENV_GPU="${GPU_ARR[4]}-${GPU_ARR[7]}"       # 第五至第八张给 env（4 worker，4 scene）
+  ENV_INFO="quad(${ENV_GPU})"
+  ACTOR_RANK_INFO="FSDP 2-rank"
+elif [ "$NUM_GPUS" -ge 7 ]; then
   # 7 卡 quad-scene：2-rank actor + 1 rollout + 4 env workers（第8张闲置）
   ACTOR_GPUS="${GPU_ARR[0]}-${GPU_ARR[1]}"   # 7 卡：前两张给 actor (FSDP 2-rank)
   ROLLOUT_GPU="${GPU_ARR[2]}"                 # 第三张给 rollout
@@ -154,7 +167,7 @@ lora)
   # lora_alpha=64：LoRA scaling=1.0
   if [ "$NUM_GPUS" -ge 7 ]; then
     TRAIN_ENVS=48; EVAL_ENVS=24; GLOBAL_BS=192
-    # 四 scene：4 env workers × 12 envs，total=48; 48%(4×3)=0 ✓; 192%(1×2)=0 ✓
+    # 四 scene：4 env workers × 12 envs，total=48; 48%(4×3)=0 ✓; 192%(rollout_ws×2)=0 ✓
   elif [ "$NUM_GPUS" -ge 6 ]; then
     TRAIN_ENVS=24; EVAL_ENVS=12; GLOBAL_BS=96
     # 双 scene：scene_offset 通过 placement 分配，env worker 0 用 scene 0，worker 1 用 scene 1
@@ -163,7 +176,7 @@ lora)
   fi
   EXTRA_ARGS=(
     "actor.model.is_lora=true"
-    "actor.micro_batch_size=1"          # FSDP all-gather peak mem 大，用 mbs=1 防 OOM
+    "actor.micro_batch_size=2"          # 4B FSDP 2-rank activation 峰值 ~40GB，mbs=8 会 OOM；mbs=2 安全
     "actor.global_batch_size=${GLOBAL_BS}"
     "actor.optim.lr=1e-7"              # 1e-6→1e-7：grad_norm=154/clipped=1.0 说明需要降一个数量级
     "actor.model.chunk_size=16"
@@ -197,6 +210,8 @@ lora)
     "actor.model.history_max_frames=4"   # 减少视觉 token：8→4，降低 OOM 风险
     "env.train.scene_offset=${SCENE_OFFSET}"
     "env.eval.scene_offset=${SCENE_OFFSET}"
+    "env.train.genesis_backend=${GENESIS_BACKEND}"
+    "env.eval.genesis_backend=${GENESIS_BACKEND}"
     "runner.max_epochs=500"
     "runner.val_check_interval=10"
     "runner.save_interval=20"
