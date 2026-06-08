@@ -345,12 +345,23 @@ class GenarkVecEnv(gym.Env):
                 backend = GenesisLocalBackend(cfg, num_envs)
         self._sim: GenesisSimBackend = backend
 
-        # Async render pipeline state (Phase 3).
+        # Async render pipeline + crash isolation state (Phase 3 / Phase 4).
         # Only active when backend is GenesisRemoteBackend.
-        from rlinf.envs.genark.genesis_server import GenesisRemoteBackend as _RemoteBackend
+        from rlinf.envs.genark.genesis_server import (
+            GenesisRemoteBackend as _RemoteBackend,
+            SceneCrashError as _SceneCrashError,
+        )
+        self._RemoteBackend   = _RemoteBackend
+        self._SceneCrashError = _SceneCrashError
         self._use_async_render: bool = isinstance(self._sim, _RemoteBackend)
         self._pending_rgb_ref        = None   # Ray ObjectRef for in-flight render_main
         self._pending_rgb_extras_ref = None   # Ray ObjectRef for in-flight render_4dir
+
+        # Phase 4: scene crash isolation.
+        # When the remote actor crashes, _scene_crashed is set True and all
+        # steps enter dormant until the actor is rebuilt and re-initialised.
+        self._scene_crashed: bool         = False
+        self._crash_recovery_cooldown: int = 0   # steps to skip before next health poll
 
         # Pick initial scene and episodes, then build Genesis scene
         self._current_scene_id = None
@@ -437,6 +448,10 @@ class GenarkVecEnv(gym.Env):
         self._pending_rgb_extras_ref = None
         self._current_rgb            = None
         self._current_rgb_extras     = None
+        # If actor was rebuilt externally, allow reset to clear crash flag.
+        if self._scene_crashed and isinstance(self._sim, self._RemoteBackend):
+            if self._sim._pool.is_healthy(self._sim._scene_id):
+                self._scene_crashed = False
 
         obs  = self._build_obs()
         return obs, {}
@@ -508,6 +523,11 @@ class GenarkVecEnv(gym.Env):
         if self._exhausted:
             return self._dormant_step()
 
+        # Phase 4: scene crash recovery.
+        # If the remote actor crashed, stay dormant until it is rebuilt.
+        if self._scene_crashed:
+            return self._dormant_step_crash_recovery()
+
         device = self._sim.device
         if not isinstance(actions, torch.Tensor):
             actions = torch.tensor(actions, dtype=torch.long, device=device)
@@ -552,25 +572,39 @@ class GenarkVecEnv(gym.Env):
             if self._slot_active[i] and not self._slot_done[i]:
                 self._stop_called[i] = True
 
-        # --- Physics: rotation + forward movement via backend (NavMesh collision) ---
-        self._sim.step_physics(actions, self._active_mask, self._active_slot_count)
+        # --- Physics + Render (wrapped for Phase 4 crash isolation) ---
+        try:
+            self._sim.step_physics(actions, self._active_mask, self._active_slot_count)
+        except self._SceneCrashError as e:
+            print(f"[GenArk][crash] scene actor crashed during step_physics: {e}", flush=True)
+            self._scene_crashed = True
+            self._crash_recovery_cooldown = 50
+            self._pending_rgb_ref = self._pending_rgb_extras_ref = None
+            return self._dormant_step_crash_recovery()
 
         # --- Render via backend ---
-        if self._use_async_render:
-            # Phase 3 async pipeline:
-            # 1. Fetch the render submitted at the *previous* step (LLM generate has
-            #    been running for ~120s in parallel, so the result is ready instantly).
-            if self._pending_rgb_ref is not None:
-                self._current_rgb = self._sim.fetch_render_main(self._pending_rgb_ref)
-                self._current_rgb_extras = self._sim.fetch_render_4dir(
-                    self._pending_rgb_extras_ref
-                )
-            # 2. Submit this step's render asynchronously (returns immediately).
-            self._pending_rgb_ref        = self._sim.render_main_async(self._active_slot_count)
-            self._pending_rgb_extras_ref = self._sim.render_4dir_async(self._active_slot_count)
-        else:
-            self._current_rgb        = self._sim.render_main(self._active_slot_count)
-            self._current_rgb_extras = self._sim.render_4dir(self._active_slot_count)
+        try:
+            if self._use_async_render:
+                # Phase 3 async pipeline:
+                # 1. Fetch the render submitted at the *previous* step (LLM generate has
+                #    been running for ~120s in parallel, so the result is ready instantly).
+                if self._pending_rgb_ref is not None:
+                    self._current_rgb = self._sim.fetch_render_main(self._pending_rgb_ref)
+                    self._current_rgb_extras = self._sim.fetch_render_4dir(
+                        self._pending_rgb_extras_ref
+                    )
+                # 2. Submit this step's render asynchronously (returns immediately).
+                self._pending_rgb_ref        = self._sim.render_main_async(self._active_slot_count)
+                self._pending_rgb_extras_ref = self._sim.render_4dir_async(self._active_slot_count)
+            else:
+                self._current_rgb        = self._sim.render_main(self._active_slot_count)
+                self._current_rgb_extras = self._sim.render_4dir(self._active_slot_count)
+        except self._SceneCrashError as e:
+            print(f"[GenArk][crash] scene actor crashed during render: {e}", flush=True)
+            self._scene_crashed = True
+            self._crash_recovery_cooldown = 50
+            self._pending_rgb_ref = self._pending_rgb_extras_ref = None
+            return self._dormant_step_crash_recovery()
 
         # --- Metrics ---
         N_act = self._active_slot_count
@@ -945,6 +979,48 @@ class GenarkVecEnv(gym.Env):
                 f"(pool remaining: {len(self._all_episodes) - self._next_ep_idx})",
                 flush=True,
             )
+
+    def _dormant_step_crash_recovery(
+        self,
+    ) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        """Dormant step issued while a remote scene actor is being rebuilt.
+
+        Every `_crash_recovery_cooldown` calls we check if the actor is healthy
+        again.  Once healthy, we re-initialise agent poses and clear the crash
+        flag so normal stepping resumes on the next call.
+        """
+        if self._crash_recovery_cooldown > 0:
+            self._crash_recovery_cooldown -= 1
+        else:
+            # Poll health; cooldown between polls to avoid spamming Ray.
+            self._crash_recovery_cooldown = 50
+            if isinstance(self._sim, self._RemoteBackend):
+                pool = self._sim._pool
+                if pool.is_healthy(self._sim._scene_id):
+                    print(
+                        f"[GenArk][crash-recovery] actor rebuilt for scene "
+                        f"'{self._sim._scene_id}', re-initialising agent poses.",
+                        flush=True,
+                    )
+                    try:
+                        active_idx = [
+                            i for i in range(self.num_envs)
+                            if self._slot_active[i] and self._episodes[i] is not None
+                        ]
+                        if active_idx:
+                            self._init_agent_poses(active_idx)
+                        self._scene_crashed = False
+                        self._pending_rgb_ref        = None
+                        self._pending_rgb_extras_ref = None
+                        self._current_rgb            = None
+                        self._current_rgb_extras     = None
+                    except Exception as e:
+                        print(
+                            f"[GenArk][crash-recovery] re-init failed: {e}, "
+                            "staying dormant.",
+                            flush=True,
+                        )
+        return self._dormant_step()
 
     def _dormant_step(self) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """Cheap no-op step issued after the worker's episode pool is exhausted.
