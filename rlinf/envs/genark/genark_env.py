@@ -345,6 +345,13 @@ class GenarkVecEnv(gym.Env):
                 backend = GenesisLocalBackend(cfg, num_envs)
         self._sim: GenesisSimBackend = backend
 
+        # Async render pipeline state (Phase 3).
+        # Only active when backend is GenesisRemoteBackend.
+        from rlinf.envs.genark.genesis_server import GenesisRemoteBackend as _RemoteBackend
+        self._use_async_render: bool = isinstance(self._sim, _RemoteBackend)
+        self._pending_rgb_ref        = None   # Ray ObjectRef for in-flight render_main
+        self._pending_rgb_extras_ref = None   # Ray ObjectRef for in-flight render_4dir
+
         # Pick initial scene and episodes, then build Genesis scene
         self._current_scene_id = None
         self._scene_episode_pool: list[dict] = []
@@ -424,6 +431,12 @@ class GenarkVecEnv(gym.Env):
 
         # Initialise tensors for active slots only
         self._init_agent_poses(active_idx)
+
+        # Clear any in-flight async render refs so _build_obs() forces a sync render.
+        self._pending_rgb_ref        = None
+        self._pending_rgb_extras_ref = None
+        self._current_rgb            = None
+        self._current_rgb_extras     = None
 
         obs  = self._build_obs()
         return obs, {}
@@ -543,8 +556,21 @@ class GenarkVecEnv(gym.Env):
         self._sim.step_physics(actions, self._active_mask, self._active_slot_count)
 
         # --- Render via backend ---
-        self._current_rgb        = self._sim.render_main(self._active_slot_count)
-        self._current_rgb_extras = self._sim.render_4dir(self._active_slot_count)
+        if self._use_async_render:
+            # Phase 3 async pipeline:
+            # 1. Fetch the render submitted at the *previous* step (LLM generate has
+            #    been running for ~120s in parallel, so the result is ready instantly).
+            if self._pending_rgb_ref is not None:
+                self._current_rgb = self._sim.fetch_render_main(self._pending_rgb_ref)
+                self._current_rgb_extras = self._sim.fetch_render_4dir(
+                    self._pending_rgb_extras_ref
+                )
+            # 2. Submit this step's render asynchronously (returns immediately).
+            self._pending_rgb_ref        = self._sim.render_main_async(self._active_slot_count)
+            self._pending_rgb_extras_ref = self._sim.render_4dir_async(self._active_slot_count)
+        else:
+            self._current_rgb        = self._sim.render_main(self._active_slot_count)
+            self._current_rgb_extras = self._sim.render_4dir(self._active_slot_count)
 
         # --- Metrics ---
         N_act = self._active_slot_count
@@ -681,8 +707,15 @@ class GenarkVecEnv(gym.Env):
 
         # RGB from last render (or first render after reset)
         if self._current_rgb is None:
-            self._current_rgb        = self._sim.render_main(self._active_slot_count)
-            self._current_rgb_extras = self._sim.render_4dir(self._active_slot_count)
+            if self._use_async_render:
+                # First frame after reset: submit and immediately fetch (no pipelining yet).
+                ref  = self._sim.render_main_async(self._active_slot_count)
+                ref4 = self._sim.render_4dir_async(self._active_slot_count)
+                self._current_rgb        = self._sim.fetch_render_main(ref)
+                self._current_rgb_extras = self._sim.fetch_render_4dir(ref4)
+            else:
+                self._current_rgb        = self._sim.render_main(self._active_slot_count)
+                self._current_rgb_extras = self._sim.render_4dir(self._active_slot_count)
 
         # (N, H, W, 3) → (N, 3, H, W) as uint8 tensor on GPU
         rgb_np  = self._current_rgb

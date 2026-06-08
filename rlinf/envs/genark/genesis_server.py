@@ -266,6 +266,40 @@ class GenesisRemoteBackend(GenesisSimBackend):
             .copy()
         )
 
+    # --- Async rendering (Phase 3) -------------------------------------------
+
+    def render_main_async(self, active_slot_count: int):
+        """Submit render request; return Ray ObjectRef immediately (non-blocking)."""
+        actor = self._pool.get_actor(self._scene_id)
+        return actor.render_main.remote(active_slot_count)
+
+    def render_4dir_async(self, active_slot_count: int):
+        """Submit 4-dir render request; return Ray ObjectRef or None if disabled."""
+        actor = self._pool.get_actor(self._scene_id)
+        return actor.render_4dir.remote(active_slot_count)
+
+    def fetch_render_main(self, ref, timeout: float = 30.0) -> np.ndarray:
+        """Block until async render result is ready, then deserialise."""
+        raw = ray.get(ref, timeout=timeout)
+        return (
+            np.frombuffer(raw, dtype=np.uint8)
+            .reshape(self._num_envs, self._cam_h, self._cam_w, 3)
+            .copy()
+        )
+
+    def fetch_render_4dir(self, ref, timeout: float = 30.0) -> Optional[np.ndarray]:
+        """Block until async 4-dir result is ready, then deserialise. Returns None if ref is None."""
+        if ref is None:
+            return None
+        raw = ray.get(ref, timeout=timeout)
+        if raw is None:
+            return None
+        return (
+            np.frombuffer(raw, dtype=np.uint8)
+            .reshape(self._num_envs, 3, self._cam_h, self._cam_w, 3)
+            .copy()
+        )
+
     # --- Internal helpers ----------------------------------------------------
 
     def _sync_state(self, state: dict) -> None:
