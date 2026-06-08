@@ -262,6 +262,18 @@ class GenesisSimBackend(ABC):
         enable_4dir_render is False."""
         ...
 
+    # --- Health / crash isolation --------------------------------------------
+
+    def is_scene_healthy(self) -> bool:
+        """Return True if the underlying simulation resource is available.
+
+        LocalBackend: always True (same process, no remote crash possible).
+        RemoteBackend / ZMQBackend: performs a lightweight liveness check.
+        Called by GenarkVecEnv._dormant_step_crash_recovery() to detect when
+        a crashed actor has been rebuilt and normal stepping can resume.
+        """
+        return True
+
     # --- Coordinate helpers (exposed so GenarkVecEnv can convert metrics) ----
 
     def genesis_to_hab(self, cam_pos_gen: torch.Tensor, camera_height: float) -> torch.Tensor:

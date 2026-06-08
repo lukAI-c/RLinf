@@ -32,7 +32,7 @@ GPUS=${GPUS:-2,3,4,5}    # 默认 4 卡
 MODE=${1:-full}
 RESUME_DIR=${RESUME_DIR:-}
 SCENE_OFFSET=${SCENE_OFFSET:-0}   # env.train/eval.scene_offset — 控制 worker→scene 分配
-GENESIS_BACKEND=${GENESIS_BACKEND:-local}   # "local" | "remote" (Ray actor per scene)
+GENESIS_BACKEND=${GENESIS_BACKEND:-local}   # "local" | "remote" (Ray direct) | "zmq" (Ray + ZMQ IPC server)
 
 # GPU 分配
 IFS=',' read -ra GPU_ARR <<< "$GPUS"

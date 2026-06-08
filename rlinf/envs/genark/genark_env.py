@@ -323,8 +323,11 @@ class GenarkVecEnv(gym.Env):
 
         # Initialise backend.  Caller can pass a backend= explicitly, or set
         # cfg.genesis_backend = "remote" to use GenesisRemoteBackend (Ray).
+        self._genesis_server_proc = None   # subprocess.Popen, set for zmq mode
+
         if backend is None:
             genesis_backend_type = str(getattr(cfg, "genesis_backend", "local"))
+
             if genesis_backend_type == "remote":
                 from rlinf.envs.genark.genesis_server import (
                     GenesisServerPool,
@@ -341,19 +344,42 @@ class GenarkVecEnv(gym.Env):
                     num_envs=num_envs,
                     device=torch.device("cuda"),
                 )
+
+            elif genesis_backend_type == "zmq":
+                from rlinf.envs.genark.genesis_zmq_server import (
+                    GenesisZMQBackend,
+                    launch_zmq_server,
+                )
+                import torch, hashlib
+                # Unique socket base: scene hash + seed_offset avoids collisions
+                # when multiple workers run on the same machine.
+                scene_hash = hashlib.md5(
+                    self._pinned_scene_id.encode()
+                ).hexdigest()[:8]
+                socket_base = f"genesis_{scene_hash}_{seed_offset}"
+                self._genesis_server_proc = launch_zmq_server(
+                    cfg,
+                    self._pinned_scene_id,
+                    min(num_envs, len(self._all_episodes)),
+                    socket_base,
+                )
+                backend = GenesisZMQBackend(
+                    socket_base,
+                    scene_id=self._pinned_scene_id,
+                    num_envs=num_envs,
+                    device=torch.device("cuda"),
+                )
+
             else:
                 backend = GenesisLocalBackend(cfg, num_envs)
+
         self._sim: GenesisSimBackend = backend
 
         # Async render pipeline + crash isolation state (Phase 3 / Phase 4).
-        # Only active when backend is GenesisRemoteBackend.
-        from rlinf.envs.genark.genesis_server import (
-            GenesisRemoteBackend as _RemoteBackend,
-            SceneCrashError as _SceneCrashError,
-        )
-        self._RemoteBackend   = _RemoteBackend
+        from rlinf.envs.genark.genesis_server import SceneCrashError as _SceneCrashError
         self._SceneCrashError = _SceneCrashError
-        self._use_async_render: bool = isinstance(self._sim, _RemoteBackend)
+        # Any backend that exposes render_main_async supports the async pipeline.
+        self._use_async_render: bool = hasattr(self._sim, "render_main_async")
         self._pending_rgb_ref        = None   # Ray ObjectRef for in-flight render_main
         self._pending_rgb_extras_ref = None   # Ray ObjectRef for in-flight render_4dir
 
@@ -449,9 +475,8 @@ class GenarkVecEnv(gym.Env):
         self._current_rgb            = None
         self._current_rgb_extras     = None
         # If actor was rebuilt externally, allow reset to clear crash flag.
-        if self._scene_crashed and isinstance(self._sim, self._RemoteBackend):
-            if self._sim._pool.is_healthy(self._sim._scene_id):
-                self._scene_crashed = False
+        if self._scene_crashed and self._sim.is_scene_healthy():
+            self._scene_crashed = False
 
         obs  = self._build_obs()
         return obs, {}
@@ -992,34 +1017,32 @@ class GenarkVecEnv(gym.Env):
         if self._crash_recovery_cooldown > 0:
             self._crash_recovery_cooldown -= 1
         else:
-            # Poll health; cooldown between polls to avoid spamming Ray.
+            # Poll health via backend abstraction (works for remote + zmq).
             self._crash_recovery_cooldown = 50
-            if isinstance(self._sim, self._RemoteBackend):
-                pool = self._sim._pool
-                if pool.is_healthy(self._sim._scene_id):
+            if self._sim.is_scene_healthy():
+                print(
+                    f"[GenArk][crash-recovery] scene healthy again, "
+                    "re-initialising agent poses.",
+                    flush=True,
+                )
+                try:
+                    active_idx = [
+                        i for i in range(self.num_envs)
+                        if self._slot_active[i] and self._episodes[i] is not None
+                    ]
+                    if active_idx:
+                        self._init_agent_poses(active_idx)
+                    self._scene_crashed          = False
+                    self._pending_rgb_ref        = None
+                    self._pending_rgb_extras_ref = None
+                    self._current_rgb            = None
+                    self._current_rgb_extras     = None
+                except Exception as e:
                     print(
-                        f"[GenArk][crash-recovery] actor rebuilt for scene "
-                        f"'{self._sim._scene_id}', re-initialising agent poses.",
+                        f"[GenArk][crash-recovery] re-init failed: {e}, "
+                        "staying dormant.",
                         flush=True,
                     )
-                    try:
-                        active_idx = [
-                            i for i in range(self.num_envs)
-                            if self._slot_active[i] and self._episodes[i] is not None
-                        ]
-                        if active_idx:
-                            self._init_agent_poses(active_idx)
-                        self._scene_crashed = False
-                        self._pending_rgb_ref        = None
-                        self._pending_rgb_extras_ref = None
-                        self._current_rgb            = None
-                        self._current_rgb_extras     = None
-                    except Exception as e:
-                        print(
-                            f"[GenArk][crash-recovery] re-init failed: {e}, "
-                            "staying dormant.",
-                            flush=True,
-                        )
         return self._dormant_step()
 
     def _dormant_step(self) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor, dict]:

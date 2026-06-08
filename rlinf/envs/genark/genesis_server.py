@@ -232,6 +232,11 @@ class GenesisRemoteBackend(GenesisSimBackend):
     def device(self) -> torch.device:
         return self._device
 
+    # --- Health --------------------------------------------------------------
+
+    def is_scene_healthy(self) -> bool:
+        return self._pool.is_healthy(self._scene_id)
+
     # --- Scene lifecycle -----------------------------------------------------
 
     def load_scene(self, scene_id: str, n_active_envs: int) -> None:
