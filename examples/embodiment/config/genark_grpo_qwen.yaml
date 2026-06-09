@@ -109,6 +109,7 @@ env:
     ignore_terminations: False
 
     cyclic_episode_sampling: true   # reshuffle pool when exhausted (train only)
+    episode_balanced_sampling: false  # P1: balanced scene-internal episode coverage (default off)
     reward_mode: "geo_ndtw"         # "geo_progress" | "ndtw_sr_delta" | "geo_ndtw" | "decision_nav"
     # geo_ndtw    = geo_progress (per step, dense) + decision-level nDTW (per decision) + SR
     # decision_nav = decision-level DTG + decision-level nDTW + SR (no step-level geo)

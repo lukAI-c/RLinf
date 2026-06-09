@@ -83,6 +83,52 @@ def _group_by_scene(episodes: list[dict]) -> dict[str, list[dict]]:
     return groups
 
 
+class EpisodeBalancer:
+    """Scene-internal episode balancer: selects next episode by (seen_count, success_rate) lexicographic order.
+
+    seen_count = number of times the episode was assigned to a GRPO group.
+    success_rate = EMA of per-trajectory success outcomes.
+    Cold-start: seen=0, sr=0.0 → unseen episodes are highest priority (coverage-first).
+    """
+
+    def __init__(self, episodes: list[dict], rng, ema_alpha: float = 0.3):
+        self._eps   = {e.get("episode_id", i): e for i, e in enumerate(episodes)}
+        self._seen  = {k: 0   for k in self._eps}
+        self._sr    = {k: 0.0 for k in self._eps}
+        self._rng   = rng
+        self._alpha = ema_alpha
+        self._last  = None
+        self._passes = 0  # number of full coverage sweeps completed
+
+    def next_episode(self) -> tuple[dict, bool]:
+        """Return (episode_dict, new_pass).
+
+        new_pass=True when this call pushed the global minimum seen_count up by 1
+        (i.e. every episode has now been covered at least N+1 times).
+        """
+        cands = [k for k in self._eps if k != self._last] or list(self._eps)
+        min_key = min((self._seen[k], self._sr[k]) for k in cands)
+        tied = [k for k in cands if (self._seen[k], self._sr[k]) == min_key]
+        k = tied[int(self._rng.integers(len(tied)))]
+        prev_min = min(self._seen.values())
+        self._seen[k] += 1
+        self._last = k
+        new_pass = min(self._seen.values()) > prev_min
+        if new_pass:
+            self._passes += 1
+        return self._eps[k], new_pass
+
+    def record(self, ep_id, success: bool) -> None:
+        """Update EMA success rate for an episode after a trajectory completes."""
+        if ep_id in self._sr:
+            self._sr[ep_id] = (1 - self._alpha) * self._sr[ep_id] + self._alpha * float(success)
+
+    def mark_seen(self, ep_id) -> None:
+        """Pre-credit an episode that was assigned during initial layout."""
+        if ep_id in self._seen:
+            self._seen[ep_id] += 1
+
+
 # ---------------------------------------------------------------------------
 # Simple tokenizer placeholder — replace with real tokenizer when available
 # ---------------------------------------------------------------------------
@@ -201,6 +247,9 @@ class GenarkVecEnv(gym.Env):
         # enter dormant once the pool is exhausted (eval / single-pass mode).
         self.cyclic_episode_sampling = bool(
             getattr(cfg, "cyclic_episode_sampling", False)
+        )
+        self.episode_balanced_sampling = bool(
+            getattr(cfg, "episode_balanced_sampling", False)
         )
 
         # --- observation params ---
@@ -321,6 +370,16 @@ class GenarkVecEnv(gym.Env):
         self._group_done_counts: dict[int, int] = {}
         self._episode_cycle: int = 0  # incremented on each cyclic reshuffle
 
+        # EpisodeBalancer: only in train (cyclic) mode when flag is set.
+        self._balancer: "EpisodeBalancer | None" = None
+        if self.episode_balanced_sampling and self.cyclic_episode_sampling:
+            self._balancer = EpisodeBalancer(self._all_episodes, self._rng)
+            # Pre-credit episodes already assigned to initial groups so balancer
+            # starts with accurate seen counts.
+            for g in range(min(n_initial_groups, len(self._all_episodes))):
+                ep_id = self._all_episodes[g].get("episode_id", g)
+                self._balancer.mark_seen(ep_id)
+
         # Initialise backend.  Caller can pass a backend= explicitly, or set
         # cfg.genesis_backend = "remote" to use GenesisRemoteBackend (Ray).
         self._genesis_server_proc = None   # subprocess.Popen, set for zmq mode
@@ -423,6 +482,19 @@ class GenarkVecEnv(gym.Env):
                 )
             else:
                 self._slot_active[i] = False  # shouldn't happen, safety guard
+        # P0 guard: verify GRPO group semantics — all active envs in the same group
+        # must share the exact same episode object after initial assignment.
+        assigned = {i for i in indices if self._slot_active[i] and self._episodes[i] is not None}
+        groups_assigned: dict[int, list[int]] = {}
+        for i in assigned:
+            gid = i // self.group_size
+            groups_assigned.setdefault(gid, []).append(i)
+        for gid, members in groups_assigned.items():
+            ep_objects = {id(self._episodes[j]) for j in members}
+            assert len(ep_objects) == 1, (
+                f"[P0] _assign_episodes_to_envs: group {gid} split across episodes: "
+                f"{[self._episodes[j].get('episode_id') for j in members]}"
+            )
 
     # ------------------------------------------------------------------
     # gym.Env interface
@@ -842,6 +914,8 @@ class GenarkVecEnv(gym.Env):
                 "scene_id":   self._pinned_scene_id,
                 **{k: float(v) for k, v in m.items()},
             })
+            if self._balancer is not None:
+                self._balancer.record(ep_id, bool(m.get("success", 0)))
             print(
                 f"[GenArk] Episode done  env={i}  ep={ep_id}"
                 f"  success={m.get('success', 0):.0f}"
@@ -940,50 +1014,68 @@ class GenarkVecEnv(gym.Env):
             # All active envs in the group are done
             del self._group_done_counts[group_id]
 
-            if self._next_ep_idx >= len(self._all_episodes):
-                if self.cyclic_episode_sampling:
-                    # Reshuffle and restart the pool (train mode).
-                    # Avoid immediately repeating the episode the group just ran.
-                    last_ep_id = (self._episodes[group_envs[0]] or {}).get(
-                        "episode_id", None
-                    )
-                    self._rng.shuffle(self._all_episodes)
-                    if (
-                        last_ep_id is not None
-                        and len(self._all_episodes) > 1
-                        and self._all_episodes[0].get("episode_id") == last_ep_id
-                    ):
-                        self._all_episodes = (
-                            self._all_episodes[1:] + self._all_episodes[:1]
-                        )
-                    self._next_ep_idx = 0
+            if self._balancer is not None:
+                # Balanced mode: EpisodeBalancer picks next episode by
+                # (seen_count, success_rate) lexicographic order.
+                next_ep, new_pass = self._balancer.next_episode()
+                ep_id = next_ep.get("episode_id", "?")
+                if new_pass:
                     self._episode_cycle += 1
-                    # Print per-scene summary on each cycle so we can compare scenes.
                     summ = self._summarize_episode_log()
                     print(
                         f"[GenArk][episode-cycle] scene={self._pinned_scene_id} "
-                        f"cycle={self._episode_cycle} "
-                        f"reshuffled {len(self._all_episodes)} episodes | "
+                        f"cycle={self._episode_cycle} (balanced) "
                         f"sr={summ.get('success', 0):.3f} "
                         f"spl={summ.get('spl', 0):.3f} "
                         f"ndtw={summ.get('ndtw', 0):.3f} "
                         f"n={summ.get('num_episodes', 0)}",
                         flush=True,
                     )
-                else:
-                    # Single-pass mode (eval) — group enters dormant permanently.
-                    print(
-                        f"[GenArk][group-reset] group={group_id} pool exhausted "
-                        f"(next_ep_idx={self._next_ep_idx}, "
-                        f"pool_size={len(self._all_episodes)}); entering dormant.",
-                        flush=True,
-                    )
-                    continue
+            else:
+                if self._next_ep_idx >= len(self._all_episodes):
+                    if self.cyclic_episode_sampling:
+                        # Reshuffle and restart the pool (train mode).
+                        # Avoid immediately repeating the episode the group just ran.
+                        last_ep_id = (self._episodes[group_envs[0]] or {}).get(
+                            "episode_id", None
+                        )
+                        self._rng.shuffle(self._all_episodes)
+                        if (
+                            last_ep_id is not None
+                            and len(self._all_episodes) > 1
+                            and self._all_episodes[0].get("episode_id") == last_ep_id
+                        ):
+                            self._all_episodes = (
+                                self._all_episodes[1:] + self._all_episodes[:1]
+                            )
+                        self._next_ep_idx = 0
+                        self._episode_cycle += 1
+                        # Print per-scene summary on each cycle so we can compare scenes.
+                        summ = self._summarize_episode_log()
+                        print(
+                            f"[GenArk][episode-cycle] scene={self._pinned_scene_id} "
+                            f"cycle={self._episode_cycle} "
+                            f"reshuffled {len(self._all_episodes)} episodes | "
+                            f"sr={summ.get('success', 0):.3f} "
+                            f"spl={summ.get('spl', 0):.3f} "
+                            f"ndtw={summ.get('ndtw', 0):.3f} "
+                            f"n={summ.get('num_episodes', 0)}",
+                            flush=True,
+                        )
+                    else:
+                        # Single-pass mode (eval) — group enters dormant permanently.
+                        print(
+                            f"[GenArk][group-reset] group={group_id} pool exhausted "
+                            f"(next_ep_idx={self._next_ep_idx}, "
+                            f"pool_size={len(self._all_episodes)}); entering dormant.",
+                            flush=True,
+                        )
+                        continue
 
-            # Assign the next pooled episode to all envs in the group
-            next_ep = self._all_episodes[self._next_ep_idx]
-            ep_id = next_ep.get("episode_id", self._next_ep_idx)
-            self._next_ep_idx += 1
+                # Assign the next pooled episode to all envs in the group
+                next_ep = self._all_episodes[self._next_ep_idx]
+                ep_id = next_ep.get("episode_id", self._next_ep_idx)
+                self._next_ep_idx += 1
 
             for j in group_envs:
                 self._episodes[j]     = next_ep
@@ -995,13 +1087,24 @@ class GenarkVecEnv(gym.Env):
                 self._pred_path_lists[j] = []
                 self._distances_lists[j] = []
 
+            # P0 guard: all envs in this group must share the exact same episode object.
+            assert len({id(self._episodes[j]) for j in group_envs}) == 1, (
+                f"[P0] group {group_id} split across episodes after reset: "
+                f"{[self._episodes[j].get('episode_id') for j in group_envs]}"
+            )
+
             # Re-initialise agent poses and metrics for the reset group
             self._init_agent_poses(group_envs)
 
+            if self._balancer is not None:
+                _seen_vals = list(self._balancer._seen.values())
+                _pool_info = (f"balanced seen min={min(_seen_vals)} max={max(_seen_vals)}"
+                              f" passes={self._balancer._passes}")
+            else:
+                _pool_info = f"pool remaining: {len(self._all_episodes) - self._next_ep_idx}"
             print(
                 f"[GenArk][group-reset] group={group_id} → ep={ep_id} "
-                f"envs={group_envs} "
-                f"(pool remaining: {len(self._all_episodes) - self._next_ep_idx})",
+                f"envs={group_envs} ({_pool_info})",
                 flush=True,
             )
 

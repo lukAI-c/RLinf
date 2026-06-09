@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import os
 import queue
@@ -354,6 +355,21 @@ class EmbodiedRunner:
                         eval_metrics = self.evaluate()
                         eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
                         self.metric_logger.log(data=eval_metrics, step=_step)
+                        # Append per-step eval metrics to training_metrics.json for
+                        # easy inspection of training progress over RL iterations.
+                        _log_path = self.cfg.runner.logger.get("log_path", ".")
+                        _metrics_json = os.path.join(_log_path, "training_metrics.json")
+                        _entry = {"step": _step, **{k: float(v) for k, v in eval_metrics.items()}}
+                        _history = []
+                        if os.path.exists(_metrics_json):
+                            with open(_metrics_json) as _f:
+                                try:
+                                    _history = json.load(_f)
+                                except json.JSONDecodeError:
+                                    _history = []
+                        _history.append(_entry)
+                        with open(_metrics_json, "w") as _f:
+                            json.dump(_history, _f, indent=2)
 
                 if save_model:
                     self._save_checkpoint()
