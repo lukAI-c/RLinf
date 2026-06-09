@@ -176,7 +176,7 @@ lora)
   fi
   EXTRA_ARGS=(
     "actor.model.is_lora=true"
-    "actor.micro_batch_size=2"          # 4B FSDP 2-rank activation 峰值 ~40GB，mbs=8 会 OOM；mbs=2 安全
+    "actor.micro_batch_size=1"          # mbs=2 OOM on 4-card (max_new_tokens=256 → longer seqs)
     "actor.global_batch_size=${GLOBAL_BS}"
     "actor.optim.lr=1e-7"              # 1e-6→1e-7：grad_norm=154/clipped=1.0 说明需要降一个数量级
     "actor.model.chunk_size=16"
@@ -210,8 +210,8 @@ lora)
     "actor.model.history_max_frames=4"   # 减少视觉 token：8→4，降低 OOM 风险
     "env.train.scene_offset=${SCENE_OFFSET}"
     "env.eval.scene_offset=${SCENE_OFFSET}"
-    "env.train.genesis_backend=${GENESIS_BACKEND}"
-    "env.eval.genesis_backend=${GENESIS_BACKEND}"
+    "++env.train.genesis_backend=${GENESIS_BACKEND}"
+    "++env.eval.genesis_backend=${GENESIS_BACKEND}"
     "runner.max_epochs=500"
     "runner.val_check_interval=10"
     "runner.save_interval=20"

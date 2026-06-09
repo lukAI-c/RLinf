@@ -344,7 +344,7 @@ class GenesisRemoteBackend(GenesisSimBackend):
             return ray.get(ref, timeout=timeout)
         except (
             ray.exceptions.RayActorError,
-            ray.exceptions.RayWorkerError,
+            ray.exceptions.WorkerCrashedError,
             ray.exceptions.RayTaskError,
         ) as exc:
             self._pool.rebuild_actor(self._scene_id)

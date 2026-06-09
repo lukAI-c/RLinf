@@ -68,24 +68,13 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from rlinf.envs.genark.genesis_backend import GenesisSimBackend
-from rlinf.envs.genark.genesis_server import (
-    GenesisServerPool,
-    SceneCrashError,
-)
+from rlinf.envs.genark.genesis_server import SceneCrashError
 
 try:
     import zmq
 except ImportError as exc:
     raise ImportError(
         "GenesisZMQServer requires pyzmq. Install with: pip install pyzmq"
-    ) from exc
-
-try:
-    import ray
-    import ray.exceptions
-except ImportError as exc:
-    raise ImportError(
-        "GenesisZMQServer requires Ray. Install with: pip install ray"
     ) from exc
 
 
@@ -113,10 +102,12 @@ def _ready_path(socket_base: str) -> Path:
 # ---------------------------------------------------------------------------
 
 class GenesisZMQServer:
-    """ZMQ server that wraps GenesisServerPool and exposes it over IPC sockets.
+    """ZMQ server that wraps GenesisLocalBackend and exposes it over IPC sockets.
 
-    Runs as a standalone subprocess (one per EnvWorker / scene).  The server
-    process itself is CPU-only; Genesis runs inside Ray actors (one GPU each).
+    Runs as a standalone subprocess (one per EnvWorker / scene).  The subprocess
+    boundary itself provides crash isolation — if Genesis segfaults the process
+    dies, the ZMQ socket times out on the client, and is_scene_healthy() returns
+    False.  No Ray actor layer needed here.
     """
 
     def __init__(
@@ -126,10 +117,12 @@ class GenesisZMQServer:
         num_envs: int,
         socket_base: str,
     ):
+        from rlinf.envs.genark.genesis_backend import GenesisLocalBackend
         self._scene_id    = scene_id
         self._num_envs    = num_envs
         self._socket_base = socket_base
-        self._pool        = GenesisServerPool(cfg, {scene_id: num_envs})
+        self._backend     = GenesisLocalBackend(cfg, num_envs)
+        self._backend.load_scene(scene_id, n_active_envs=num_envs)
 
     # ------------------------------------------------------------------
 
@@ -181,35 +174,52 @@ class GenesisZMQServer:
     def _dispatch(self, msg: dict) -> dict:
         req_id = msg["req_id"]
         method = msg["method"]
+        dev    = self._backend.device
 
         try:
             if method == "health_check":
                 return {"req_id": req_id, "status": "ok", "result": True, "error": None}
 
-            actor = self._pool.get_actor(self._scene_id)
-
             if method == "get_state":
-                result = ray.get(actor.get_state.remote())
+                result = {
+                    "cam_pos":         self._backend.cam_pos.cpu().numpy(),
+                    "cam_yaw":         self._backend.cam_yaw.cpu().numpy(),
+                    "current_tri_idx": self._backend.current_tri_idx.cpu().numpy(),
+                    "num_envs": self._num_envs,
+                    "cam_h":    self._backend._cam_h,
+                    "cam_w":    self._backend._cam_w,
+                }
 
             elif method == "set_agent_poses":
-                result = ray.get(actor.set_agent_poses.remote(
+                self._backend.set_agent_poses(
                     msg["env_idx"],
-                    msg["positions_np"],
-                    msg["yaws_np"],
-                ))
+                    torch.from_numpy(msg["positions_np"]).to(dev),
+                    torch.from_numpy(msg["yaws_np"]).to(dev),
+                )
+                result = {
+                    "cam_pos":         self._backend.cam_pos.cpu().numpy(),
+                    "cam_yaw":         self._backend.cam_yaw.cpu().numpy(),
+                    "current_tri_idx": self._backend.current_tri_idx.cpu().numpy(),
+                }
 
             elif method == "step_physics":
-                result = ray.get(actor.step_physics.remote(
-                    msg["actions_np"],
-                    msg["active_mask_np"],
+                self._backend.step_physics(
+                    torch.from_numpy(msg["actions_np"]).to(dev),
+                    torch.from_numpy(msg["active_mask_np"]).to(dev),
                     msg["active_slot_count"],
-                ))
+                )
+                result = {
+                    "cam_pos":         self._backend.cam_pos.cpu().numpy(),
+                    "cam_yaw":         self._backend.cam_yaw.cpu().numpy(),
+                    "current_tri_idx": self._backend.current_tri_idx.cpu().numpy(),
+                }
 
             elif method == "render_main":
-                result = ray.get(actor.render_main.remote(msg["active_slot_count"]))
+                result = self._backend.render_main(msg["active_slot_count"]).tobytes()
 
             elif method == "render_4dir":
-                result = ray.get(actor.render_4dir.remote(msg["active_slot_count"]))
+                arr = self._backend.render_4dir(msg["active_slot_count"])
+                result = arr.tobytes() if arr is not None else None
 
             else:
                 return {
@@ -219,16 +229,6 @@ class GenesisZMQServer:
 
             return {"req_id": req_id, "status": "ok", "result": result, "error": None}
 
-        except (
-            ray.exceptions.RayActorError,
-            ray.exceptions.RayWorkerError,
-            ray.exceptions.RayTaskError,
-        ) as exc:
-            self._pool.rebuild_actor(self._scene_id)
-            return {
-                "req_id": req_id, "status": "crash",
-                "result": None, "error": str(exc),
-            }
         except Exception as exc:
             return {
                 "req_id": req_id, "status": "error",
@@ -254,11 +254,12 @@ class GenesisZMQBackend(GenesisSimBackend):
         num_envs: int,
         device: torch.device,
     ):
-        self._socket_base = socket_base
-        self._scene_id    = scene_id
-        self._num_envs    = num_envs
-        self._device      = device
-        self._req_counter = 0
+        self._socket_base       = socket_base
+        self._scene_id          = scene_id
+        self._num_envs          = num_envs
+        self._device            = device
+        self._req_counter       = 0
+        self._response_buffer: dict[int, dict] = {}  # req_id → buffered response
 
         ctx = zmq.Context.instance()
         self._req_sock = ctx.socket(zmq.PUSH)
@@ -398,7 +399,8 @@ class GenesisZMQBackend(GenesisSimBackend):
     def _send(self, msg: dict) -> None:
         self._req_sock.send(pickle.dumps(msg))
 
-    def _recv(self, timeout_ms: int) -> dict:
+    def _recv_one(self, timeout_ms: int) -> dict:
+        """Read exactly one raw response from the socket (no req_id filtering)."""
         if not self._rep_sock.poll(timeout_ms):
             raise TimeoutError(
                 f"[GenesisZMQBackend] no response within {timeout_ms}ms "
@@ -413,11 +415,33 @@ class GenesisZMQBackend(GenesisSimBackend):
             )
         return resp
 
+    def _recv(self, expected_req_id: int, timeout_ms: int) -> dict:
+        """Return the response matching expected_req_id, buffering others.
+
+        Needed because render_main_async submits a request without waiting,
+        so the render response may arrive in the socket before the next
+        step_physics response — we must not mistake one for the other.
+        """
+        if expected_req_id in self._response_buffer:
+            return self._response_buffer.pop(expected_req_id)
+        deadline = time.time() + timeout_ms / 1000.0
+        while True:
+            remaining_ms = int((deadline - time.time()) * 1000)
+            if remaining_ms <= 0:
+                raise TimeoutError(
+                    f"[GenesisZMQBackend] no response for req_id={expected_req_id} "
+                    f"within {timeout_ms}ms (scene='{self._scene_id}')"
+                )
+            resp = self._recv_one(remaining_ms)
+            if resp["req_id"] == expected_req_id:
+                return resp
+            self._response_buffer[resp["req_id"]] = resp
+
     def _call(self, method: str, timeout_ms: int = 60_000, **kwargs) -> dict:
-        """Synchronous call: PUSH request then PULL response."""
+        """Synchronous call: PUSH request then PULL matching response."""
         req_id = self._next_req_id()
         self._send({"req_id": req_id, "method": method, **kwargs})
-        return self._recv(timeout_ms)
+        return self._recv(req_id, timeout_ms)
 
     def _submit(self, method: str, **kwargs) -> int:
         """Async submit: PUSH request without waiting. Returns req_id."""
@@ -427,7 +451,7 @@ class GenesisZMQBackend(GenesisSimBackend):
 
     def _fetch(self, req_id: int, timeout_ms: int = 60_000) -> dict:
         """Block until the response for req_id arrives."""
-        return self._recv(timeout_ms)
+        return self._recv(req_id, timeout_ms)
 
     def _sync_state(self, state: dict) -> None:
         self._cam_pos_t = torch.from_numpy(

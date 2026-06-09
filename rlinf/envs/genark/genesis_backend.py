@@ -424,6 +424,14 @@ class GenesisLocalBackend(GenesisSimBackend):
         self._gs_ready      = True
         self._n_active_envs = n_active_envs
 
+        # Pre-initialise state tensors so get_state() works before set_agent_poses().
+        device = self._gs.device
+        N = self._num_envs
+        if self._cam_pos_t is None:
+            self._cam_pos_t         = torch.zeros(N, 3, dtype=torch.float32, device=device)
+            self._cam_yaw_t         = torch.zeros(N,    dtype=torch.float32, device=device)
+            self._current_tri_idx_t = torch.zeros(N,    dtype=torch.long,    device=device)
+
     # --- Agent pose management -----------------------------------------------
 
     def set_agent_poses(
