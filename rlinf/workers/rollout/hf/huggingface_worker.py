@@ -414,8 +414,20 @@ class MultiStepRolloutWorker(Worker):
 
         step = 0
         while step < safety_steps:
+            # Global termination flag broadcast by the env worker (sole coordinator).
+            # Reset each step; set from any stage's obs (the value is identical across
+            # stages and ranks). When present it OVERRIDES the local per-rank all_done
+            # so every rollout rank exits on the same step — required for multi-scene,
+            # where rank↔scene binding makes local termination diverge across ranks.
+            global_terminate_flag = None
             for stage_idx in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
+                # Pop the coordination key before predict so the policy never sees it.
+                _gt = env_output["obs"].pop("should_terminate", None)
+                if _gt is not None:
+                    global_terminate_flag = bool(
+                        _gt.any() if isinstance(_gt, torch.Tensor) else _gt
+                    )
                 actions, result = self.predict(env_output["obs"])
 
                 # is_decision: [B] bool — True means the model ran a new LLM inference.
@@ -476,12 +488,19 @@ class MultiStepRolloutWorker(Worker):
 
             step += 1
 
-            # Termination: all active envs across all stages have completed max_dec decisions.
-            # Dormant envs that ended early do not block termination.
-            all_done = all(
-                not ((decision_counts[s] < max_dec) & (~last_env_dormant[s])).any()
-                for s in range(self.num_pipeline_stages)
-            )
+            # Termination: prefer the env worker's GLOBAL signal (multi-scene safe —
+            # all ranks see the same value, so they enter bootstrap synchronously).
+            # Fall back to the local per-rank all_done when the env worker doesn't
+            # provide it (e.g. non-genark envs), preserving original behavior exactly.
+            if global_terminate_flag is not None:
+                all_done = global_terminate_flag
+            else:
+                # All active envs across all stages have completed max_dec decisions.
+                # Dormant envs that ended early do not block termination.
+                all_done = all(
+                    not ((decision_counts[s] < max_dec) & (~last_env_dormant[s])).any()
+                    for s in range(self.num_pipeline_stages)
+                )
             if all_done:
                 break
 
@@ -489,6 +508,8 @@ class MultiStepRolloutWorker(Worker):
         # last observation.  This mirrors the original fixed-loop bootstrap.
         for _ in range(self.num_pipeline_stages):
             env_output = await self.recv_env_output(input_channel)
+            # Drop the coordination key before predict (env sends it on every obs).
+            env_output["obs"].pop("should_terminate", None)
             actions, result = self.predict(env_output["obs"])
 
             rollout_result = RolloutResult(

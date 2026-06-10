@@ -28,7 +28,29 @@ cam_res: [640, 480]
 max_seq_len: 256
 
 # Multi-pass scene traversal offset (rank i picks unique_scenes[(scene_offset+i) % N])
+# Used only when genesis_backend != "multiscene".
 scene_offset: 0
+
+# Genesis backend: "local" | "remote" | "zmq" | "multiscene"
+genesis_backend: local
+
+# Multi-scene pool (only active when genesis_backend: "multiscene").
+# Each env worker preloads K scenes concurrently; K = scene_count GPUs per worker.
+# GPU budget: env workers MUST be on separate GPUs from the policy model —
+# Ray num_gpus=1 actors will contend with policy GPUs and deadlock otherwise.
+#
+# Scene assignment: worker w gets scenes[w*scene_count : (w+1)*scene_count] (mod M),
+# so workers cover disjoint scene windows automatically.
+# Alternatively, set scenes: [list of explicit scene_ids] to override.
+#
+# Invariants checked at startup (ValueError if violated):
+#   len(eps_s) >= slots_per_scene  (fully-active blocks)
+#   slots_per_scene % group_size == 0  (groups never straddle scenes)
+#   scene_count <= gpu_budget (if set)
+multi_scene:
+  scene_count: 2       # K: number of scenes per worker (= K GPUs per worker)
+  scenes: null         # explicit list of scene_ids; overrides scene_count if set
+  gpu_budget: null     # optional: max K; raises ValueError if exceeded
 
 # Task params
 success_distance: 3.0

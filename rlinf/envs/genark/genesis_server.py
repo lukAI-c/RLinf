@@ -14,6 +14,8 @@ Usage (from GenarkVecEnv via genesis_backend_type="remote"):
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 from typing import Optional
@@ -54,7 +56,7 @@ class SceneCrashError(RuntimeError):
 # Ray remote actor — one per Genesis scene, one GPU
 # ---------------------------------------------------------------------------
 
-@ray.remote(num_gpus=1)
+@ray.remote
 class GenesisSceneActor:
     """Holds one Genesis scene in a dedicated Ray worker process.
 
@@ -92,6 +94,10 @@ class GenesisSceneActor:
         active_slot_count: int,
     ) -> dict:
         """Physics step. Returns updated agent state as CPU numpy."""
+        assert active_slot_count <= self._num_envs, (
+            f"GenesisSceneActor.step_physics: active_slot_count={active_slot_count} "
+            f"> actor num_envs={self._num_envs}. Pass per-scene local count, not global N_act."
+        )
         dev = self._backend.device
         self._backend.step_physics(
             torch.from_numpy(actions_np).to(dev),
@@ -102,11 +108,19 @@ class GenesisSceneActor:
 
     def render_main(self, active_slot_count: int) -> bytes:
         """Returns (N, H, W, 3) uint8 as raw bytes."""
+        assert active_slot_count <= self._num_envs, (
+            f"GenesisSceneActor.render_main: active_slot_count={active_slot_count} "
+            f"> actor num_envs={self._num_envs}. Pass per-scene local count, not global N_act."
+        )
         rgb = self._backend.render_main(active_slot_count)
         return rgb.tobytes()
 
     def render_4dir(self, active_slot_count: int) -> Optional[bytes]:
         """Returns (N, 3, H, W, 3) uint8 as raw bytes, or None."""
+        assert active_slot_count <= self._num_envs, (
+            f"GenesisSceneActor.render_4dir: active_slot_count={active_slot_count} "
+            f"> actor num_envs={self._num_envs}. Pass per-scene local count, not global N_act."
+        )
         extras = self._backend.render_4dir(active_slot_count)
         if extras is None:
             return None
@@ -146,28 +160,127 @@ class GenesisServerPool:
         {scene_id: num_envs} — one actor per entry.
     """
 
-    def __init__(self, cfg: DictConfig, scene_assignments: dict[str, int]):
+    def __init__(self, cfg: DictConfig, scene_assignments: dict[str, int],
+                 gpu_budget: Optional[int] = None,
+                 scenes_per_gpu: int = 1):
         if not ray.is_initialized():
             ray.init(ignore_reinit_error=True)
+
+        # scenes_per_gpu: how many scene actors may share one physical GPU.
+        #   =1 → strict 1:1 (max parallelism, the original behavior).
+        #   >1 → oversubscribe: K scenes packed onto ceil(K/spg) GPUs. Scenes on
+        #        the same GPU serialize on its compute/render engine, but Genesis
+        #        sim is light (~1% of step time), so this trades a small per-step
+        #        cost for wider scene coverage on fewer GPUs.
+        self._scenes_per_gpu = max(int(scenes_per_gpu), 1)
+
+        # Bug #9: fail fast (ValueError) instead of hanging on Ray GPU allocation.
+        # Capacity = gpu_budget × scenes_per_gpu. Exceeding it would silently
+        # triple-book a GPU; fail loudly instead.
+        k = len(scene_assignments)
+        if gpu_budget is not None and k > gpu_budget * self._scenes_per_gpu:
+            raise ValueError(
+                f"GenesisServerPool: {k} scenes requested but capacity is "
+                f"gpu_budget({gpu_budget}) × scenes_per_gpu({self._scenes_per_gpu}) "
+                f"= {gpu_budget * self._scenes_per_gpu}. Reduce multi_scene.scene_count "
+                f"or raise multi_scene.scenes_per_gpu / gpu_budget."
+            )
 
         self._cfg               = cfg
         self._cfg_dict          = OmegaConf.to_container(cfg, resolve=True)
         self._scene_assignments = scene_assignments
         self._actors: dict[str, ray.actor.ActorHandle] = {}
 
+        # ── GPU pinning ──────────────────────────────────────────────────────
+        # RLinf runs all workers with num_gpus=0 and pins them to physical GPUs
+        # via CUDA_VISIBLE_DEVICES (RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
+        # tells Ray not to override). We mirror that here: spawn each scene actor
+        # with num_gpus=0 and an explicit single-GPU CUDA_VISIBLE_DEVICES drawn
+        # from the env worker's own visible-device pool. Using Ray's num_gpus=1
+        # accounting instead crashes (IndexError in get_accelerator_ids) because
+        # the actor inherits the worker's restricted CUDA_VISIBLE_DEVICES while
+        # Ray hands out global pool indices that exceed that restricted list.
+        self._gpu_pool = self._discover_gpu_pool()
+        capacity = len(self._gpu_pool) * self._scenes_per_gpu
+        if capacity < k:
+            raise ValueError(
+                f"GenesisServerPool: {k} scenes requested but capacity is "
+                f"{len(self._gpu_pool)} GPU(s) × scenes_per_gpu({self._scenes_per_gpu}) "
+                f"= {capacity} (CUDA_VISIBLE_DEVICES="
+                f"{os.environ.get('CUDA_VISIBLE_DEVICES')!r}). "
+                f"Reduce multi_scene.scene_count, raise scenes_per_gpu, or widen the "
+                f"env worker placement."
+            )
+        # scene_id -> physical GPU id (string). Round-robin packs scenes onto the
+        # pool: with scenes_per_gpu>1 this assigns multiple scenes to each GPU
+        # (scene i → gpu_pool[i % len(pool)], so [g0,g1,g0,g1] for 4 scenes/2 GPUs).
+        self._scene_gpu: dict[str, str] = {}
+        for i, scene_id in enumerate(scene_assignments):
+            self._scene_gpu[scene_id] = self._gpu_pool[i % len(self._gpu_pool)]
+        if self._scenes_per_gpu > 1:
+            print(
+                f"[GenesisServerPool] oversubscribe: {k} scenes on "
+                f"{len(self._gpu_pool)} GPU(s) (scenes_per_gpu={self._scenes_per_gpu}); "
+                f"same-GPU scenes serialize on compute/render.",
+                flush=True,
+            )
+
         for scene_id, num_envs in scene_assignments.items():
             self._actors[scene_id] = self._create_actor(scene_id, num_envs)
 
+    @staticmethod
+    def _discover_gpu_pool() -> list[str]:
+        """Physical GPU ids this env worker may use, from CUDA_VISIBLE_DEVICES.
+
+        RLinf sets CUDA_VISIBLE_DEVICES to the worker's absolute physical GPU
+        indices. We split it so each scene actor can claim one distinct GPU.
+        """
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if cvd.strip() == "":
+            # Fall back to Ray's GPU count if the worker didn't restrict devices.
+            try:
+                n = int(ray.cluster_resources().get("GPU", 0))
+            except Exception:
+                n = 0
+            return [str(i) for i in range(n)]
+        return [tok.strip() for tok in cvd.split(",") if tok.strip() != ""]
+
     def _create_actor(self, scene_id: str, num_envs: int) -> ray.actor.ActorHandle:
-        return GenesisSceneActor.remote(self._cfg_dict, scene_id, num_envs)
+        gpu_id = self._scene_gpu[scene_id]
+        return GenesisSceneActor.options(
+            num_gpus=0,
+            runtime_env={
+                "env_vars": {
+                    "CUDA_VISIBLE_DEVICES": gpu_id,
+                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                    "MUJOCO_EGL_DEVICE_ID": gpu_id,
+                }
+            },
+        ).remote(self._cfg_dict, scene_id, num_envs)
 
     def get_actor(self, scene_id: str) -> ray.actor.ActorHandle:
-        """Return the actor for a scene, rebuilding it if it has crashed."""
+        """Return the actor for a scene, rebuilding it if it has crashed.
+
+        Performs a blocking health_check round-trip. Use this on the SYNC path.
+        The concurrent fan-out path uses actor_handle() instead (see below).
+        """
         actor = self._actors[scene_id]
         try:
             ray.get(actor.health_check.remote(), timeout=2.0)
         except Exception:
             self.rebuild_actor(scene_id)
+        return self._actors[scene_id]
+
+    def actor_handle(self, scene_id: str) -> ray.actor.ActorHandle:
+        """Return the current actor handle WITHOUT a health_check round-trip.
+
+        Used by the concurrent fan-out path (MultiSceneBackend): blocking on a
+        per-scene health_check before each submit would serialize the K submits
+        and defeat cross-GPU parallelism. Crash detection still happens on the
+        fetch side via GenesisRemoteBackend._safe_get (RayActorError -> rebuild
+        + SceneCrashError), so no crash is missed — it's just detected one step
+        later, which the full-env dormancy model already tolerates.
+        """
         return self._actors[scene_id]
 
     def rebuild_actor(self, scene_id: str) -> None:
@@ -259,6 +372,23 @@ class GenesisRemoteBackend(GenesisSimBackend):
         ))
         self._sync_state(state)
 
+    def set_agent_poses_async(
+        self,
+        env_idx: list[int],
+        positions: torch.Tensor,
+        yaws: torch.Tensor,
+    ):
+        """Submit a pose reset; return a Ray ObjectRef immediately (non-blocking).
+
+        Pair with fetch_state() to collect the snapped state and sync local tensors.
+        """
+        actor = self._pool.actor_handle(self._scene_id)
+        return actor.set_agent_poses.remote(
+            env_idx,
+            positions.cpu().numpy(),
+            yaws.cpu().numpy(),
+        )
+
     # --- Physics step --------------------------------------------------------
 
     def step_physics(
@@ -274,6 +404,33 @@ class GenesisRemoteBackend(GenesisSimBackend):
             active_slot_count,
         ))
         self._sync_state(state)
+
+    def step_physics_async(
+        self,
+        actions: torch.Tensor,
+        active_mask: torch.Tensor,
+        active_slot_count: int,
+    ):
+        """Submit a physics step; return a Ray ObjectRef immediately (non-blocking).
+
+        Uses actor_handle (no health_check round-trip) so MultiSceneBackend can
+        submit all K scenes back-to-back and let them run in parallel across GPUs.
+        Pair with fetch_state() to collect the result and sync local tensors.
+        """
+        actor = self._pool.actor_handle(self._scene_id)
+        return actor.step_physics.remote(
+            actions.cpu().numpy(),
+            active_mask.cpu().numpy(),
+            active_slot_count,
+        )
+
+    def fetch_state(self, ref) -> None:
+        """Block on a step_physics / set_agent_poses ref and sync local tensors.
+
+        Crash-safe: _safe_get rebuilds the actor and raises SceneCrashError if
+        the remote actor died while we were waiting.
+        """
+        self._sync_state(self._safe_get(ref))
 
     # --- Rendering -----------------------------------------------------------
 
@@ -300,13 +457,20 @@ class GenesisRemoteBackend(GenesisSimBackend):
     # --- Async rendering (Phase 3) -------------------------------------------
 
     def render_main_async(self, active_slot_count: int):
-        """Submit render request; return Ray ObjectRef immediately (non-blocking)."""
-        actor = self._pool.get_actor(self._scene_id)
+        """Submit render request; return Ray ObjectRef immediately (non-blocking).
+
+        Uses actor_handle (no health_check round-trip) so K scenes can render
+        concurrently across GPUs. Crash detection happens in fetch_render_main.
+        """
+        actor = self._pool.actor_handle(self._scene_id)
         return actor.render_main.remote(active_slot_count)
 
     def render_4dir_async(self, active_slot_count: int):
-        """Submit 4-dir render request; return Ray ObjectRef or None if disabled."""
-        actor = self._pool.get_actor(self._scene_id)
+        """Submit 4-dir render request; return Ray ObjectRef or None if disabled.
+
+        Uses actor_handle (no health_check round-trip) for concurrent fan-out.
+        """
+        actor = self._pool.actor_handle(self._scene_id)
         return actor.render_4dir.remote(active_slot_count)
 
     def fetch_render_main(self, ref, timeout: float = 30.0) -> np.ndarray:

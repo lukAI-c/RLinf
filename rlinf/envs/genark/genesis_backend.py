@@ -285,6 +285,16 @@ class GenesisSimBackend(ABC):
     def calculate_initial_yaw(self, rotations: torch.Tensor) -> torch.Tensor:
         return _calculate_initial_yaw(rotations)
 
+    def cam_pos_hab(self, camera_height: float) -> torch.Tensor:
+        """Return cam_pos converted to Habitat coordinate frame, shape (num_envs, 3).
+
+        Single-scene backends apply _genesis_to_hab over the full tensor.
+        MultiSceneBackend overrides this to apply the transform per scene block
+        (each scene has its own navmesh datum), preventing cross-scene coordinate
+        corruption (Bug #1: silent reward/distance corruption).
+        """
+        return _genesis_to_hab(self.cam_pos, camera_height)
+
 
 # ---------------------------------------------------------------------------
 # Local (in-process) implementation

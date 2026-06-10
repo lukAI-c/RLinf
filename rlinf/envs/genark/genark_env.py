@@ -325,68 +325,147 @@ class GenarkVecEnv(gym.Env):
 
         # Load episode list and group by scene.
         # Genesis builds ONE scene per process — all envs share it.
-        # Episodes must therefore come from a single scene_id.
+        # Episodes must therefore come from a single scene_id (single-scene path),
+        # or from K scenes (multiscene path, see genesis_backend="multiscene").
         #
-        # Scene assignment: deterministic round-robin over the sorted unique
+        # Single-scene assignment: deterministic round-robin over the sorted unique
         # scene list. With N workers and M scenes:
         #   - if N <= M: each worker pins to a distinct scene (covers N/M)
         #   - if N >  M: workers wrap around (some scenes get >1 worker)
-        # This guarantees no two workers collide on the same scene when N <= M,
-        # which is the common case (e.g. 5 workers × 10 scenes → cover 5).
         all_episodes = _load_episodes(self.episodes_file)
         unique_scenes = sorted({e["scene_id"] for e in all_episodes})
         scene_offset = int(getattr(cfg, "scene_offset", 0))
-        pinned_scene = unique_scenes[(scene_offset + seed_offset) % len(unique_scenes)]
-        scene_eps = [e for e in all_episodes if e["scene_id"] == pinned_scene]
 
-        # Persistent RNG — used for initial shuffle and subsequent cyclic reshuffles.
-        # seed_offset makes each worker use a different sequence.
-        self._rng = np.random.default_rng(seed=42 + seed_offset)
-        self._rng.shuffle(scene_eps)
+        genesis_backend_type = str(getattr(cfg, "genesis_backend", "local"))
 
-        self._all_episodes    = scene_eps
-        self._pinned_scene_id = pinned_scene
-        # Active slots = min(num_envs, actual ep count) — no cycling needed.
-        active_slot_count = min(num_envs, len(scene_eps))
-        self._slot_active[:active_slot_count] = True
-        self._active_slot_count = active_slot_count  # Genesis n_envs
-        print(f"[GenArk] Worker {seed_offset}/{total_num_processes}: "
-              f"pinned to scene '{pinned_scene}' "
-              f"({len(self._all_episodes)} eps, "
-              f"active_slots={active_slot_count}/{num_envs}, "
-              f"{len(unique_scenes)} unique scenes total)", flush=True)
+        # _scene_layout: set only in multiscene mode; None in single-scene mode.
+        # _pool_by_scene: dict[scene_id -> list[episode]] for each scene in use.
+        #   Single-scene: one-key dict so per-scene paths work for both modes.
+        # _rng_by_scene: dict[scene_id -> np.Generator] — independent per-scene RNG.
+        self._scene_layout = None
+        self._pool_by_scene: dict[str, list[dict]] = {}
+        self._rng_by_scene:  dict[str, np.random.Generator] = {}
+        self._next_ep_idx_by_scene:  dict[str, int] = {}
+        self._episode_cycle_by_scene: dict[str, int] = {}
+        self._balancer_by_scene: dict[str, "EpisodeBalancer | None"] = {}
 
-        # Group-level reset state.
-        # When group_size>1, envs in the same group share one episode.
-        # When ALL envs in a group finish, the group is reset together to the
-        # next episode in the pool (preserving GRPO group semantics).
-        # _next_ep_idx: index into _all_episodes for the next group reset.
-        #   Initially = number of episodes already assigned (one per group).
-        #   Incremented by 1 each time a group resets.
-        # _group_done_counts: group_id → number of done envs waiting for group-mates.
         gs = max(self.group_size, 1)
-        n_initial_groups = (active_slot_count + gs - 1) // gs  # ceil division
-        self._next_ep_idx: int = n_initial_groups
+
+        if genesis_backend_type == "multiscene":
+            # --- Multi-scene path ---
+            import torch
+            from rlinf.envs.genark.genesis_multiscene import (
+                build_multiscene_backend,
+                SceneLayout,
+                _stable_scene_hash,
+            )
+            _multi_cfg = getattr(cfg, "multi_scene", None)
+            gpu_budget = getattr(_multi_cfg, "gpu_budget", None)
+            if gpu_budget is not None:
+                gpu_budget = int(gpu_budget)
+            scenes_per_gpu = int(getattr(_multi_cfg, "scenes_per_gpu", 1) or 1)
+
+            ms_backend, layout, pool_by_scene = build_multiscene_backend(
+                cfg=cfg,
+                all_episodes=all_episodes,
+                num_envs=num_envs,
+                group_size=gs,
+                seed_offset=seed_offset,
+                device=torch.device("cuda"),
+                gpu_budget=gpu_budget,
+                scenes_per_gpu=scenes_per_gpu,
+            )
+            backend = ms_backend
+            self._scene_layout = layout
+
+            for scene_id in layout.scenes:
+                eps = pool_by_scene[scene_id]
+                self._pool_by_scene[scene_id]   = eps
+                # Per-scene RNG (independent of other scenes for reproducibility)
+                self._rng_by_scene[scene_id]    = np.random.default_rng(
+                    seed=42 + seed_offset + _stable_scene_hash(scene_id)
+                )
+                k_s = layout.sizes[layout.scenes.index(scene_id)]
+                n_initial_groups_s = k_s // gs
+                self._next_ep_idx_by_scene[scene_id]   = n_initial_groups_s
+                self._episode_cycle_by_scene[scene_id] = 0
+                self._balancer_by_scene[scene_id]      = None
+                if self.episode_balanced_sampling and self.cyclic_episode_sampling:
+                    bal = EpisodeBalancer(eps, self._rng_by_scene[scene_id])
+                    for g in range(min(n_initial_groups_s, len(eps))):
+                        bal.mark_seen(eps[g].get("episode_id", g))
+                    self._balancer_by_scene[scene_id] = bal
+
+            # Mark all slots active (fully-active invariant: K_s <= len(eps_s))
+            self._active_slot_count = num_envs
+            self._slot_active[:num_envs] = True
+
+            # Compatibility aliases used in single-scene code paths.
+            # The first scene is used for attributes that don't affect correctness
+            # in multiscene (e.g. logging fallback). Real per-slot scene is in layout.
+            self._pinned_scene_id = layout.scenes[0]
+            self._all_episodes    = []   # not used in multiscene; per-scene pools are
+
+            print(
+                f"[GenArk][multiscene] Worker {seed_offset}/{total_num_processes}: "
+                f"K={len(layout.scenes)} scenes, num_envs={num_envs}, "
+                f"group_size={gs}, scenes={layout.scenes}",
+                flush=True,
+            )
+
+        else:
+            # --- Single-scene path (local / remote / zmq) ---
+            pinned_scene = unique_scenes[(scene_offset + seed_offset) % len(unique_scenes)]
+            scene_eps = [e for e in all_episodes if e["scene_id"] == pinned_scene]
+
+            rng = np.random.default_rng(seed=42 + seed_offset)
+            rng.shuffle(scene_eps)
+
+            self._pool_by_scene[pinned_scene]   = scene_eps
+            self._rng_by_scene[pinned_scene]    = rng
+            self._pinned_scene_id = pinned_scene
+            self._all_episodes    = scene_eps   # kept for backward-compat read paths
+
+            active_slot_count = min(num_envs, len(scene_eps))
+            self._slot_active[:active_slot_count] = True
+            self._active_slot_count = active_slot_count
+
+            n_initial_groups = (active_slot_count + gs - 1) // gs
+            self._next_ep_idx_by_scene[pinned_scene]   = n_initial_groups
+            self._episode_cycle_by_scene[pinned_scene] = 0
+            self._balancer_by_scene[pinned_scene]      = None
+            if self.episode_balanced_sampling and self.cyclic_episode_sampling:
+                bal = EpisodeBalancer(scene_eps, rng)
+                for g in range(min(n_initial_groups, len(scene_eps))):
+                    bal.mark_seen(scene_eps[g].get("episode_id", g))
+                self._balancer_by_scene[pinned_scene] = bal
+
+            print(f"[GenArk] Worker {seed_offset}/{total_num_processes}: "
+                  f"pinned to scene '{pinned_scene}' "
+                  f"({len(scene_eps)} eps, "
+                  f"active_slots={active_slot_count}/{num_envs}, "
+                  f"{len(unique_scenes)} unique scenes total)", flush=True)
+
+        # _group_done_counts: group_id → count of done envs waiting for group-mates.
         self._group_done_counts: dict[int, int] = {}
-        self._episode_cycle: int = 0  # incremented on each cyclic reshuffle
 
-        # EpisodeBalancer: only in train (cyclic) mode when flag is set.
-        self._balancer: "EpisodeBalancer | None" = None
-        if self.episode_balanced_sampling and self.cyclic_episode_sampling:
-            self._balancer = EpisodeBalancer(self._all_episodes, self._rng)
-            # Pre-credit episodes already assigned to initial groups so balancer
-            # starts with accurate seen counts.
-            for g in range(min(n_initial_groups, len(self._all_episodes))):
-                ep_id = self._all_episodes[g].get("episode_id", g)
-                self._balancer.mark_seen(ep_id)
+        # --- Legacy single-scene accessors (kept for backward-compat) ---
+        # These resolve from the per-scene dicts for K=1; in multiscene they are
+        # only accessed in code paths guarded by _scene_layout is None.
+        def _single_scene_attr(attr: str):
+            """Return the value for the single scene (K=1 path only)."""
+            sid = self._pinned_scene_id
+            return {
+                "_next_ep_idx":   self._next_ep_idx_by_scene,
+                "_episode_cycle": self._episode_cycle_by_scene,
+                "_balancer":      self._balancer_by_scene,
+                "_rng":           self._rng_by_scene,
+            }[attr][sid]
 
-        # Initialise backend.  Caller can pass a backend= explicitly, or set
-        # cfg.genesis_backend = "remote" to use GenesisRemoteBackend (Ray).
+        # Initialise backend.  Caller can pass a backend= explicitly.
         self._genesis_server_proc = None   # subprocess.Popen, set for zmq mode
 
         if backend is None:
-            genesis_backend_type = str(getattr(cfg, "genesis_backend", "local"))
-
             if genesis_backend_type == "remote":
                 from rlinf.envs.genark.genesis_server import (
                     GenesisServerPool,
@@ -395,7 +474,7 @@ class GenarkVecEnv(gym.Env):
                 import torch
                 pool = GenesisServerPool(
                     cfg,
-                    {self._pinned_scene_id: min(num_envs, len(self._all_episodes))},
+                    {self._pinned_scene_id: self._active_slot_count},
                 )
                 backend = GenesisRemoteBackend(
                     pool,
@@ -410,8 +489,6 @@ class GenarkVecEnv(gym.Env):
                     launch_zmq_server,
                 )
                 import torch, hashlib
-                # Unique socket base: scene hash + seed_offset avoids collisions
-                # when multiple workers run on the same machine.
                 scene_hash = hashlib.md5(
                     self._pinned_scene_id.encode()
                 ).hexdigest()[:8]
@@ -419,7 +496,7 @@ class GenarkVecEnv(gym.Env):
                 self._genesis_server_proc = launch_zmq_server(
                     cfg,
                     self._pinned_scene_id,
-                    min(num_envs, len(self._all_episodes)),
+                    self._active_slot_count,
                     socket_base,
                 )
                 backend = GenesisZMQBackend(
@@ -469,25 +546,43 @@ class GenarkVecEnv(gym.Env):
 
     def _assign_episodes_to_envs(self, env_idx: Optional[list[int]] = None):
         """Assign episodes to slots. With group_size>1, every group_size consecutive
-        slots share the same episode so GRPO can compare rewards within a group."""
+        slots share the same episode so GRPO can compare rewards within a group.
+
+        Multi-scene: slot i is assigned from its own scene's pool using a LOCAL
+        group index within the scene block, so episodes never cross scene boundaries.
+        Single-scene: equivalent to the old global-index path (K=1 one-key dict).
+        """
+        gs      = max(self.group_size, 1)
         indices = list(range(self.num_envs)) if env_idx is None else env_idx
+        layout  = self._scene_layout  # None in single-scene mode
+
         for i in indices:
             if not self._slot_active[i]:
                 continue  # ghost slot — no episode assigned
-            ep_idx = i // self.group_size  # group_size envs share one episode
-            if ep_idx < len(self._all_episodes):
-                self._episodes[i] = self._all_episodes[ep_idx]
-                self._instructions[i] = (
-                    self._all_episodes[ep_idx]["instruction"]["instruction_text"]
-                )
+
+            if layout is not None:
+                # Multi-scene: index into the slot's own scene pool
+                scene_id    = layout.scene_id_of(i)
+                pool        = self._pool_by_scene[scene_id]
+                local_group = layout.scene_local_group(i)   # group within scene block
+            else:
+                # Single-scene: global group index into the one pool
+                scene_id    = self._pinned_scene_id
+                pool        = self._pool_by_scene[scene_id]
+                local_group = i // gs
+
+            if local_group < len(pool):
+                self._episodes[i]     = pool[local_group]
+                self._instructions[i] = pool[local_group]["instruction"]["instruction_text"]
             else:
                 self._slot_active[i] = False  # shouldn't happen, safety guard
-        # P0 guard: verify GRPO group semantics — all active envs in the same group
-        # must share the exact same episode object after initial assignment.
+
+        # P0 guard: all active envs in the same group must share the exact same
+        # episode object AND belong to the same scene (Bug #2 runtime backstop).
         assigned = {i for i in indices if self._slot_active[i] and self._episodes[i] is not None}
         groups_assigned: dict[int, list[int]] = {}
         for i in assigned:
-            gid = i // self.group_size
+            gid = i // gs
             groups_assigned.setdefault(gid, []).append(i)
         for gid, members in groups_assigned.items():
             ep_objects = {id(self._episodes[j]) for j in members}
@@ -495,6 +590,13 @@ class GenarkVecEnv(gym.Env):
                 f"[P0] _assign_episodes_to_envs: group {gid} split across episodes: "
                 f"{[self._episodes[j].get('episode_id') for j in members]}"
             )
+            if layout is not None:
+                # Bug #2 runtime backstop: all group members must be in the same scene
+                scene_ids_in_group = {layout.scene_id_of(j) for j in members}
+                assert len(scene_ids_in_group) == 1, (
+                    f"[P0] group {gid} straddles scenes {scene_ids_in_group}. "
+                    f"SceneLayout invariant violated — check group_size alignment."
+                )
 
     # ------------------------------------------------------------------
     # gym.Env interface
@@ -575,6 +677,14 @@ class GenarkVecEnv(gym.Env):
 
         for j, i in enumerate(valid_idx):
             ep  = self._episodes[i]
+            # Bug #2 runtime check: slot must hold an episode for its own scene.
+            if self._scene_layout is not None:
+                expected_scene = self._scene_layout.scene_id_of(i)
+                assert ep["scene_id"] == expected_scene, (
+                    f"[P0] _init_agent_poses: slot {i} has episode scene_id "
+                    f"'{ep['scene_id']}' but belongs to scene block '{expected_scene}'. "
+                    f"Episode pool routing bug in _assign_episodes_to_envs."
+                )
             sp  = ep["start_position"]
             gx, gy, gz = _hab_to_genesis(sp)
             positions[j] = torch.tensor([gx, gy, gz + self.camera_height])
@@ -588,9 +698,11 @@ class GenarkVecEnv(gym.Env):
         # Backend: set poses + snap to navmesh + update Genesis camera
         self._sim.set_agent_poses(valid_idx, positions, yaws)
 
-        # Read back snapped positions for metric initialisation
-        cam_pos = self._sim.cam_pos
-        init_hab = _genesis_to_hab(cam_pos, self.camera_height)
+        # Read back snapped positions for metric initialisation.
+        # Bug #1: use cam_pos_hab() so coordinate frames are correct per scene.
+        # In single-scene mode this is identical to _genesis_to_hab(cam_pos, height).
+        # In multi-scene mode, MultiSceneBackend applies the transform per block.
+        init_hab = self._sim.cam_pos_hab(self.camera_height)
         for i in valid_idx:
             d = torch.norm(init_hab[i] - self._goal_pos_t[i]).item()
             self._distances_lists[i] = [d]
@@ -705,7 +817,10 @@ class GenarkVecEnv(gym.Env):
 
         # --- Metrics ---
         N_act = self._active_slot_count
-        curr_hab_act = _genesis_to_hab(self._sim.cam_pos[:N_act], self.camera_height)
+        # Bug #1: use cam_pos_hab() so each scene block uses its own navmesh datum.
+        # Single-scene: identical to _genesis_to_hab(cam_pos, height).
+        # Multi-scene: MultiSceneBackend applies transform per scene block.
+        curr_hab_act = self._sim.cam_pos_hab(self.camera_height)[:N_act]
         curr_dist_act = torch.norm(
             curr_hab_act - self._goal_pos_t[:N_act].to(curr_hab_act.device), dim=1
         )
@@ -820,7 +935,12 @@ class GenarkVecEnv(gym.Env):
         if not self._exhausted and not np.any(self._slot_active & ~self._slot_done):
             self._exhausted = True
             self._dump_per_scene_metrics()
-            print(f"[GenArk] Worker exhausted: scene='{self._pinned_scene_id}' "
+            scene_label = (
+                str(self._scene_layout.scenes)
+                if self._scene_layout is not None
+                else f"'{self._pinned_scene_id}'"
+            )
+            print(f"[GenArk] Worker exhausted: scene={scene_label} "
                   f"all {int(self._slot_active.sum())} episodes done. "
                   "Entering dormant mode.", flush=True)
 
@@ -909,13 +1029,20 @@ class GenarkVecEnv(gym.Env):
             self._elapsed_steps[i] = 0
             m   = ep_metrics_by_env.get(i, {})
             ep_id = self._episodes[i].get("episode_id", f"_env{i}")
+            # Bug #10: write the slot's actual scene_id, not the stale _pinned_scene_id.
+            slot_scene_id = (
+                self._scene_layout.scene_id_of(i)
+                if self._scene_layout is not None
+                else self._pinned_scene_id
+            )
             self._episode_log.append({
                 "episode_id": ep_id,
-                "scene_id":   self._pinned_scene_id,
+                "scene_id":   slot_scene_id,
                 **{k: float(v) for k, v in m.items()},
             })
-            if self._balancer is not None:
-                self._balancer.record(ep_id, bool(m.get("success", 0)))
+            balancer = self._balancer_by_scene.get(slot_scene_id)
+            if balancer is not None:
+                balancer.record(ep_id, bool(m.get("success", 0)))
             print(
                 f"[GenArk] Episode done  env={i}  ep={ep_id}"
                 f"  success={m.get('success', 0):.0f}"
@@ -992,39 +1119,64 @@ class GenarkVecEnv(gym.Env):
         rewards within the group. Resetting them together to a NEW episode
         (same scene, different task) preserves this invariant across resets.
 
+        Multi-scene: each group resolves its scene via slot_to_scene_idx and draws
+        the next episode from that scene's independent pool — groups never straddle
+        scene boundaries (enforced by SceneLayout group-alignment invariants).
+
         If the episode pool is exhausted, the group stays dormant (existing behavior).
         """
+        gs = max(self.group_size, 1)
+        layout = self._scene_layout  # None in single-scene mode
+
         for env_i in newly_done_idx:
-            group_id = env_i // self.group_size
+            group_id    = env_i // gs
+            group_start = group_id * gs
+            group_envs  = [
+                j for j in range(group_start, group_start + gs)
+                if j < self.num_envs and self._slot_active[j]
+            ]
+
             self._group_done_counts[group_id] = (
                 self._group_done_counts.get(group_id, 0) + 1
             )
-
-            # Count active envs in this group (may be < group_size at scene edge)
-            group_start = group_id * self.group_size
-            group_envs = [
-                j for j in range(group_start, group_start + self.group_size)
-                if j < self.num_envs and self._slot_active[j]
-            ]
-            n_active_in_group = len(group_envs)
-
-            if self._group_done_counts[group_id] < n_active_in_group:
+            if self._group_done_counts[group_id] < len(group_envs):
                 continue  # still waiting for group-mates
 
             # All active envs in the group are done
             del self._group_done_counts[group_id]
 
-            if self._balancer is not None:
+            # Resolve which scene this group belongs to.
+            scene_id = (
+                layout.scene_id_of(group_start)
+                if layout is not None
+                else self._pinned_scene_id
+            )
+
+            # Bug #2 runtime backstop: all group members must be in the same scene.
+            if layout is not None:
+                scene_ids_in_group = {layout.scene_id_of(j) for j in group_envs}
+                assert len(scene_ids_in_group) == 1, (
+                    f"[P0] _maybe_reset_complete_groups: group {group_id} straddles "
+                    f"scenes {scene_ids_in_group}. SceneLayout alignment broken."
+                )
+
+            # Resolve per-scene episode-pool state
+            pool     = self._pool_by_scene[scene_id]
+            rng      = self._rng_by_scene[scene_id]
+            balancer = self._balancer_by_scene.get(scene_id)
+
+            if balancer is not None:
                 # Balanced mode: EpisodeBalancer picks next episode by
                 # (seen_count, success_rate) lexicographic order.
-                next_ep, new_pass = self._balancer.next_episode()
+                next_ep, new_pass = balancer.next_episode()
                 ep_id = next_ep.get("episode_id", "?")
                 if new_pass:
-                    self._episode_cycle += 1
-                    summ = self._summarize_episode_log()
+                    self._episode_cycle_by_scene[scene_id] += 1
+                    cycle = self._episode_cycle_by_scene[scene_id]
+                    summ  = self._summarize_episode_log()
                     print(
-                        f"[GenArk][episode-cycle] scene={self._pinned_scene_id} "
-                        f"cycle={self._episode_cycle} (balanced) "
+                        f"[GenArk][episode-cycle] scene={scene_id} "
+                        f"cycle={cycle} (balanced) "
                         f"sr={summ.get('success', 0):.3f} "
                         f"spl={summ.get('spl', 0):.3f} "
                         f"ndtw={summ.get('ndtw', 0):.3f} "
@@ -1032,30 +1184,31 @@ class GenarkVecEnv(gym.Env):
                         flush=True,
                     )
             else:
-                if self._next_ep_idx >= len(self._all_episodes):
+                next_ep_idx = self._next_ep_idx_by_scene[scene_id]
+                if next_ep_idx >= len(pool):
                     if self.cyclic_episode_sampling:
-                        # Reshuffle and restart the pool (train mode).
-                        # Avoid immediately repeating the episode the group just ran.
+                        # Reshuffle and restart this scene's pool (train mode).
+                        # Avoid immediately repeating the episode just run.
                         last_ep_id = (self._episodes[group_envs[0]] or {}).get(
                             "episode_id", None
                         )
-                        self._rng.shuffle(self._all_episodes)
+                        rng.shuffle(pool)
                         if (
                             last_ep_id is not None
-                            and len(self._all_episodes) > 1
-                            and self._all_episodes[0].get("episode_id") == last_ep_id
+                            and len(pool) > 1
+                            and pool[0].get("episode_id") == last_ep_id
                         ):
-                            self._all_episodes = (
-                                self._all_episodes[1:] + self._all_episodes[:1]
-                            )
-                        self._next_ep_idx = 0
-                        self._episode_cycle += 1
-                        # Print per-scene summary on each cycle so we can compare scenes.
-                        summ = self._summarize_episode_log()
+                            self._pool_by_scene[scene_id] = pool[1:] + pool[:1]
+                            pool = self._pool_by_scene[scene_id]
+                        self._next_ep_idx_by_scene[scene_id] = 0
+                        next_ep_idx = 0
+                        self._episode_cycle_by_scene[scene_id] += 1
+                        cycle = self._episode_cycle_by_scene[scene_id]
+                        summ  = self._summarize_episode_log()
                         print(
-                            f"[GenArk][episode-cycle] scene={self._pinned_scene_id} "
-                            f"cycle={self._episode_cycle} "
-                            f"reshuffled {len(self._all_episodes)} episodes | "
+                            f"[GenArk][episode-cycle] scene={scene_id} "
+                            f"cycle={cycle} "
+                            f"reshuffled {len(pool)} episodes | "
                             f"sr={summ.get('success', 0):.3f} "
                             f"spl={summ.get('spl', 0):.3f} "
                             f"ndtw={summ.get('ndtw', 0):.3f} "
@@ -1065,22 +1218,22 @@ class GenarkVecEnv(gym.Env):
                     else:
                         # Single-pass mode (eval) — group enters dormant permanently.
                         print(
-                            f"[GenArk][group-reset] group={group_id} pool exhausted "
-                            f"(next_ep_idx={self._next_ep_idx}, "
-                            f"pool_size={len(self._all_episodes)}); entering dormant.",
+                            f"[GenArk][group-reset] group={group_id} scene={scene_id} "
+                            f"pool exhausted (next_ep_idx={next_ep_idx}, "
+                            f"pool_size={len(pool)}); entering dormant.",
                             flush=True,
                         )
                         continue
 
                 # Assign the next pooled episode to all envs in the group
-                next_ep = self._all_episodes[self._next_ep_idx]
-                ep_id = next_ep.get("episode_id", self._next_ep_idx)
-                self._next_ep_idx += 1
+                next_ep = pool[self._next_ep_idx_by_scene[scene_id]]
+                ep_id   = next_ep.get("episode_id", self._next_ep_idx_by_scene[scene_id])
+                self._next_ep_idx_by_scene[scene_id] += 1
 
             for j in group_envs:
                 self._episodes[j]     = next_ep
                 self._instructions[j] = next_ep["instruction"]["instruction_text"]
-                self._slot_done[j]    = False   # clear done → no longer dormant
+                self._slot_done[j]    = False
                 self._elapsed_steps[j] = 0
                 self._stop_called[j]  = False
                 self._action_history[j] = []
@@ -1096,14 +1249,15 @@ class GenarkVecEnv(gym.Env):
             # Re-initialise agent poses and metrics for the reset group
             self._init_agent_poses(group_envs)
 
-            if self._balancer is not None:
-                _seen_vals = list(self._balancer._seen.values())
+            if balancer is not None:
+                _seen_vals = list(balancer._seen.values())
                 _pool_info = (f"balanced seen min={min(_seen_vals)} max={max(_seen_vals)}"
-                              f" passes={self._balancer._passes}")
+                              f" passes={balancer._passes}")
             else:
-                _pool_info = f"pool remaining: {len(self._all_episodes) - self._next_ep_idx}"
+                remaining = len(pool) - self._next_ep_idx_by_scene[scene_id]
+                _pool_info = f"pool remaining: {remaining}"
             print(
-                f"[GenArk][group-reset] group={group_id} → ep={ep_id} "
+                f"[GenArk][group-reset] group={group_id} scene={scene_id} → ep={ep_id} "
                 f"envs={group_envs} ({_pool_info})",
                 flush=True,
             )
@@ -1201,10 +1355,21 @@ class GenarkVecEnv(gym.Env):
             else:
                 base = "/tmp"
             os.makedirs(base, exist_ok=True)
-            scan = os.path.basename(os.path.dirname(self._pinned_scene_id))
+            if self._scene_layout is not None:
+                # Multi-scene: use a worker-level name listing all scenes
+                scan = "multiscene_" + "_".join(
+                    os.path.basename(os.path.dirname(sid))
+                    for sid in self._scene_layout.scenes
+                )
+            else:
+                scan = os.path.basename(os.path.dirname(self._pinned_scene_id))
             out_path = os.path.join(base, f"per_scene_{scan}.json")
             payload = {
-                "scene_id":  self._pinned_scene_id,
+                "scene_id":  (
+                    self._scene_layout.scenes
+                    if self._scene_layout is not None
+                    else self._pinned_scene_id
+                ),
                 "scan_name": scan,
                 "n_episodes": len(self._episode_log),
                 "episodes":  self._episode_log,

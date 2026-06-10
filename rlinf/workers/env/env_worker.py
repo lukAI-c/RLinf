@@ -980,6 +980,15 @@ class EnvWorker(Worker):
             for stage_id in range(self.stage_num):
                 env_output: EnvOutput = env_outputs[stage_id]
                 env_batch = env_output.to_dict()
+                # Initial obs of the epoch: nothing decided yet → global termination
+                # is always False. Inject it (decision-rollout only) so the rollout's
+                # very first step also reads the global flag rather than its local
+                # all_done, keeping every step on the synchronized global path.
+                if use_decision_rollout:
+                    env_batch["obs"]["should_terminate"] = torch.zeros(
+                        self.train_num_envs_per_stage, dtype=torch.bool,
+                        device=torch.device("cpu"),
+                    )
                 self.send_env_batch(
                     rollout_channel,
                     {
@@ -1197,6 +1206,28 @@ class EnvWorker(Worker):
                             rollout_result.actions, stage_id
                         )
                         env_batch = env_output.to_dict()
+                        # Global termination signal for synchronized rollout-rank exit.
+                        # The env worker is the sole coordinator: it sees every stage's
+                        # decision_counts/dormant state (the full global batch), so it
+                        # computes the SAME all-done condition the rollout used to derive
+                        # locally — but globally — and broadcasts it to all rollout ranks
+                        # via the obs. This makes every rank enter bootstrap on the same
+                        # step, so prev_logprobs is never None on one shard and a tensor on
+                        # another (heterogeneous multi-scene termination otherwise crashes
+                        # RolloutResult.merge). Single-scene: global == local, behavior is
+                        # byte-identical to before.
+                        should_terminate = all(
+                            not (
+                                (decision_counts[s] < max_dec) & (~last_env_dormant[s])
+                            ).any()
+                            for s in range(self.stage_num)
+                        )
+                        env_batch["obs"]["should_terminate"] = torch.full(
+                            (self.train_num_envs_per_stage,),
+                            bool(should_terminate),
+                            dtype=torch.bool,
+                            device=_cpu,
+                        )
                         self.send_env_batch(
                             rollout_channel,
                             {

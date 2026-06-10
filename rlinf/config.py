@@ -172,6 +172,9 @@ def openai_gelu(x):
 
 try:
     jit_fuser = torch.compile
+    # Eagerly validate that torch.compile is functional (torch._inductor import chain
+    # can be broken in mixed-version installs even if the attribute exists).
+    jit_fuser(lambda x: x)
 except Exception:
     jit_fuser = torch.jit.script
 
