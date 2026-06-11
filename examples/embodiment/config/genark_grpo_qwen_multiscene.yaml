@@ -146,9 +146,17 @@ env:
     ndtw_coef: 1.0
     sr_coef: 2.0
     format_reward_coef: 0.0
-    decision_dtg_coef: 1.0
+    decision_dtg_coef: 1.0         # no-op in geo_ndtw mode (only used by decision_nav)
     decision_dtg_clip: 2.0
     enable_4dir_render: true
+    # Aligned with the proven single-scene lora run (run_qwen_rft.sh):
+    # wrong_stop_penalty -0.5(code default)→-2.0 strengthens the early-stop
+    # penalty so the model is pushed to keep exploring instead of STOP-ing early
+    # (96% of episodes were wrong_stop). success_distance 3.0→5.0 widens the
+    # success threshold so cold-start GRPO groups get positive samples and
+    # within-group reward variance (otherwise advantages collapse to 0).
+    wrong_stop_penalty: -2.0
+    success_distance: 5.0
 
     scene_offset: 0
 
@@ -162,6 +170,7 @@ env:
     ignore_terminations: True
     reward_mode: "geo_progress"
     enable_4dir_render: true
+    success_distance: 5.0          # match train threshold (proven single-scene)
     scene_offset: 0
     video_cfg:
       save_video: True
