@@ -45,3 +45,20 @@ collect_forward_inputs: false
 # Reduces rollout time by ~35% (removes one full VLM forward per step).
 # MUST keep algorithm.recompute_prev_logprobs=True when this is True.
 skip_rollout_logprobs: false
+
+# Phase A: LaViRA merged LA+VA schema (gated, default=off to protect running baseline).
+# Enable with: ++actor.model.prompt_style=lavira_merged ++actor.model.merged_la_va=true
+prompt_style: "default"        # "default" | "lavira_merged"
+merged_la_va: false            # reserved for Phase B API routing (unused in Phase A)
+record_bbox_diagnostics: true  # log bbox_2d / action_type in diagnostics
+
+# Phase B2: eval-only bbox heading correction (replaces fixed 30° macro, default off)
+# Enable: ++actor.model.bbox_heading_correction=true
+bbox_heading_correction: false
+
+# Phase B3 / P1: hybrid-gated controller (train+eval). A geometrically-valid bbox_2d
+# drives a goal-directed primitive queue (placeholder = bbox-center heading until FMM
+# lands in P3); an invalid bbox falls back to the discrete direction macro. Routes
+# through the verified pending_actions variable-length replay path. Default off.
+# Enable: ++actor.model.lavira_controller=true (with prompt_style=lavira_merged)
+lavira_controller: false

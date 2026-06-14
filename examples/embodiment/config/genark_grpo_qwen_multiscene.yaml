@@ -97,7 +97,7 @@ algorithm:
 
   sampling_params:
     do_sample: True
-    temperature_train: 1.0
+    temperature_train: 0.4        # 1.0→0.4: reduce schema randomness; keep do_sample for GRPO diversity
     temperature_eval: -1
     top_k: -1
     top_p: 1.0
@@ -140,12 +140,15 @@ env:
 
     cyclic_episode_sampling: true
     episode_balanced_sampling: true   # within-scene (seen_count, success_rate) balanced sampling
-    reward_mode: "geo_ndtw"
+    reward_mode: "decision_nav"   # geo_ndtw→decision_nav: per-DECISION DTG progress
+                                  # (net meters closer, clip ±2) — dense gradient WITHOUT
+                                  # macro-length bias (why geo_coef was kept 0). Activates
+                                  # the already-set decision_dtg_coef=1.0.
     decision_level_ndtw: true
     geo_coef: 0.0
     ndtw_coef: 1.0
     sr_coef: 2.0
-    format_reward_coef: 0.0
+    format_reward_coef: 0.2        # 0.0→0.2: direct schema correctness signal (parse_fail ~35%)
     decision_dtg_coef: 1.0         # no-op in geo_ndtw mode (only used by decision_nav)
     decision_dtg_clip: 2.0
     enable_4dir_render: true
@@ -231,14 +234,15 @@ actor:
     # the actor to ~15GB.
     is_lora: true
     add_value_head: false
-    lora_rank: 64
-    lora_alpha: 128
-    lora_dropout: 0.0
+    lora_rank: 32                    # 64→32: smaller rank, scale alpha/rank 2.0→1.0
+    lora_alpha: 32                   # 128→32: more conservative LoRA updates
+    lora_dropout: 0.05               # 0.0→0.05: light regularization
     lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
   optim:
-    lr: 1.0e-7                     # matches proven single-scene; 5e-6 was 50× too
-                                   # high → GRPO policy collapse (steps→0, reward↓)
+    lr: 5.0e-7                     # 1e-7→5e-7: 5× increase; net LoRA delta ~2.5× vs
+                                   # before (alpha/rank halved from 2.0→1.0); well below
+                                   # collapse threshold (5e-6 caused collapse at scale=2)
     adam_beta1: 0.9
     adam_beta2: 0.999
     adam_eps: 1.0e-08

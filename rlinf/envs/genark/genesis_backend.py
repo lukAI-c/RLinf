@@ -147,6 +147,11 @@ def _genesis_to_hab(cam_pos_gen: torch.Tensor, camera_height: float) -> torch.Te
 
 
 def _update_camera(cam, cam_pos: torch.Tensor, cam_yaw: torch.Tensor):
+    # Last line of defense: a non-finite pos/yaw produces a non-finite camera
+    # transform that segfaults the Genesis renderer (z_up_to_R). Sanitize here so
+    # no inf/NaN — from any source — can reach cam.set_pose.
+    cam_pos = torch.nan_to_num(cam_pos, nan=0.0, posinf=0.0, neginf=0.0)
+    cam_yaw = torch.nan_to_num(cam_yaw, nan=0.0, posinf=0.0, neginf=0.0)
     dir_x  = torch.cos(cam_yaw)
     dir_y  = torch.sin(cam_yaw)
     lookat = cam_pos.clone()
@@ -471,8 +476,16 @@ class GenesisLocalBackend(GenesisSimBackend):
             self._tri_v0_3d, self._tri_v1_3d, self._tri_v2_3d,
             self._max_step_height,
         )
-        self._cam_pos_t[idx_t, 2]      = new_z + self._camera_height
-        self._current_tri_idx_t[idx_t] = tri_idx
+        # Only apply the snapped floor where the snap actually succeeded AND is
+        # finite. An off-navmesh spawn makes _batch_find_floor extrapolate a far
+        # (or near-vertical) triangle's plane → inf / wildly-large z; writing that
+        # into the camera pose builds a non-finite transform that segfaults the
+        # Genesis renderer (z_up_to_R). Fall back to the spawn-provided height.
+        snapped_z = new_z + self._camera_height
+        safe      = valid & torch.isfinite(snapped_z)
+        cur_z     = self._cam_pos_t[idx_t, 2]      # spawn height (finite)
+        self._cam_pos_t[idx_t, 2]      = torch.where(safe, snapped_z, cur_z)
+        self._current_tri_idx_t[idx_t] = torch.where(safe, tri_idx, torch.zeros_like(tri_idx))
 
         _update_camera(
             self._cam,
@@ -604,3 +617,38 @@ class GenesisLocalBackend(GenesisSimBackend):
 
         # (3, N, H, W, 3) → (N, 3, H, W, 3)
         return np.stack(extras_np, axis=1)
+
+    def render_main_with_depth(self, active_slot_count: int):
+        """Render front camera RGB + depth for active slots.
+
+        Returns:
+            rgb_batch  : (num_envs, H, W, 3) uint8 numpy — same as render_main()
+            depth_batch: (num_envs, H, W)    float32 numpy, meters; ghost slots = 0
+        """
+        _update_camera(
+            self._cam,
+            self._cam_pos_t[:active_slot_count],
+            self._cam_yaw_t[:active_slot_count],
+        )
+        rgb_raw, depth_raw, _, _ = self._cam.render(
+            rgb=True, depth=True, segmentation=False, force_render=True
+        )
+        # Apply the same light-scale normalisation as _render_and_scale()
+        if rgb_raw.dtype == torch.uint8:
+            rgb_float = rgb_raw.float() / 255.0
+        else:
+            rgb_float = rgb_raw
+        rgb_active = torch.clamp(rgb_float * self._light_scale * 255.0, 0, 255).byte()
+
+        rgb_batch   = self._pad_ghost_slots(rgb_active, active_slot_count).cpu().numpy()
+        depth_active = depth_raw[:active_slot_count].float()
+        if active_slot_count < self._num_envs:
+            pad_n = self._num_envs - active_slot_count
+            pad = torch.zeros(
+                (pad_n, self._cam_h, self._cam_w),
+                dtype=torch.float32, device=depth_active.device,
+            )
+            depth_batch = torch.cat([depth_active, pad], dim=0).cpu().numpy()
+        else:
+            depth_batch = depth_active.cpu().numpy()
+        return rgb_batch, depth_batch

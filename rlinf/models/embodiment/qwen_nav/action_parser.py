@@ -35,6 +35,10 @@ ACTION_STOP, ACTION_FORWARD, ACTION_TURN_LEFT, ACTION_TURN_RIGHT = 0, 1, 2, 3
 # Sentinel returned to env when JSON parse fails (so env can distinguish
 # "model chose stop" from "parse failed → fallback stop" for format_reward).
 ACTION_PARSE_FAIL = 4
+# Sentinel base for parse_ok + has_valid_bbox_2d: sent = 10 + true_action.
+# 10=stop+bbox, 11=fwd+bbox, 12=left+bbox, 13=right+bbox
+# Env decodes: action >= 10 → has_bbox=True, true_action = action - 10.
+ACTION_PARSE_OK_HAS_BBOX_BASE = 10
 
 DIRECTION_TO_ACTIONS: dict[str, list[int]] = {
     "navigate to forward": [ACTION_FORWARD],
@@ -57,23 +61,35 @@ _BARE_JSON_RE = re.compile(r"\{(?:[^{}]|\{[^{}]*\})*\}", re.S)
 
 class ParsedAction:
     """
-    Structured output of parse_lavira_json.
+    Structured output of parse_lavira_json / parse_lavira_merged_json.
 
-    Fields:
+    Core fields (all parsers):
       actions     : list[int]      — GenArk action sequence (1+ elements when ok)
-      bbox        : list[float]|None
+      bbox        : list[float]|None — pixel bbox (default schema); None in merged schema
       stop        : bool
       stair       : str|False      — "up"/"down"/False
       progress    : str            — progress_analysis text (for logging)
-      reasoning   : str            — reasoning text
+      reasoning   : str            — reasoning text (default) / reasoning_action (merged)
       raw_dir     : str|None       — original "navigate to ..." string
       ok          : bool           — True if JSON parsed and required fields valid
       err         : str|None       — error code if not ok
+
+    Merged-schema fields (parse_lavira_merged_json only; defaults for default parser):
+      action_type     : str             — "NAVIGATE" / "BACKTRACK" / "STOP" / "PARSE_FAIL"
+      waypoint_id     : int|None        — backtrack target waypoint id
+      bbox_2d         : list[float]|None — 0-1000 normalized bbox in chosen-direction view
+      target          : str             — short bbox content description
+      planning        : str             — planning field text
+      reasoning_action: str             — reasoning_action field text
+      reasoning_bbox  : str             — reasoning_bbox field text
     """
 
     __slots__ = (
         "actions", "bbox", "stop", "stair",
         "progress", "reasoning", "raw_dir", "ok", "err",
+        # merged-schema extended fields
+        "action_type", "waypoint_id", "bbox_2d",
+        "target", "planning", "reasoning_action", "reasoning_bbox",
     )
 
     def __init__(
@@ -87,6 +103,14 @@ class ParsedAction:
         raw_dir: Optional[str] = None,
         ok: bool = True,
         err: Optional[str] = None,
+        # merged-schema extended fields
+        action_type: str = "",
+        waypoint_id: Optional[int] = None,
+        bbox_2d: Optional[list[float]] = None,
+        target: str = "",
+        planning: str = "",
+        reasoning_action: str = "",
+        reasoning_bbox: str = "",
     ):
         self.actions = actions
         self.bbox = bbox
@@ -97,6 +121,13 @@ class ParsedAction:
         self.raw_dir = raw_dir
         self.ok = ok
         self.err = err
+        self.action_type = action_type
+        self.waypoint_id = waypoint_id
+        self.bbox_2d = bbox_2d
+        self.target = target
+        self.planning = planning
+        self.reasoning_action = reasoning_action
+        self.reasoning_bbox = reasoning_bbox
 
 
 def parse_lavira_json(text: str) -> ParsedAction:
@@ -154,6 +185,136 @@ def parse_lavira_json(text: str) -> ParsedAction:
         raw_dir=raw_dir,
         ok=True,
         err=None,
+    )
+
+
+# Regex to extract waypoint id from "backtrack to <N>"
+_BACKTRACK_RE = re.compile(r"^backtrack\s+to\s+(\d+)$", re.I)
+
+
+def parse_lavira_merged_json(text: str) -> ParsedAction:
+    """
+    Parse a model response that uses the LaViRA merged LA+VA JSON schema.
+
+    Expected schema (9 fields in order):
+      progress_analysis, planning, reasoning_action, action,
+      stop, stair, reasoning_bbox, bbox_2d, target
+
+    Action handling:
+      - "navigate to {forward|left|right|behind}" → NAVIGATE, 30° macros (Phase A)
+      - "backtrack to <N>"                        → BACKTRACK, degraded to forward (Phase A)
+      - stop=true                                 → STOP, actions=[ACTION_STOP]
+      - anything else                             → fallback PARSE_FAIL
+    """
+    if not text:
+        return _fallback_merged("empty_text")
+
+    json_str = _extract_json_string(text)
+    if json_str is None:
+        return _fallback_merged("no_json_found")
+
+    try:
+        obj = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        return _fallback_merged(f"json_invalid:{e.msg}")
+
+    if not isinstance(obj, dict):
+        return _fallback_merged("not_object")
+
+    raw_action = obj.get("action")
+    stop = bool(obj.get("stop", False))
+
+    # Shared text fields (all truncated for logging)
+    progress = str(obj.get("progress_analysis", ""))[:512]
+    planning = str(obj.get("planning", ""))[:512]
+    reasoning_action = str(obj.get("reasoning_action", ""))[:512]
+    reasoning_bbox = str(obj.get("reasoning_bbox", ""))[:256]
+    target = str(obj.get("target", ""))[:256]
+    stair = _clean_stair(obj.get("stair", False))
+    bbox_2d = _clean_bbox(obj.get("bbox_2d"))
+
+    if stop:
+        return ParsedAction(
+            actions=[ACTION_STOP],
+            bbox=None,
+            stop=True,
+            stair=stair,
+            progress=progress,
+            reasoning=reasoning_action,
+            raw_dir=raw_action if isinstance(raw_action, str) else None,
+            ok=True,
+            err=None,
+            action_type="STOP",
+            waypoint_id=None,
+            bbox_2d=bbox_2d,
+            target=target,
+            planning=planning,
+            reasoning_action=reasoning_action,
+            reasoning_bbox=reasoning_bbox,
+        )
+
+    if not isinstance(raw_action, str):
+        return _fallback_merged(f"unknown_direction:{raw_action}")
+
+    # Check for backtrack (Phase A: degrade to forward)
+    bm = _BACKTRACK_RE.match(raw_action.strip())
+    if bm:
+        waypoint_id = int(bm.group(1))
+        return ParsedAction(
+            actions=list(DIRECTION_TO_ACTIONS["navigate to forward"]),
+            bbox=None,
+            stop=False,
+            stair=stair,
+            progress=progress,
+            reasoning=f"[backtrack→forward wp={waypoint_id}] " + reasoning_action,
+            raw_dir="navigate to forward",
+            ok=True,
+            err=None,
+            action_type="BACKTRACK",
+            waypoint_id=waypoint_id,
+            bbox_2d=None,  # bbox unused for backtrack
+            target="",
+            planning=planning,
+            reasoning_action=reasoning_action,
+            reasoning_bbox=reasoning_bbox,
+        )
+
+    # Regular navigate action
+    if raw_action not in VALID_DIRECTIONS:
+        return _fallback_merged(f"unknown_direction:{raw_action}")
+
+    return ParsedAction(
+        actions=list(DIRECTION_TO_ACTIONS[raw_action]),
+        bbox=None,
+        stop=False,
+        stair=stair,
+        progress=progress,
+        reasoning=reasoning_action,
+        raw_dir=raw_action,
+        ok=True,
+        err=None,
+        action_type="NAVIGATE",
+        waypoint_id=None,
+        bbox_2d=bbox_2d,
+        target=target,
+        planning=planning,
+        reasoning_action=reasoning_action,
+        reasoning_bbox=reasoning_bbox,
+    )
+
+
+def _fallback_merged(err: str) -> ParsedAction:
+    return ParsedAction(
+        actions=[ACTION_STOP],
+        bbox=None,
+        stop=True,
+        stair=False,
+        progress="",
+        reasoning="",
+        raw_dir=None,
+        ok=False,
+        err=err,
+        action_type="PARSE_FAIL",
     )
 
 

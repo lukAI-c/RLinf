@@ -221,6 +221,11 @@ class GenarkVecEnv(gym.Env):
         # action=4 (ACTION_PARSE_FAIL sentinel) means parse failed → no format reward.
         # Breaks cold-start: model learns to output valid JSON before learning navigation.
         self.format_reward_coef = float(getattr(cfg, "format_reward_coef", 0.0))
+        # B1: extra format reward when policy outputs valid bbox_2d (lavira_merged mode).
+        # Communicated via action sentinel >= 10 (ACTION_PARSE_OK_HAS_BBOX_BASE).
+        self.bbox_reward_coef = float(getattr(cfg, "bbox_reward_coef", 0.0))
+        # B-infra: when True, render front depth and expose via extra_view_images.
+        self._enable_depth_obs = bool(getattr(cfg, "enable_depth_obs", False))
         # --- Penalties to discourage premature / illegal terminations ---
         # parse_fail_penalty: applied when the model fails to produce valid JSON.
         # The action is clamped to MOVE_FORWARD (episode continues) but a negative
@@ -303,6 +308,7 @@ class GenarkVecEnv(gym.Env):
         self._current_rgb_extras = None
         self._stop_called     = [False] * num_envs
         self._current_rgb     = None     # cached last RGB (CPU numpy)
+        self._current_depth   = None     # cached last depth (CPU numpy, float32) when enable_depth_obs
 
         # --- Episode-end diagnostic trackers ---
         # Raw action history per env (includes PARSE_FAIL=4 sentinel, NOT clamped).
@@ -648,6 +654,7 @@ class GenarkVecEnv(gym.Env):
         self._pending_rgb_extras_ref = None
         self._current_rgb            = None
         self._current_rgb_extras     = None
+        self._current_depth          = None
         # If actor was rebuilt externally, allow reset to clear crash flag.
         if self._scene_crashed and self._sim.is_scene_healthy():
             self._scene_crashed = False
@@ -665,6 +672,7 @@ class GenarkVecEnv(gym.Env):
             self._goal_pos_t           = torch.zeros(N, 3, dtype=torch.float32, device=device)
             self._prev_geo_dist        = torch.zeros(N,    dtype=torch.float32, device=device)
             self._last_parse_ok        = torch.zeros(N,    dtype=torch.bool,    device=device)
+            self._last_has_bbox        = torch.zeros(N,    dtype=torch.bool,    device=device)
             self._dtg_decision_start   = torch.zeros(N,    dtype=torch.float32, device=device)
 
         # Build position/yaw tensors from episode data for valid slots
@@ -743,11 +751,20 @@ class GenarkVecEnv(gym.Env):
         else:
             actions = actions.to(device=device, dtype=torch.long)
 
-        # Detect parse-fail sentinel (ACTION_PARSE_FAIL=4) BEFORE clamping.
-        # parse_ok_mask[i]=True means policy output valid JSON for env i.
-        parse_ok_mask = (actions < 4)
-        # Store for compute_decision_ndtw_reward() to use as format bonus gate.
+        # Decode action sentinels BEFORE clamping.
+        # Sentinel table:
+        #   0-3  : normal action, parse_ok=True,  has_bbox=False
+        #   4    : ACTION_PARSE_FAIL, parse_ok=False, has_bbox=False
+        #   10-13: ACTION_PARSE_OK_HAS_BBOX_BASE + true_action, parse_ok=True, has_bbox=True
+        _HAS_BBOX_BASE = 10
+        actions = actions.clone()
+        has_bbox_mask = (actions >= _HAS_BBOX_BASE)
+        parse_ok_mask = (actions < 4) | has_bbox_mask
+        # Recover true action from has_bbox sentinel (11→1, 12→2, 13→3)
+        actions[has_bbox_mask] = actions[has_bbox_mask] - _HAS_BBOX_BASE
+        # Store for compute_decision_ndtw_reward() to use as format/bbox bonus gate.
         self._last_parse_ok = parse_ok_mask.to(dtype=torch.bool, device=self._last_parse_ok.device)
+        self._last_has_bbox = has_bbox_mask.to(dtype=torch.bool, device=self._last_has_bbox.device)
 
         # Record raw action (incl. parse-fail sentinel) into per-env history,
         # for episode-end termination-reason diagnostics.
@@ -759,11 +776,8 @@ class GenarkVecEnv(gym.Env):
                     self._action_history[_i].append(int(_a))
 
         # Parse-fail policy (Lavira-style): keep navigating, do NOT terminate.
-        # Sentinel ACTION_PARSE_FAIL=4 is clamped to MOVE_FORWARD so the episode
-        # continues and the agent has a chance to self-recover. The negative reward
-        # for parse_fail is applied later in the reward block. Done/ghost slots
-        # still go to STOP (they must not move further).
-        actions = actions.clone()
+        # Any remaining sentinel value >= 4 is clamped to MOVE_FORWARD so the
+        # episode continues. Done/ghost slots still go to STOP.
         actions[actions >= 4] = self.MOVE_FORWARD  # parse-fail → default forward
         done_or_ghost = torch.tensor(
             self._slot_done | ~self._slot_active, dtype=torch.bool, device=device
@@ -793,7 +807,13 @@ class GenarkVecEnv(gym.Env):
 
         # --- Render via backend ---
         try:
-            if self._use_async_render:
+            if self._enable_depth_obs:
+                # Depth obs path: synchronous render_main_with_depth + 4-dir RGB.
+                self._current_rgb, self._current_depth = self._sim.render_main_with_depth(
+                    self._active_slot_count
+                )
+                self._current_rgb_extras = self._sim.render_4dir(self._active_slot_count)
+            elif self._use_async_render:
                 # Phase 3 async pipeline:
                 # 1. Fetch the render submitted at the *previous* step (LLM generate has
                 #    been running for ~120s in parallel, so the result is ready instantly).
@@ -956,9 +976,15 @@ class GenarkVecEnv(gym.Env):
         """Assemble observation tensors from current state."""
         device = self._sim.device
 
-        # RGB from last render (or first render after reset)
+        # RGB (+ optional depth) from last render (or first render after reset)
         if self._current_rgb is None:
-            if self._use_async_render:
+            if self._enable_depth_obs:
+                # Depth obs: render RGB + depth together; 4-dir still RGB-only.
+                self._current_rgb, self._current_depth = self._sim.render_main_with_depth(
+                    self._active_slot_count
+                )
+                self._current_rgb_extras = self._sim.render_4dir(self._active_slot_count)
+            elif self._use_async_render:
                 # First frame after reset: submit and immediately fetch (no pipelining yet).
                 ref  = self._sim.render_main_async(self._active_slot_count)
                 ref4 = self._sim.render_4dir_async(self._active_slot_count)
@@ -993,13 +1019,33 @@ class GenarkVecEnv(gym.Env):
 
         # CHW → HWC
         rgb_hwc = rgb_t.permute(0, 2, 3, 1).contiguous()
-        elapsed_t = torch.from_numpy(
-            self._elapsed_steps.astype(np.float32)
-        ).unsqueeze(1).to(device)  # (N,1) float — states format
 
-        # 4-dir extras: (N, 3, H, W, 3) uint8 → put into extra_view_images
-        # Order: [left, right, behind] (front is in main_images)
-        if self._current_rgb_extras is not None:
+        # states: (N, 4) float32
+        #   [:, 0] elapsed_steps  — used by policy for episode-reset detection
+        #   [:, 1] cam_pos_hab_x  — Habitat X (metres); P2 depth projection
+        #   [:, 2] cam_pos_hab_z  — Habitat Z (metres) = −Genesis Y; P2
+        #   [:, 3] cam_yaw        — Genesis yaw (radians), 0=+X CCW; P2
+        cam_hab   = self._sim.cam_pos_hab(self.camera_height)  # (N, 3) tensor
+        cam_yaw_t = self._sim.cam_yaw                          # (N,)   tensor
+        states_np = np.stack([
+            self._elapsed_steps.astype(np.float32),
+            cam_hab[:, 0].cpu().numpy().astype(np.float32),
+            cam_hab[:, 2].cpu().numpy().astype(np.float32),
+            cam_yaw_t.cpu().numpy().astype(np.float32),
+        ], axis=1)  # (N, 4)
+        states_t = torch.from_numpy(states_np).to(device)
+
+        # extra_view_images: either depth obs (B-infra) or 4-dir RGB, never both.
+        if self._enable_depth_obs and self._current_depth is not None:
+            # Depth: shape (N, 1, H, W, 1) float32 — borrowed channel for B-infra.
+            # Policy identifies it as depth by dtype=float32 and shape[1]==1.
+            depth_np = self._current_depth  # (N, H, W) float32
+            extra_t = torch.from_numpy(
+                depth_np[:, None, :, :, None].astype(np.float32)
+            ).to(device)
+        elif self._current_rgb_extras is not None:
+            # 4-dir extras: (N, 3, H, W, 3) uint8 → put into extra_view_images
+            # Order: [left, right, behind] (front is in main_images)
             extra_t = torch.from_numpy(
                 np.ascontiguousarray(self._current_rgb_extras)
             ).to(device)
@@ -1008,11 +1054,11 @@ class GenarkVecEnv(gym.Env):
 
         return {
             "main_images":     rgb_hwc,           # (N, H, W, 3) uint8 — front view
-            "states":          elapsed_t,          # (N, 1) float — carries elapsed_steps
+            "states":          states_t,           # (N, 4) float — [elapsed, hab_x, hab_z, yaw]
             "task_descriptions": list(self._instructions),  # list[str], len=N
             # Kept for any direct callers that bypass prepare_observations
             "wrist_images":    None,
-            "extra_view_images": extra_t,         # (N, 3, H, W, 3) uint8 [L,R,B] or None
+            "extra_view_images": extra_t,         # depth (N,1,H,W,1) float32 or 4-dir (N,3,H,W,3) uint8
         }
 
     def _handle_slot_done(
@@ -1315,7 +1361,7 @@ class GenarkVecEnv(gym.Env):
             dev = self._sim.device
             dummy_rgb = torch.zeros((N, self.cam_h, self.cam_w, 3),
                                     dtype=torch.uint8, device=dev)
-            dummy_states = torch.zeros((N, 1), dtype=torch.float32, device=dev)
+            dummy_states = torch.zeros((N, 4), dtype=torch.float32, device=dev)
             # extra_view_images: (N, 3, H, W, 3) uint8 when enable_4dir_render, else None.
             # wrist_images: GenArk has no wrist camera → always None.
             dummy_extra = (
@@ -1517,7 +1563,13 @@ class GenarkVecEnv(gym.Env):
                 if (self.format_reward_coef > 0 and bool(self._last_parse_ok[i]))
                 else 0.0
             )
-            reward_np[i] = ndtw_r + dtg_r + fmt_r
+            # --- bbox reward (B1: bonus when policy outputs valid bbox_2d) ---
+            bbox_r = (
+                self.bbox_reward_coef
+                if (self.bbox_reward_coef > 0 and bool(self._last_has_bbox[i]))
+                else 0.0
+            )
+            reward_np[i] = ndtw_r + dtg_r + fmt_r + bbox_r
         return torch.from_numpy(reward_np).float()
 
     def _compute_episode_metrics(self, env_idx: list[int]) -> dict:

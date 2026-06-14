@@ -65,6 +65,14 @@ sr_coef:   10.0
 # Required by QwenNavPolicy lavira-style prompt; outputs go to extra_view_images.
 enable_4dir_render: false
 
+# Phase B1: extra format reward when policy outputs valid bbox_2d (lavira_merged mode).
+# Set >0 to enable. Communicated via action sentinel ACTION_PARSE_OK_HAS_BBOX_BASE=10.
+bbox_reward_coef: 0.0
+
+# Phase B-infra: render front depth and expose via extra_view_images (float32, meters).
+# Mutually exclusive with enable_4dir_render in _build_obs (depth takes priority).
+enable_depth_obs: true
+
 init_params:
   episodes_file: /home/nvme03/lck/genark/data/datasets/OpenNav_R2R-CE_100_bertidx.json
   scene_datasets: /home/nvme03/lck/genark/scene_datasets

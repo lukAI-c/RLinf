@@ -19,6 +19,7 @@ See docs/genark_rft_caveats.md for known design caveats (C1-C11).
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from typing import Optional
@@ -34,14 +35,20 @@ from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 
 from .prompts import (
     SYSTEM_PROMPT, STOP_CHECK_SYSTEM_PROMPT,
+    LAVIRA_MERGED_SYSTEM_PROMPT,
     build_user_content_text, build_stop_check_text,
+    build_merged_user_content_text,
     expected_image_count, USER_STOP_REJECTED,
 )
 from .action_parser import (
     ParsedAction, ParsedStopCheck,
-    parse_lavira_json, parse_stop_check_json,
-    ACTION_STOP, ACTION_PARSE_FAIL,
+    parse_lavira_json, parse_lavira_merged_json, parse_stop_check_json,
+    ACTION_STOP, ACTION_FORWARD, ACTION_TURN_LEFT, ACTION_TURN_RIGHT,
+    ACTION_PARSE_FAIL, ACTION_PARSE_OK_HAS_BBOX_BASE,
+    VALID_DIRECTIONS,
 )
+from .lavira_depth_utils import project_bbox_to_world
+from .lavira_map import OccupancyMap
 
 
 # ---------------------------------------------------------------------------
@@ -171,11 +178,26 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         self._action_stats = {
             "forward": 0, "left": 0, "right": 0, "behind": 0,
             "stop": 0, "parse_fail": 0, "total": 0,
+            # P1 hybrid-gated controller: per-decision bbox gate outcomes.
+            "bbox_valid": 0, "bbox_fallback": 0,
         }
         # When True, skip teacher-forcing logprobs at rollout time.
         # Safe only when actor.recompute_prev_logprobs=True; actor will overwrite
         # prev_logprobs with its own eval forward before PPO training.
         self.skip_rollout_logprobs = bool(getattr(cfg, "skip_rollout_logprobs", False))
+        # Prompt/schema style: "default" uses 6-field schema; "lavira_merged" uses
+        # 9-field merged LA+VA schema. Gated so running baseline is unaffected.
+        self.prompt_style = str(getattr(cfg, "prompt_style", "default"))
+        # B2: eval-only bbox heading correction (replaces fixed 30° macro when enabled).
+        self.bbox_heading_correction = bool(getattr(cfg, "bbox_heading_correction", False))
+        # P1 (hybrid-gated controller): when True, a geometrically-valid bbox_2d drives a
+        # goal-directed primitive queue (placeholder = bbox-center heading until FMM lands
+        # in P3); an invalid bbox falls back to the discrete direction macro. Unlike
+        # bbox_heading_correction (eval-only lite), this is active in BOTH train and eval —
+        # it routes through the already-verified pending_actions variable-length replay path
+        # (P0). Separate flag, default off, so the running baseline and default runs are
+        # unaffected.
+        self.lavira_controller = bool(getattr(cfg, "lavira_controller", False))
         # Fixed image resolution fed to the VLM processor.
         # All images (env renders + history + blank pads) are resized to (W, H)
         # before tokenisation so that pixel_values shape is consistent across
@@ -196,6 +218,9 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         self.model = None
         self.processor = None
         self._per_env_cache = {}
+        # P3: per-slot occupancy maps (lazily created on first episode reset).
+        # Only allocated when lavira_controller=True to avoid overhead on baseline.
+        self._occ_maps: dict[int, OccupancyMap] = {}
 
         # _no_split_modules: populated after model loads so FSDP wraps each
         # transformer block individually instead of flattening the whole model.
@@ -302,12 +327,20 @@ class QwenNavPolicy(nn.Module, BasePolicy):
 
         # Build fake step indices for history
         dummy_hist_idx = list(range(self.history_max_frames))
-        user_text = build_user_content_text(
-            instruction="go to the elevator",
-            history_step_indices=dummy_hist_idx,
-        )
+        if self.prompt_style == "lavira_merged":
+            user_text = build_merged_user_content_text(
+                instruction="go to the elevator",
+                history_step_indices=dummy_hist_idx,
+            )
+            sys_prompt = LAVIRA_MERGED_SYSTEM_PROMPT
+        else:
+            user_text = build_user_content_text(
+                instruction="go to the elevator",
+                history_step_indices=dummy_hist_idx,
+            )
+            sys_prompt = SYSTEM_PROMPT
         messages = [
-            {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+            {"role": "system", "content": [{"type": "text", "text": sys_prompt}]},
             {
                 "role": "user",
                 "content": (
@@ -402,12 +435,19 @@ class QwenNavPolicy(nn.Module, BasePolicy):
             history_imgs = [self._blank_image] * pad_n + list(history_imgs)
             history_step_indices = [-1] * pad_n + list(history_step_indices)
 
-        user_text = build_user_content_text(
-            instruction=instruction,
-            history_step_indices=history_step_indices,
-        )
-        if stop_rejection_feedback:
-            user_text = user_text + stop_rejection_feedback
+        if self.prompt_style == "lavira_merged":
+            user_text = build_merged_user_content_text(
+                instruction=instruction,
+                history_step_indices=history_step_indices,
+                stop_rejection_feedback=stop_rejection_feedback,
+            )
+        else:
+            user_text = build_user_content_text(
+                instruction=instruction,
+                history_step_indices=history_step_indices,
+            )
+            if stop_rejection_feedback:
+                user_text = user_text + stop_rejection_feedback
 
         if self.use_4dir:
             if extra_views is not None and len(extra_views) == 3:
@@ -426,10 +466,15 @@ class QwenNavPolicy(nn.Module, BasePolicy):
                 f"prompt expects {n_expected}"
             )
 
+        sys_prompt = (
+            LAVIRA_MERGED_SYSTEM_PROMPT
+            if self.prompt_style == "lavira_merged"
+            else SYSTEM_PROMPT
+        )
         messages = [
             {
                 "role": "system",
-                "content": [{"type": "text", "text": SYSTEM_PROMPT}],
+                "content": [{"type": "text", "text": sys_prompt}],
             },
             {
                 "role": "user",
@@ -632,6 +677,57 @@ class QwenNavPolicy(nn.Module, BasePolicy):
     )
     _STOP_VALUE_RE = re.compile(r'"stop"\s*:\s*(true|false)')
 
+    # B2 heading correction constants (front camera, Genesis render settings)
+    _B2_CAM_W: int = 640
+    _B2_CAM_CX: float = 640 / 2
+    _B2_CAM_FX: float = 640 / (2 * math.tan(math.radians(105) / 2))  # ≈ 245.5 px
+
+    # P1 bbox_geom_valid: depth-independent area bounds in 0-1000 normalized space
+    # (full frame area = 1000*1000 = 1e6). Reject degenerate points and near-full-frame.
+    _BBOX_AREA_MIN: float = 400.0       # ~20x20 px-equiv: reject point/sliver boxes
+    _BBOX_AREA_MAX: float = 810_000.0   # 0.81 * 1e6: reject boxes covering whole view
+
+    def bbox_geom_valid(self, parsed) -> bool:
+        """Depth-independent subset of the bbox_valid predicate (P1, hybrid-gated C).
+
+        Checks: JSON parse ok, bbox_2d well-formed and ordered within 0-1000, area
+        in a sane (non-degenerate, non-full-frame) range, and a recognised navigate
+        direction. Depth-dependent checks (valid depth crop, projected goal in map,
+        goal traversable) are deferred to P2/P3. Returns False → caller falls back to
+        the discrete direction macro.
+        """
+        if not parsed.ok or parsed.bbox_2d is None:
+            return False
+        b = parsed.bbox_2d
+        if len(b) != 4:
+            return False
+        x1, y1, x2, y2 = b
+        if not (0 <= x1 < x2 <= 1000 and 0 <= y1 < y2 <= 1000):
+            return False
+        area = (x2 - x1) * (y2 - y1)
+        if not (self._BBOX_AREA_MIN <= area <= self._BBOX_AREA_MAX):
+            return False
+        if parsed.raw_dir not in VALID_DIRECTIONS:
+            return False
+        return True
+
+    def _bbox_to_heading_correction(self, bbox_2d: list[float]) -> list[int]:
+        """Convert merged-schema bbox_2d center to heading-corrected action sequence.
+
+        Uses only the horizontal pixel offset (cam_yaw and depth both cancel out
+        for a zero-pitch camera). Returns [TURN_RIGHT*n, FORWARD] or [FORWARD].
+        """
+        x1, _y1, x2, _y2 = bbox_2d
+        u = (x1 + x2) / 2 / 1000 * self._B2_CAM_W
+        bearing = math.atan2((u - self._B2_CAM_CX) / self._B2_CAM_FX, 1.0)
+        n = int(round(bearing / math.radians(30)))
+        n = max(-6, min(6, n))
+        if n > 0:
+            return [ACTION_TURN_RIGHT] * n + [ACTION_FORWARD]
+        if n < 0:
+            return [ACTION_TURN_LEFT] * (-n) + [ACTION_FORWARD]
+        return [ACTION_FORWARD]
+
     def _compute_action_loss_mask(
         self,
         decoded_text: str,
@@ -825,29 +921,44 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         )
         num_envs = rgb_np.shape[0]
 
-        extras_np = None
+        extras_np  = None
+        depth_np   = None   # (N, H, W) float32 metres, or None
         if extra_views_t is not None:
-            extras_np = (
+            arr = (
                 extra_views_t.cpu().numpy()
                 if isinstance(extra_views_t, torch.Tensor)
                 else np.asarray(extra_views_t)
             )
-            if extras_np.shape[0] != num_envs or extras_np.shape[1] != 3:
-                extras_np = None
+            if arr.shape[0] == num_envs and arr.shape[1] == 3 and arr.dtype == np.uint8:
+                # 4-dir RGB extras: (N, 3, H, W, 3) uint8
+                extras_np = arr
+            elif arr.shape[0] == num_envs and arr.shape[1] == 1 and arr.dtype == np.float32:
+                # P2 depth obs: (N, 1, H, W, 1) float32 → squeeze to (N, H, W)
+                depth_np = arr[:, 0, :, :, 0]
 
+        # P2: extract pose from extended states (N, 4) = [elapsed, hab_x, hab_z, yaw]
+        pose_np = None  # (N, 3) float32: [hab_x, hab_z, gen_yaw_rad]
         if not instructions:
             instructions = [""] * num_envs
 
         # Episode reset detection (elapsed_steps == 0)
         if states is not None:
-            elapsed = (
+            elapsed_arr = (
                 states.cpu().numpy()
                 if isinstance(states, torch.Tensor)
                 else np.asarray(states)
             )
             for i in range(num_envs):
-                if instructions[i] and float(elapsed[i, 0]) == 0.0:
+                if instructions[i] and float(elapsed_arr[i, 0]) == 0.0:
                     self.reset_env_cache([i])
+                    # P3: reset per-slot occupancy map at episode start.
+                    if self.lavira_controller and elapsed_arr.shape[1] >= 4:
+                        hab_x0 = float(elapsed_arr[i, 1])
+                        hab_z0 = float(elapsed_arr[i, 2])
+                        occ = self._occ_maps.setdefault(i, OccupancyMap())
+                        occ.reset(hab_x0, hab_z0)
+            if elapsed_arr.shape[1] >= 4:
+                pose_np = elapsed_arr[:, 1:4].astype(np.float32)
 
         # Push current image into per-env history
         current_pils: list[Optional[Image.Image]] = [None] * num_envs
@@ -856,6 +967,17 @@ class QwenNavPolicy(nn.Module, BasePolicy):
                 continue
             current_pils[i] = _to_pil(rgb_np[i])
             self._get_cache(i).push_image(current_pils[i])
+
+        # P3: update per-slot occupancy map from depth at every step (incl. replay steps).
+        if self.lavira_controller and depth_np is not None and pose_np is not None:
+            for i in range(num_envs):
+                if instructions[i] and i in self._occ_maps:
+                    self._occ_maps[i].update(
+                        depth_np[i],
+                        float(pose_np[i, 0]),  # hab_x
+                        float(pose_np[i, 1]),  # hab_z
+                        float(pose_np[i, 2]),  # gen_yaw_rad
+                    )
 
         # Phase 1: dispatch buffered actions
         actions: list[Optional[int]] = [None] * num_envs
@@ -974,12 +1096,24 @@ class QwenNavPolicy(nn.Module, BasePolicy):
 
             # Phase 3a: parse JSON responses
             parsed_actions: dict[int, ParsedAction] = {}
+            use_merged = self.prompt_style == "lavira_merged"
             for env_i, text in zip(need_infer, decoded):
-                parsed: ParsedAction = parse_lavira_json(text)
+                parsed: ParsedAction = (
+                    parse_lavira_merged_json(text) if use_merged
+                    else parse_lavira_json(text)
+                )
                 cache = self._get_cache(env_i)
                 cache.last_parse_ok = parsed.ok
                 cache.last_err = parsed.err
-                cache.last_bbox = parsed.bbox
+                # For merged schema: bbox_2d is the navigation target bbox;
+                # store in last_bbox so existing bboxes diagnostics still works.
+                cache.last_bbox = parsed.bbox_2d if use_merged else parsed.bbox
+                if use_merged and parsed.action_type == "BACKTRACK":
+                    import logging as _log
+                    _log.getLogger(__name__).debug(
+                        "merged:backtrack env=%d wp=%s degraded→forward",
+                        env_i, parsed.waypoint_id,
+                    )
                 parsed_actions[env_i] = parsed
 
             # Phase 3b: stop double-check (Lavira-style, eval-only)
@@ -1060,13 +1194,73 @@ class QwenNavPolicy(nn.Module, BasePolicy):
             for env_i in need_infer:
                 parsed = parsed_actions[env_i]
                 act_seq = parsed.actions if parsed.actions else [ACTION_STOP]
-                actions[env_i] = ACTION_PARSE_FAIL if not parsed.ok else act_seq[0]
+                cache = self._get_cache(env_i)
+
+                # P1 (hybrid-gated controller, train+eval): a geometrically-valid bbox
+                # drives a goal-directed primitive queue (placeholder = bbox-center
+                # heading until FMM in P3). An invalid bbox keeps the discrete direction
+                # macro (act_seq unchanged → fallback). Routes through the verified
+                # pending_actions variable-length replay path (P0).
+                if (self.lavira_controller
+                        and self.prompt_style == "lavira_merged"
+                        and not parsed.stop
+                        and self.bbox_geom_valid(parsed)):
+                    # P3: bbox → depth projection → world goal → FMM → action sequence.
+                    # Falls back to heading-correction (P1) if depth/pose/map unavailable.
+                    _used_fmm = False
+                    if depth_np is not None and pose_np is not None and env_i in self._occ_maps:
+                        world_goal = project_bbox_to_world(
+                            bbox_2d=parsed.bbox_2d,
+                            depth_hw=depth_np[env_i],
+                            gen_yaw_rad=float(pose_np[env_i, 2]),
+                            hab_x=float(pose_np[env_i, 0]),
+                            hab_z=float(pose_np[env_i, 1]),
+                        )
+                        if world_goal is not None:
+                            fmm_acts = self._occ_maps[env_i].get_fmm_action_seq(
+                                world_goal_x=float(world_goal[0]),
+                                world_goal_z=float(world_goal[1]),
+                                hab_x=float(pose_np[env_i, 0]),
+                                hab_z=float(pose_np[env_i, 1]),
+                                gen_yaw_rad=float(pose_np[env_i, 2]),
+                            )
+                            act_seq = fmm_acts
+                            _used_fmm = True
+                            print(
+                                f"[P3][fmm] env={env_i} "
+                                f"agent=({pose_np[env_i,0]:.2f},{pose_np[env_i,1]:.2f}) "
+                                f"yaw={pose_np[env_i,2]:.2f}rad "
+                                f"goal=({world_goal[0]:.2f},{world_goal[1]:.2f}) "
+                                f"acts={act_seq}"
+                            )
+                    if not _used_fmm:
+                        # Fallback: P1 heading correction (no depth / map not ready)
+                        act_seq = self._bbox_to_heading_correction(parsed.bbox_2d)
+
+                # B2: eval-only heading correction via bbox center u-coordinate.
+                # Applies only when the P1 controller is OFF and: bbox_heading_correction=
+                # True, not training, navigate to forward, valid bbox_2d.
+                elif (not self.lavira_controller
+                        and self.bbox_heading_correction
+                        and not self.collect_forward_inputs
+                        and parsed.ok and not parsed.stop
+                        and parsed.raw_dir == "navigate to forward"
+                        and parsed.bbox_2d is not None):
+                    act_seq = self._bbox_to_heading_correction(parsed.bbox_2d)
+
+                # B1: encode has_bbox sentinel when merged schema + valid bbox_2d.
+                if (self.prompt_style == "lavira_merged"
+                        and parsed.ok
+                        and parsed.bbox_2d is not None):
+                    actions[env_i] = ACTION_PARSE_OK_HAS_BBOX_BASE + act_seq[0]
+                else:
+                    actions[env_i] = ACTION_PARSE_FAIL if not parsed.ok else act_seq[0]
+
                 if len(act_seq) > 1:
-                    cache = self._get_cache(env_i)
                     cache.pending_actions.extend(act_seq[1:])
                 # Clear rejection feedback once a non-stop action is taken
                 if not parsed.stop:
-                    self._get_cache(env_i).stop_rejection_feedback = ""
+                    cache.stop_rejection_feedback = ""
 
         # ---- Action distribution logger (per inference batch) ----
         if self._action_stats_flush_every > 0 and need_infer:
@@ -1084,11 +1278,23 @@ class QwenNavPolicy(nn.Module, BasePolicy):
                 rd = (p.raw_dir or "").replace("navigate to ", "").strip()
                 if rd in ("forward", "left", "right", "behind"):
                     self._action_stats[rd] += 1
+                # P1 hybrid-gated controller: record bbox gate outcome per decision.
+                if self.lavira_controller and self.prompt_style == "lavira_merged":
+                    if self.bbox_geom_valid(p):
+                        self._action_stats["bbox_valid"] += 1
+                    else:
+                        self._action_stats["bbox_fallback"] += 1
             self._action_stats_counter += 1
             if self._action_stats_counter >= self._action_stats_flush_every:
                 tot = max(self._action_stats["total"], 1)
                 mode = "train" if self.collect_forward_inputs else "eval"
                 pct = lambda k: 100.0 * self._action_stats[k] / tot
+                gate_str = ""
+                if self.lavira_controller and self.prompt_style == "lavira_merged":
+                    gate_str = (
+                        f" || bbox_valid={self._action_stats['bbox_valid']}({pct('bbox_valid'):.1f}%) "
+                        f"fallback={self._action_stats['bbox_fallback']}({pct('bbox_fallback'):.1f}%)"
+                    )
                 print(
                     f"[QwenNav][action-dist][{mode}] batches={self._action_stats_counter} "
                     f"decisions={self._action_stats['total']} | "
@@ -1097,7 +1303,8 @@ class QwenNavPolicy(nn.Module, BasePolicy):
                     f"right={self._action_stats['right']}({pct('right'):.1f}%) "
                     f"behind={self._action_stats['behind']}({pct('behind'):.1f}%) "
                     f"stop={self._action_stats['stop']}({pct('stop'):.1f}%) "
-                    f"parse_fail={self._action_stats['parse_fail']}({pct('parse_fail'):.1f}%)",
+                    f"parse_fail={self._action_stats['parse_fail']}({pct('parse_fail'):.1f}%)"
+                    f"{gate_str}",
                     flush=True,
                 )
                 self._action_stats_counter = 0
@@ -1123,6 +1330,12 @@ class QwenNavPolicy(nn.Module, BasePolicy):
             },
             "prev_values":  None,
         }
+        # Merged-schema extra diagnostics (logged when prompt_style=lavira_merged)
+        if self.prompt_style == "lavira_merged":
+            diagnostics["action_types"] = [
+                (parsed_actions[i].action_type if i in parsed_actions else "")
+                for i in range(num_envs)
+            ]
 
         if self.collect_forward_inputs:
             # Aggregate per_env → batch tensors: (N, ...)

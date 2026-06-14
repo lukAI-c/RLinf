@@ -126,6 +126,15 @@ class GenesisSceneActor:
             return None
         return extras.tobytes()
 
+    def render_main_with_depth(self, active_slot_count: int) -> tuple:
+        """Returns (rgb_bytes, depth_bytes): rgb=(N,H,W,3) uint8, depth=(N,H,W) float32."""
+        assert active_slot_count <= self._num_envs, (
+            f"GenesisSceneActor.render_main_with_depth: active_slot_count={active_slot_count} "
+            f"> actor num_envs={self._num_envs}."
+        )
+        rgb, depth = self._backend.render_main_with_depth(active_slot_count)
+        return rgb.tobytes(), depth.tobytes()
+
     def get_state(self) -> dict:
         """Return full agent state for initial sync."""
         d = self._get_state_dict()
@@ -473,6 +482,11 @@ class GenesisRemoteBackend(GenesisSimBackend):
         actor = self._pool.actor_handle(self._scene_id)
         return actor.render_4dir.remote(active_slot_count)
 
+    def render_main_with_depth_async(self, active_slot_count: int):
+        """Submit RGB+depth render; return Ray ObjectRef (non-blocking)."""
+        actor = self._pool.actor_handle(self._scene_id)
+        return actor.render_main_with_depth.remote(active_slot_count)
+
     def fetch_render_main(self, ref, timeout: float = 30.0) -> np.ndarray:
         """Block until async render result is ready, then deserialise."""
         raw = self._safe_get(ref, timeout=timeout)
@@ -494,6 +508,23 @@ class GenesisRemoteBackend(GenesisSimBackend):
             .reshape(self._num_envs, 3, self._cam_h, self._cam_w, 3)
             .copy()
         )
+
+    def fetch_render_main_with_depth(
+        self, ref, timeout: float = 30.0
+    ) -> tuple:
+        """Block until RGB+depth result is ready. Returns (rgb (N,H,W,3) uint8, depth (N,H,W) float32)."""
+        rgb_bytes, depth_bytes = self._safe_get(ref, timeout=timeout)
+        rgb = (
+            np.frombuffer(rgb_bytes, dtype=np.uint8)
+            .reshape(self._num_envs, self._cam_h, self._cam_w, 3)
+            .copy()
+        )
+        depth = (
+            np.frombuffer(depth_bytes, dtype=np.float32)
+            .reshape(self._num_envs, self._cam_h, self._cam_w)
+            .copy()
+        )
+        return rgb, depth
 
     # --- Internal helpers ----------------------------------------------------
 
