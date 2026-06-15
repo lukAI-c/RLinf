@@ -89,9 +89,15 @@ class EpisodeBalancer:
     seen_count = number of times the episode was assigned to a GRPO group.
     success_rate = EMA of per-trajectory success outcomes.
     Cold-start: seen=0, sr=0.0 → unseen episodes are highest priority (coverage-first).
+
+    Curriculum: if curriculum_dtg_start is set, only episodes with Euclidean
+    start-to-goal distance <= (curriculum_dtg_start + passes * curriculum_dtg_step)
+    are considered. Falls back to the full pool if no episodes fit the window.
     """
 
-    def __init__(self, episodes: list[dict], rng, ema_alpha: float = 0.3):
+    def __init__(self, episodes: list[dict], rng, ema_alpha: float = 0.3,
+                 curriculum_dtg_start: float | None = None,
+                 curriculum_dtg_step: float = 5.0):
         self._eps   = {e.get("episode_id", i): e for i, e in enumerate(episodes)}
         self._seen  = {k: 0   for k in self._eps}
         self._sr    = {k: 0.0 for k in self._eps}
@@ -100,6 +106,21 @@ class EpisodeBalancer:
         self._last  = None
         self._passes = 0  # number of full coverage sweeps completed
 
+        # Pre-compute Euclidean start→goal distance for each episode (curriculum use).
+        self._dtg: dict = {}
+        for k, e in self._eps.items():
+            sp = np.array(e.get("start_position", [0.0, 0.0, 0.0]), dtype=float)
+            gp = np.array((e.get("goals") or [{}])[0].get("position", [0.0, 0.0, 0.0]), dtype=float)
+            self._dtg[k] = float(np.linalg.norm(sp - gp))
+
+        self._curriculum_dtg_start = curriculum_dtg_start  # None = disabled
+        self._curriculum_dtg_step  = float(curriculum_dtg_step)
+
+    def _curriculum_max_dtg(self) -> float:
+        if self._curriculum_dtg_start is None:
+            return float("inf")
+        return self._curriculum_dtg_start + self._passes * self._curriculum_dtg_step
+
     def next_episode(self) -> tuple[dict, bool]:
         """Return (episode_dict, new_pass).
 
@@ -107,6 +128,15 @@ class EpisodeBalancer:
         (i.e. every episode has now been covered at least N+1 times).
         """
         cands = [k for k in self._eps if k != self._last] or list(self._eps)
+
+        # Curriculum filtering: restrict to episodes within current DTG window.
+        max_dtg = self._curriculum_max_dtg()
+        if max_dtg < float("inf"):
+            easy = [k for k in cands if self._dtg[k] <= max_dtg]
+            if easy:
+                cands = easy
+            # else: fallback to full pool (don't starve at scene startup)
+
         min_key = min((self._seen[k], self._sr[k]) for k in cands)
         tied = [k for k in cands if (self._seen[k], self._sr[k]) == min_key]
         k = tied[int(self._rng.integers(len(tied)))]
@@ -256,6 +286,9 @@ class GenarkVecEnv(gym.Env):
         self.episode_balanced_sampling = bool(
             getattr(cfg, "episode_balanced_sampling", False)
         )
+        _c = getattr(cfg, "curriculum_dtg_start", None)
+        self._curriculum_dtg_start = float(_c) if _c is not None else None
+        self._curriculum_dtg_step  = float(getattr(cfg, "curriculum_dtg_step", 5.0))
 
         # --- observation params ---
         cam_res              = tuple(getattr(cfg, "cam_res", (640, 480)))
@@ -397,7 +430,9 @@ class GenarkVecEnv(gym.Env):
                 self._episode_cycle_by_scene[scene_id] = 0
                 self._balancer_by_scene[scene_id]      = None
                 if self.episode_balanced_sampling and self.cyclic_episode_sampling:
-                    bal = EpisodeBalancer(eps, self._rng_by_scene[scene_id])
+                    bal = EpisodeBalancer(eps, self._rng_by_scene[scene_id],
+                                         curriculum_dtg_start=self._curriculum_dtg_start,
+                                         curriculum_dtg_step=self._curriculum_dtg_step)
                     for g in range(min(n_initial_groups_s, len(eps))):
                         bal.mark_seen(eps[g].get("episode_id", g))
                     self._balancer_by_scene[scene_id] = bal
@@ -441,7 +476,9 @@ class GenarkVecEnv(gym.Env):
             self._episode_cycle_by_scene[pinned_scene] = 0
             self._balancer_by_scene[pinned_scene]      = None
             if self.episode_balanced_sampling and self.cyclic_episode_sampling:
-                bal = EpisodeBalancer(scene_eps, rng)
+                bal = EpisodeBalancer(scene_eps, rng,
+                                     curriculum_dtg_start=self._curriculum_dtg_start,
+                                     curriculum_dtg_step=self._curriculum_dtg_step)
                 for g in range(min(n_initial_groups, len(scene_eps))):
                     bal.mark_seen(scene_eps[g].get("episode_id", g))
                 self._balancer_by_scene[pinned_scene] = bal

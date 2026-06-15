@@ -50,7 +50,7 @@ runner:
   max_steps: -1
 
   only_eval: False
-  val_check_interval: 50
+  val_check_interval: 5
   save_interval: 50
 
   resume_dir: null
@@ -97,7 +97,7 @@ algorithm:
 
   sampling_params:
     do_sample: True
-    temperature_train: 0.4        # 1.0→0.4: reduce schema randomness; keep do_sample for GRPO diversity
+    temperature_train: 0.6        # 0.4→0.6: recover exploration diversity for GRPO advantage variance
     temperature_eval: -1
     top_k: -1
     top_p: 1.0
@@ -140,6 +140,8 @@ env:
 
     cyclic_episode_sampling: true
     episode_balanced_sampling: true   # within-scene (seen_count, success_rate) balanced sampling
+    curriculum_dtg_start: 5.0         # cold-start: only episodes ≤5m (match success_distance)
+    curriculum_dtg_step: 5.0          # each coverage pass unlocks +5m (5→10→15→… up to full pool)
     reward_mode: "decision_nav"   # geo_ndtw→decision_nav: per-DECISION DTG progress
                                   # (net meters closer, clip ±2) — dense gradient WITHOUT
                                   # macro-length bias (why geo_coef was kept 0). Activates
