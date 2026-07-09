@@ -125,3 +125,65 @@ The PPO-clip objective for each decision step is:
 $$\mathcal{L}^{\text{CLIP}}(\theta) = -\mathbb{E}\!\left[\min\!\left(\frac{\pi_\theta(a_d|s_d)}{\pi_{\theta_{\text{old}}}(a_d|s_d)} A_{i,d},\; \text{clip}\!\left(\frac{\pi_\theta}{\pi_{\theta_{\text{old}}}}, 1-\varepsilon, 1+\varepsilon\right) A_{i,d}\right) \cdot \mathbf{1}[\text{loss\_mask}_d]\right]$$
 
 Blank-padded decisions (dormant env steps) have $\text{loss\_mask}_d = 0$ and do not contribute to the loss.
+
+---
+
+## Current Reward Profile Design
+
+As of the LaViRA / GenArk RFT overfit experiments, reward selection is no
+longer driven by a fixed step-based curriculum.  The old sequence
+`format -> geometry -> local_nav -> full_nav` was useful while the base model
+could not reliably emit the required LaViRA waypoint schema, but it became a
+poor fit once a format-stable checkpoint was available:
+
+- Re-running from a checkpoint repeatedly re-entered early curriculum stages.
+- `local_nav` rewarded DTG progress and wrong-stop avoidance, but kept
+  `sr = 0`, so correct STOP was not explicitly rewarded.
+- Format and geometry shaping started to compete with the actual navigation
+  objective.
+
+The current code therefore uses an explicit `reward_profile`:
+
+```yaml
+reward_profile: nav              # default for online RFT
+# reward_profile: format_learning # only for cold-start format warm-up
+```
+
+### `format_learning`
+
+This profile is only for cold-start checkpoints or prompt/schema changes.  It
+teaches the model how to produce valid LaViRA waypoint outputs, not how to
+navigate.
+
+| Component | Role |
+|---|---|
+| JSON / struct / field-format reward | Main positive signal |
+| bbox / point reward | Geometry-format shaping |
+| parse-fail penalty | Strong format correction |
+| DTG / nDTW / SR / wrong-stop | Disabled |
+
+### `nav`
+
+This is the main task-learning profile.  It assumes the checkpoint already emits
+mostly valid actions and focuses reward on navigation and correct STOP.
+
+| Component | Role |
+|---|---|
+| `sr_coef` | Positive reward for correct STOP near the goal |
+| `wrong_stop_penalty` | Penalty for premature STOP far from the goal |
+| `decision_dtg_coef` | Dense decision-level progress toward the goal |
+| `ndtw_coef` | Path-quality shaping against the reference trajectory |
+| `process_reward_enabled` | Optional DTG best-progress / regression shaping |
+| format / bbox rewards | Low-weight guardrails against schema regression |
+| GroundedSAM reward | Disabled by default; diagnostics only unless explicitly enabled |
+
+The intended training flow is:
+
+1. Use `format_learning` only when the model cannot reliably produce the
+   expected output schema.
+2. Resume from a format-stable checkpoint with `reward_profile: nav`.
+3. Do not use step counters to decide whether the model should learn formatting
+   or navigation; choose the profile based on checkpoint capability.
+
+The legacy `reward_curriculum` config is retained only for backward
+compatibility.  New GenArk / LaViRA RFT runs should prefer `reward_profile`.

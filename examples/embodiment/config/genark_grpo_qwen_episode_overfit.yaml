@@ -1,0 +1,129 @@
+defaults:
+  - genark_grpo_qwen_multiscene
+  - _self_
+
+# Single-episode GRPO sanity check.
+#
+# Purpose:
+#   Verify whether the RL update itself can improve behavior when data variance is
+#   removed.  All rollout slots replay the SAME scene / episode; GRPO then compares
+#   multiple sampled trajectories for one fixed instruction/start/goal.
+#
+# Recommended override:
+#   env.train.episode_overfit.scene_id=<scene_id>
+#   env.train.episode_overfit.episode_id=<episode_id>
+
+runner:
+  logger:
+    log_path: "/home/clk/workspace/results/genark_grpo_qwen_episode_overfit"
+    experiment_name: "genark_grpo_qwen_episode_overfit"
+  # Evaluate/save frequently because this mode is meant for fast sanity checks.
+  val_check_interval: 5
+  save_interval: 20
+
+algorithm:
+  group_size: 4
+  rollout_epoch: 1
+  eval_rollout_epoch: 1
+  sampling_params:
+    do_sample: True
+    # Higher than eval, low enough to avoid pure noise.  The same episode is
+    # sampled 4 times per rollout group, so this creates GRPO reward variance.
+    temperature_train: 0.8
+    temperature_eval: -1
+
+env:
+  train:
+    episodes_file: /home/clk/workspace/genark/data/datasets/OpenNav_R2R-CE_100_bertidx.json
+    # One GRPO group = 4 sampled trajectories of the same episode.
+    total_num_envs: 4
+    genesis_backend: multiscene
+    multi_scene:
+      scene_count: 1
+      scenes_per_gpu: 1
+      scenes:
+        - "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb"
+      gpu_budget: 1
+
+    episode_overfit:
+      enabled: true
+      # Chosen from existing zero-shot/eval metrics as an easy, non-trivial
+      # sanity target: success=1, SPL=1.0, nDTW≈0.578, final DTG≈0.66m,
+      # steps≈28, parse_fail=0.
+      scene_id: "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb"
+      episode_id: 824
+
+    group_size: ${algorithm.group_size}
+    max_episode_steps: 80
+    max_decisions_per_rollout_epoch: 20
+    max_steps_per_rollout_epoch: 200
+    cyclic_episode_sampling: true
+    # For one episode, balanced sampling/curriculum add no useful signal and make
+    # logs noisier.  The cyclic pool reset will replay the same episode forever.
+    episode_balanced_sampling: false
+    curriculum_dtg_start: null
+    curriculum_dtg_step: 5.0
+
+    reward_mode: "decision_nav"
+    decision_level_ndtw: true
+    geo_coef: 0.0
+    ndtw_coef: 0.5
+    sr_coef: 2.0
+    decision_dtg_coef: 1.0
+    decision_dtg_clip: 2.0
+    # LaViRA waypoint schema shaping: dense but capped.  This overfit run first
+    # needs to leave the parse-fail regime before navigation reward can dominate.
+    format_reward_coef: 0.05
+    format_reward_cap: 1.0
+    structured_reward_cap: 1.0
+    json_reward_coef: 0.05
+    struct_reward_coef: 0.05
+    field_format_reward_coef: 0.05
+    length_reward_coef: 0.02
+    bbox_reward_cap: 2.0
+    bbox_reward_coef: 0.2
+    parse_fail_penalty: -1.0
+    wrong_stop_penalty: -0.5
+    success_distance: 3.0
+    reward_curriculum:
+      enabled: true
+      format_steps: 20
+      geometry_steps: 60
+      local_nav_steps: 100
+
+  eval:
+    episodes_file: /home/clk/workspace/genark/data/datasets/OpenNav_R2R-CE_100_bertidx.json
+    total_num_envs: 1
+    genesis_backend: multiscene
+    multi_scene:
+      scene_count: 1
+      scenes_per_gpu: 1
+      scenes:
+        - "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb"
+      gpu_budget: 1
+    episode_overfit:
+      enabled: true
+      scene_id: "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb"
+      episode_id: 824
+    group_size: 1
+    max_episode_steps: 80
+    max_steps_per_rollout_epoch: 120
+    auto_reset: true
+    ignore_terminations: true
+    reward_mode: "geo_progress"
+    enable_4dir_render: true
+    success_distance: 3.0
+
+actor:
+  # Small rollout batch; keep actor batch modest for fast iterations.
+  global_batch_size: 32
+  micro_batch_size: 1
+  optim:
+    # Slightly larger than broad training, because this is deliberately an
+    # overfit probe.  Lower this if KL/ratio explodes.
+    lr: 1.0e-6
+
+rollout:
+  max_num_seqs: 8
+  model:
+    history_max_frames: ${actor.model.history_max_frames}

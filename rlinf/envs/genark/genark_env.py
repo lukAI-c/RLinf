@@ -83,6 +83,65 @@ def _group_by_scene(episodes: list[dict]) -> dict[str, list[dict]]:
     return groups
 
 
+def _filter_overfit_episode(episodes: list[dict], cfg) -> list[dict]:
+    """Optionally restrict the pool to one fixed episode for RL sanity checks."""
+    overfit_cfg = getattr(cfg, "episode_overfit", None)
+    if overfit_cfg is None or not bool(getattr(overfit_cfg, "enabled", False)):
+        return episodes
+
+    target_scene = getattr(overfit_cfg, "scene_id", None)
+    target_ep = getattr(overfit_cfg, "episode_id", None)
+    if target_scene is None or target_ep is None:
+        raise ValueError(
+            "episode_overfit.enabled=true requires episode_overfit.scene_id and "
+            "episode_overfit.episode_id."
+        )
+
+    target_scene = str(target_scene)
+    target_ep = str(target_ep)
+    filtered = [
+        ep for ep in episodes
+        if str(ep.get("scene_id", "")) == target_scene
+        and str(ep.get("episode_id", "")) == target_ep
+    ]
+    if not filtered:
+        sample = [
+            (str(ep.get("scene_id", "")), str(ep.get("episode_id", "")))
+            for ep in episodes[:5]
+        ]
+        raise ValueError(
+            "episode_overfit: requested episode not found: "
+            f"scene_id={target_scene!r}, episode_id={target_ep!r}. "
+            f"First available examples: {sample}"
+        )
+    if len(filtered) > 1:
+        print(
+            f"[GenArk][episode-overfit] WARNING: found {len(filtered)} matching "
+            f"records for scene={target_scene} ep={target_ep}; using all matches.",
+            flush=True,
+        )
+    ep = filtered[0]
+    instr = (ep.get("instruction") or {}).get("instruction_text", "")
+    print(
+        f"[GenArk][episode-overfit] enabled: scene={target_scene} "
+        f"episode_id={target_ep} matches={len(filtered)} "
+        f"instruction={instr!r}",
+        flush=True,
+    )
+    group_size = int(getattr(cfg, "group_size", 1) or 1)
+    total_num_envs = int(getattr(cfg, "total_num_envs", group_size) or group_size)
+    n_groups = max(1, math.ceil(total_num_envs / max(group_size, 1)))
+    if len(filtered) < n_groups:
+        filtered = [copy.deepcopy(filtered[i % len(filtered)]) for i in range(n_groups)]
+        print(
+            f"[GenArk][episode-overfit] duplicated fixed episode to "
+            f"{len(filtered)} group entries for total_num_envs={total_num_envs}, "
+            f"group_size={group_size}.",
+            flush=True,
+        )
+    return filtered
+
+
 class EpisodeBalancer:
     """Scene-internal episode balancer: selects next episode by (seen_count, success_rate) lexicographic order.
 
@@ -247,13 +306,53 @@ class GenarkVecEnv(gym.Env):
         # Benefit: 1 fastdtw call per decision instead of N_macro calls; credit assignment
         # granularity matches LLM decision granularity.
         self.decision_level_ndtw = bool(getattr(cfg, "decision_level_ndtw", False))
-        # Format reward: added each step when policy outputs valid JSON (action 0-3).
-        # action=4 (ACTION_PARSE_FAIL sentinel) means parse failed → no format reward.
-        # Breaks cold-start: model learns to output valid JSON before learning navigation.
+        # Format reward: added once per LLM decision when policy outputs valid JSON,
+        # capped per episode.  LaViRA waypoint has a large schema; a single one-time
+        # bonus is too weak when parse_fail is common, while an uncapped per-decision
+        # bonus can dominate navigation.  The cap keeps schema learning useful but
+        # bounded during overfit reward exploration.
         self.format_reward_coef = float(getattr(cfg, "format_reward_coef", 0.0))
-        # B1: extra format reward when policy outputs valid bbox_2d (lavira_merged mode).
+        self.format_reward_cap = float(getattr(cfg, "format_reward_cap", 1.0))
+        self.json_reward_coef = float(
+            getattr(cfg, "json_reward_coef", max(self.format_reward_coef, 0.05))
+        )
+        self.struct_reward_coef = float(
+            getattr(cfg, "struct_reward_coef", max(self.format_reward_coef, 0.05))
+        )
+        self.field_format_reward_coef = float(
+            getattr(cfg, "field_format_reward_coef", max(self.format_reward_coef, 0.05))
+        )
+        self.length_reward_coef = float(getattr(cfg, "length_reward_coef", 0.02))
+        self.structured_reward_cap = float(
+            getattr(cfg, "structured_reward_cap", self.format_reward_cap)
+        )
+        self.bbox_reward_cap = float(
+            getattr(cfg, "bbox_reward_cap", self.format_reward_cap)
+        )
+        # B1: extra format reward when policy outputs valid bbox_2d.  In
+        # lavira_waypoint mode the sentinel is emitted only for valid NAVIGATE
+        # waypoint geometry, so this acts as bbox/point shaping.
         # Communicated via action sentinel >= 10 (ACTION_PARSE_OK_HAS_BBOX_BASE).
         self.bbox_reward_coef = float(getattr(cfg, "bbox_reward_coef", 0.0))
+        rcfg = getattr(cfg, "reward_curriculum", None)
+        # Reward profiles:
+        #   "format_learning": schema / bbox warm-up for cold-start checkpoints.
+        #   "nav":             task reward for navigation and correct STOP.
+        #
+        # Legacy reward_curriculum is mapped to format_learning for backward
+        # compatibility, but new runs should set reward_profile explicitly.
+        legacy_curriculum_enabled = bool(
+            getattr(rcfg, "enabled", False) if rcfg is not None else False
+        )
+        self.reward_profile = str(
+            getattr(
+                cfg,
+                "reward_profile",
+                "format_learning" if legacy_curriculum_enabled else "nav",
+            )
+        )
+        self._global_step = 0
+        self._last_reward_profile: str | None = None
         # B-infra: when True, render front depth and expose via extra_view_images.
         self._enable_depth_obs = bool(getattr(cfg, "enable_depth_obs", False))
         # --- Penalties to discourage premature / illegal terminations ---
@@ -266,6 +365,31 @@ class GenarkVecEnv(gym.Env):
         # Episode still ends (STOP is honored); penalty makes "give-up stop" costly.
         self.wrong_stop_penalty = float(getattr(cfg, "wrong_stop_penalty", -0.5))
         self.wrong_stop_dist_factor = float(getattr(cfg, "wrong_stop_dist_factor", 1.5))
+        # Optional experiment-1 STOP shaping: replace the flat wrong_stop penalty
+        # with a distance-conditioned penalty.  Disabled by default so baseline
+        # runs keep exactly the old reward semantics.
+        self.conditional_wrong_stop_penalty = bool(
+            getattr(cfg, "conditional_wrong_stop_penalty", False)
+        )
+        self.conditional_wrong_stop_ratio_min = float(
+            getattr(cfg, "conditional_wrong_stop_ratio_min", 0.5)
+        )
+        self.conditional_wrong_stop_ratio_max = float(
+            getattr(cfg, "conditional_wrong_stop_ratio_max", 2.0)
+        )
+        # Lightweight SACA-style process reward.  Disabled by default: when enabled,
+        # reward new best DTG progress and lightly penalize regressing after getting
+        # close.  This gives all-failure GRPO groups nonzero relative signal without
+        # introducing an external auditor.
+        self.process_reward_enabled = bool(getattr(cfg, "process_reward_enabled", False))
+        self.process_progress_coef = float(getattr(cfg, "process_progress_coef", 0.2))
+        self.process_progress_cap = float(getattr(cfg, "process_progress_cap", 1.0))
+        self.process_regression_penalty = float(getattr(cfg, "process_regression_penalty", -0.2))
+        self.process_regression_margin = float(getattr(cfg, "process_regression_margin", 1.0))
+        # GroundedSAM reward is intentionally gated by DTG progress; raw detection
+        # confidence is diagnostic only and never used directly as reward.
+        self.gsam_reward_enabled = bool(getattr(cfg, "gsam_reward_enabled", False))
+        self.gsam_detect_progress_bonus = float(getattr(cfg, "gsam_detect_progress_bonus", 0.05))
         # 4-direction rendering: when True, in addition to the front view stored
         # in `main_images`, also render left/right/behind and put them in
         # `extra_view_images` shape (num_envs, 3, H, W, 3) uint8.
@@ -282,6 +406,13 @@ class GenarkVecEnv(gym.Env):
         # enter dormant once the pool is exhausted (eval / single-pass mode).
         self.cyclic_episode_sampling = bool(
             getattr(cfg, "cyclic_episode_sampling", False)
+        )
+        self.is_eval = bool(getattr(cfg, "is_eval", False))
+        self.eval_roll_through_episode_pool = bool(
+            getattr(cfg, "eval_roll_through_episode_pool", False)
+        )
+        self.eval_repeats_per_episode = max(
+            1, int(getattr(cfg, "eval_repeats_per_episode", 1))
         )
         self.episode_balanced_sampling = bool(
             getattr(cfg, "episode_balanced_sampling", False)
@@ -359,6 +490,16 @@ class GenarkVecEnv(gym.Env):
         self._slot_active = np.zeros(num_envs, dtype=bool)   # set after scene pinning
         self._slot_done   = np.zeros(num_envs, dtype=bool)
         self._episode_log: list[dict] = []
+        self._last_completed_diag_by_env: list[dict | None] = [None] * num_envs
+        self._completed_diag_event_by_env: list[dict | None] = [None] * num_envs
+        # One-shot bridge for terminal decision rewards.  In cyclic train mode a
+        # finished GRPO group can be reset inside step(); env_worker computes the
+        # decision reward immediately after step(), so preserve the just-finished
+        # episode state before _init_agent_poses() overwrites it.
+        self._pending_decision_reward_snapshot_by_env: list[dict | None] = [
+            None
+        ] * num_envs
+        self._gsam_reward_diag_counts = self._empty_gsam_reward_diag_counts()
         self._exhausted = False
         self._dummy_obs_cache = None
 
@@ -371,8 +512,14 @@ class GenarkVecEnv(gym.Env):
         # scene list. With N workers and M scenes:
         #   - if N <= M: each worker pins to a distinct scene (covers N/M)
         #   - if N >  M: workers wrap around (some scenes get >1 worker)
-        all_episodes = _load_episodes(self.episodes_file)
+        all_episodes = _filter_overfit_episode(
+            _load_episodes(self.episodes_file), cfg
+        )
         unique_scenes = sorted({e["scene_id"] for e in all_episodes})
+        if not unique_scenes:
+            raise ValueError(
+                f"No episodes available after filtering episodes_file={self.episodes_file}"
+            )
         scene_offset = int(getattr(cfg, "scene_offset", 0))
 
         genesis_backend_type = str(getattr(cfg, "genesis_backend", "local"))
@@ -587,6 +734,52 @@ class GenarkVecEnv(gym.Env):
     # Episode assignment helpers
     # ------------------------------------------------------------------
 
+    def set_global_step(self, step: int) -> None:
+        self._global_step = int(step)
+
+    def _reward_coeffs(self) -> dict[str, float]:
+        """Effective reward coefficients for the selected reward profile."""
+        profile = self.reward_profile
+        if profile != self._last_reward_profile:
+            print(
+                f"[GenArk][reward-profile] step={self._global_step} profile={profile}",
+                flush=True,
+            )
+            self._last_reward_profile = profile
+
+        if profile == "format_learning":
+            return {
+                "ndtw": 0.0,
+                "sr": 0.0,
+                "dtg": 0.0,
+                "json": max(self.json_reward_coef, 0.20),
+                "struct": max(self.struct_reward_coef, 0.20),
+                "field_format": max(self.field_format_reward_coef, 0.20),
+                "length": max(self.length_reward_coef, 0.05),
+                "format": max(self.format_reward_coef, 0.05),
+                "bbox": max(self.bbox_reward_coef, 0.50),
+                "parse_fail": min(self.parse_fail_penalty, -1.0),
+                "wrong_stop": 0.0,
+            }
+        if profile != "nav":
+            raise ValueError(
+                f"Unknown reward_profile={profile!r}; expected 'nav' or "
+                "'format_learning'."
+            )
+        return {
+            "ndtw": self.ndtw_coef,
+            "sr": self.sr_coef,
+            "dtg": self.decision_dtg_coef,
+            "json": self.json_reward_coef,
+            "struct": self.struct_reward_coef,
+            "field_format": self.field_format_reward_coef,
+            "length": self.length_reward_coef,
+            "format": self.format_reward_coef,
+            "bbox": self.bbox_reward_coef,
+            "parse_fail": self.parse_fail_penalty,
+            "wrong_stop": self.wrong_stop_penalty,
+        }
+
     def _assign_episodes_to_envs(self, env_idx: Optional[list[int]] = None):
         """Assign episodes to slots. With group_size>1, every group_size consecutive
         slots share the same episode so GRPO can compare rewards within a group.
@@ -710,7 +903,18 @@ class GenarkVecEnv(gym.Env):
             self._prev_geo_dist        = torch.zeros(N,    dtype=torch.float32, device=device)
             self._last_parse_ok        = torch.zeros(N,    dtype=torch.bool,    device=device)
             self._last_has_bbox        = torch.zeros(N,    dtype=torch.bool,    device=device)
+            self._last_json_valid      = torch.zeros(N,    dtype=torch.bool,    device=device)
+            self._last_struct_ok       = torch.zeros(N,    dtype=torch.bool,    device=device)
+            self._last_field_format_ok = torch.zeros(N,    dtype=torch.bool,    device=device)
+            self._last_length_ok       = torch.zeros(N,    dtype=torch.bool,    device=device)
             self._dtg_decision_start   = torch.zeros(N,    dtype=torch.float32, device=device)
+            self._min_dtg_t            = torch.zeros(N,    dtype=torch.float32, device=device)
+            self._process_progress_paid = torch.zeros(N,   dtype=torch.float32, device=device)
+            # Cumulative format reward already paid this episode, used to cap
+            # dense schema shaping during LaViRA waypoint overfit.
+            self._format_reward_given  = torch.zeros(N,    dtype=torch.float32, device=device)
+            self._bbox_reward_given    = torch.zeros(N,    dtype=torch.float32, device=device)
+            self._structured_reward_given = torch.zeros(N, dtype=torch.float32, device=device)
 
         # Build position/yaw tensors from episode data for valid slots
         valid_idx = [i for i in env_idx if self._episodes[i] is not None]
@@ -755,8 +959,13 @@ class GenarkVecEnv(gym.Env):
             self._prev_geo_dist[i]   = d
             self._start_dtg[i]       = d
             self._dtg_decision_start[i] = d
+            self._min_dtg_t[i] = d
+            self._process_progress_paid[i] = 0.0
             self._prev_ndtw[i] = 1.0
             self._prev_sr[i]   = 0.0
+            self._format_reward_given[i] = 0.0
+            self._bbox_reward_given[i] = 0.0
+            self._structured_reward_given[i] = 0.0
 
     def step(
         self,
@@ -792,25 +1001,55 @@ class GenarkVecEnv(gym.Env):
         # Sentinel table:
         #   0-3  : normal action, parse_ok=True,  has_bbox=False
         #   4    : ACTION_PARSE_FAIL, parse_ok=False, has_bbox=False
+        #   5    : schema_ok but geometry/action invalid; parse_ok=True,
+        #          has_bbox=False, execute as parse-fail fallback
         #   10-13: ACTION_PARSE_OK_HAS_BBOX_BASE + true_action, parse_ok=True, has_bbox=True
+        #   20+  : structured parse-fail bitmask; fallback action but partial
+        #          RL-Struct rewards (JSON/fields/format/geometry/length) apply.
         _HAS_BBOX_BASE = 10
+        _SCHEMA_OK_PARSE_FAIL = 5
+        _STRUCTURED_FAIL_BASE = 20
+        _R_JSON = 1 << 0
+        _R_STRUCT = 1 << 1
+        _R_FIELD = 1 << 2
+        _R_GEOM = 1 << 3
+        _R_LENGTH = 1 << 4
         actions = actions.clone()
-        has_bbox_mask = (actions >= _HAS_BBOX_BASE)
-        parse_ok_mask = (actions < 4) | has_bbox_mask
+        structured_mask = actions >= _STRUCTURED_FAIL_BASE
+        structured_bits = torch.zeros_like(actions)
+        structured_bits[structured_mask] = actions[structured_mask] - _STRUCTURED_FAIL_BASE
+        has_bbox_mask = (actions >= _HAS_BBOX_BASE) & (actions < _HAS_BBOX_BASE + 4)
+        schema_ok_parse_fail_mask = actions == _SCHEMA_OK_PARSE_FAIL
+        normal_ok_mask = (actions < 4) | has_bbox_mask
+        parse_ok_mask = (
+            normal_ok_mask
+            | schema_ok_parse_fail_mask
+            | ((structured_bits & _R_FIELD) != 0)
+        )
+        json_valid_mask = normal_ok_mask | schema_ok_parse_fail_mask | ((structured_bits & _R_JSON) != 0)
+        struct_ok_mask = normal_ok_mask | schema_ok_parse_fail_mask | ((structured_bits & _R_STRUCT) != 0)
+        field_format_ok_mask = normal_ok_mask | schema_ok_parse_fail_mask | ((structured_bits & _R_FIELD) != 0)
+        geometry_ok_mask = has_bbox_mask | ((structured_bits & _R_GEOM) != 0)
+        length_ok_mask = normal_ok_mask | ((structured_bits & _R_LENGTH) != 0)
         # Recover true action from has_bbox sentinel (11→1, 12→2, 13→3)
         actions[has_bbox_mask] = actions[has_bbox_mask] - _HAS_BBOX_BASE
+        actions[schema_ok_parse_fail_mask] = 4
+        actions[structured_mask] = 4
         # Store for compute_decision_ndtw_reward() to use as format/bbox bonus gate.
         self._last_parse_ok = parse_ok_mask.to(dtype=torch.bool, device=self._last_parse_ok.device)
         self._last_has_bbox = has_bbox_mask.to(dtype=torch.bool, device=self._last_has_bbox.device)
+        self._last_json_valid = json_valid_mask.to(dtype=torch.bool, device=self._last_json_valid.device)
+        self._last_struct_ok = struct_ok_mask.to(dtype=torch.bool, device=self._last_struct_ok.device)
+        self._last_field_format_ok = field_format_ok_mask.to(dtype=torch.bool, device=self._last_field_format_ok.device)
+        self._last_length_ok = length_ok_mask.to(dtype=torch.bool, device=self._last_length_ok.device)
 
-        # Record raw action (incl. parse-fail sentinel) into per-env history,
-        # for episode-end termination-reason diagnostics.
-        if self._ep_diag_enabled:
-            raw_acts_cpu = actions.detach().cpu().tolist()
-            active_undone_pre = self._slot_active & ~self._slot_done
-            for _i, _a in enumerate(raw_acts_cpu):
-                if active_undone_pre[_i]:
-                    self._action_history[_i].append(int(_a))
+        # Record raw action (incl. parse-fail sentinel) into per-env history for
+        # episode-end diagnostics and zero-shot difficulty metrics.
+        raw_acts_cpu = actions.detach().cpu().tolist()
+        active_undone_pre = self._slot_active & ~self._slot_done
+        for _i, _a in enumerate(raw_acts_cpu):
+            if active_undone_pre[_i]:
+                self._action_history[_i].append(int(_a))
 
         # Parse-fail policy (Lavira-style): keep navigating, do NOT terminate.
         # Any remaining sentinel value >= 4 is clamped to MOVE_FORWARD so the
@@ -892,6 +1131,11 @@ class GenarkVecEnv(gym.Env):
             if self._active_mask[i]:
                 self._pred_path_lists[i].append(curr_hab_act[i].cpu().numpy())
                 self._distances_lists[i].append(curr_dist_act[i].item())
+                if hasattr(self, "_min_dtg_t") and self._min_dtg_t is not None:
+                    self._min_dtg_t[i] = min(
+                        float(self._min_dtg_t[i].item()),
+                        float(curr_dist_act[i].item()),
+                    )
 
         # --- Reward ---
         if self.reward_mode == "ndtw_sr_delta":
@@ -918,15 +1162,11 @@ class GenarkVecEnv(gym.Env):
             )
             reward = geo_reward + sr_and_ndtw
         elif self.reward_mode == "decision_nav":
-            # Decision-level DTG + decision-level nDTW + SR. No step-level geo_progress.
-            # DTG reward is deferred to compute_decision_ndtw_reward() alongside nDTW.
-            # Per-step: only SR delta (so episode termination is still rewarded on the correct step).
-            reward = self._compute_ndtw_sr_delta_reward(
-                curr_dist=curr_dist,
-                newly_stopped=newly_stopped,
-                N_act=N_act,
-                include_ndtw=False,  # both DTG and nDTW deferred to decision flush
-            )
+            # Decision-level DTG + decision-level nDTW + terminal STOP reward.
+            # All navigation/STOP rewards are settled in compute_decision_ndtw_reward()
+            # at decision flush time.  Do not compute SR here: STOP marks
+            # _active_mask=False before this point, which would drop successful STOP.
+            reward = torch.zeros_like(curr_dist)
         else:
             # Default: dense d2g progress + sparse success bonus
             reward = self._prev_geo_dist.to(curr_dist.device) - curr_dist
@@ -935,23 +1175,26 @@ class GenarkVecEnv(gym.Env):
         self._prev_geo_dist = curr_dist.clone()
 
         # --- Parse-fail penalty (episode continues, malformed output costs) ---
-        if self.parse_fail_penalty != 0.0:
+        coeffs = self._reward_coeffs()
+        parse_fail_penalty = coeffs["parse_fail"]
+        if parse_fail_penalty != 0.0:
             active_undone_t = torch.tensor(
                 active_undone_np, dtype=torch.bool, device=reward.device,
             )
             pf_mask = (~self._last_parse_ok.to(reward.device)) & active_undone_t
             if pf_mask.any():
-                reward[pf_mask] += self.parse_fail_penalty
+                reward[pf_mask] += parse_fail_penalty
 
         # --- Wrong-stop penalty (STOP issued when still far from goal) ---
-        # Penalty scales with DTG: penalty = -wrong_stop_penalty * (DTG / success_distance)
-        # e.g. DTG=10m, success=5m → -2.0; DTG=5m → -1.0; DTG=2m → -0.4
-        if self.wrong_stop_penalty != 0.0:
+        # FIXED small penalty (no distance scaling). Scaling by DTG made "explore
+        # farther then stop" hurt MORE than "stop in place" (-3.5 @ 8.9m), actively
+        # teaching the agent not to leave spawn. A flat penalty discourages premature
+        # STOP without punishing exploration distance.
+        wrong_stop_penalty = coeffs["wrong_stop"]
+        if wrong_stop_penalty != 0.0 and self.reward_mode != "decision_nav":
             ws_mask = newly_stopped & (curr_dist.to(newly_stopped.device) > self.success_distance)
             if ws_mask.any():
-                dist_ratio = curr_dist.to(reward.device) / max(self.success_distance, 1e-6)
-                scaled_penalty = -abs(self.wrong_stop_penalty) * dist_ratio
-                reward[ws_mask.to(reward.device)] += scaled_penalty[ws_mask.to(reward.device)]
+                reward[ws_mask.to(reward.device)] += -abs(wrong_stop_penalty)
 
         # --- Termination / truncation (active+undone slots only) ---
         newly_timed_out = torch.tensor(
@@ -982,7 +1225,12 @@ class GenarkVecEnv(gym.Env):
             # reset the whole group to the next episode (same scene, next pool entry).
             # This runs BEFORE the exhaustion check so reset envs clear _slot_done
             # and the exhaustion flag is not set prematurely.
-            if self.group_size > 1:
+            should_roll_eval_pool = (
+                self.is_eval
+                and self.eval_roll_through_episode_pool
+                and not self.cyclic_episode_sampling
+            )
+            if self.group_size > 1 or should_roll_eval_pool:
                 self._maybe_reset_complete_groups(newly_done_idx)
                 obs = self._build_obs()  # rebuild after potential pose reset
         else:
@@ -1089,10 +1337,17 @@ class GenarkVecEnv(gym.Env):
         else:
             extra_t = None
 
+        task_descriptions = [
+            self._instructions[i]
+            if self._slot_active[i] and not self._slot_done[i]
+            else ""
+            for i in range(self.num_envs)
+        ]
+
         return {
             "main_images":     rgb_hwc,           # (N, H, W, 3) uint8 — front view
             "states":          states_t,           # (N, 4) float — [elapsed, hab_x, hab_z, yaw]
-            "task_descriptions": list(self._instructions),  # list[str], len=N
+            "task_descriptions": task_descriptions,  # empty string marks dormant slots
             # Kept for any direct callers that bypass prepare_observations
             "wrist_images":    None,
             "extra_view_images": extra_t,         # depth (N,1,H,W,1) float32 or 4-dir (N,3,H,W,3) uint8
@@ -1118,11 +1373,76 @@ class GenarkVecEnv(gym.Env):
                 if self._scene_layout is not None
                 else self._pinned_scene_id
             )
-            self._episode_log.append({
+            acts = self._action_history[i]
+            parse_fail_count = sum(1 for a in acts if a >= 4)
+            last_action = acts[-1] if acts else None
+            termination_cause = "stop" if last_action == self.STOP else "timeout"
+            success_val = int(m.get("success", 0))
+            start_dtg = float(self._start_dtg[i])
+            final_dtg = float(m.get("distance_to_goal", 0.0))
+            dists = self._distances_lists[i]
+            min_dtg = float(min(dists)) if dists else final_dtg
+            best_dtg_progress = start_dtg - min_dtg
+            final_regression = final_dtg - min_dtg
+            stop_step = len(acts) if termination_cause == "stop" else 0
+            stop_dtg = final_dtg if termination_cause == "stop" else 0.0
+            early_stop = bool(
+                termination_cause == "stop"
+                and stop_step <= 5
+                and final_dtg > self.success_distance
+            )
+            trial_index = self._completed_trial_count(slot_scene_id, ep_id) + 1
+            if success_val:
+                if start_dtg < self.success_distance:
+                    success_type = "lucky_start"
+                elif parse_fail_count > 0:
+                    success_type = "recovered"
+                else:
+                    success_type = "clean"
+            else:
+                success_type = "wrong_stop" if termination_cause == "stop" else "no_stop"
+            ep_record = {
+                "env_id": int(i),
                 "episode_id": ep_id,
                 "scene_id":   slot_scene_id,
+                "trial_index": int(trial_index),
+                "parse_fail_count": int(parse_fail_count),
+                "success_type": success_type,
+                "termination_cause": termination_cause,
+                "start_distance_to_goal": start_dtg,
+                "dtg_progress": start_dtg - final_dtg,
+                "stop_step": int(stop_step),
+                "stop_dtg": float(stop_dtg),
+                "min_dtg": float(min_dtg),
+                "best_dtg_progress": float(best_dtg_progress),
+                "final_regression": float(final_regression),
+                "early_stop": float(early_stop),
                 **{k: float(v) for k, v in m.items()},
-            })
+            }
+            self._episode_log.append(ep_record)
+            self._last_completed_diag_by_env[i] = ep_record
+            self._completed_diag_event_by_env[i] = dict(ep_record)
+            self._pending_decision_reward_snapshot_by_env[i] = {
+                "episode_id": ep_id,
+                "ep": self._episodes[i],
+                "pred": np.array(self._pred_path_lists[i], dtype=float).copy(),
+                "curr_ndtw": float(m.get("ndtw", self._prev_ndtw[i])),
+                "prev_ndtw": float(self._prev_ndtw[i]),
+                "dtg_before": float(self._dtg_decision_start[i].item()),
+                "curr_dtg": final_dtg,
+                "termination_cause": termination_cause,
+                "success": float(m.get("success", 0.0)),
+                "min_dtg": min_dtg,
+                "start_dtg": start_dtg,
+                "process_paid": float(self._process_progress_paid[i].item()),
+                "last_json_valid": bool(self._last_json_valid[i]),
+                "last_struct_ok": bool(self._last_struct_ok[i]),
+                "last_field_format_ok": bool(self._last_field_format_ok[i]),
+                "last_length_ok": bool(self._last_length_ok[i]),
+                "last_has_bbox": bool(self._last_has_bbox[i]),
+                "structured_paid": float(self._structured_reward_given[i].item()),
+                "bbox_paid": float(self._bbox_reward_given[i].item()),
+            }
             balancer = self._balancer_by_scene.get(slot_scene_id)
             if balancer is not None:
                 balancer.record(ep_id, bool(m.get("success", 0)))
@@ -1137,35 +1457,15 @@ class GenarkVecEnv(gym.Env):
 
             # --- Episode-end termination-reason diagnostic ---
             if self._ep_diag_enabled:
-                acts = self._action_history[i]
                 last = acts[-1] if acts else None
-                n_pf = sum(1 for a in acts if a >= 4)
-                # Classify termination cause. Parse-fail no longer terminates the
-                # episode (it is clamped to MOVE_FORWARD); only real STOP or
-                # max_episode_steps timeout end an episode.
-                if last == self.STOP:
-                    cause = "stop"
-                else:
-                    cause = "timeout"
-                # Classify success type for post-hoc quality analysis.
-                success_val = int(m.get('success', 0))
-                start_dtg = self._start_dtg[i]
-                if success_val:
-                    if start_dtg < self.success_distance:
-                        success_type = "lucky_start"   # started within threshold
-                    elif n_pf > 0:
-                        success_type = "recovered"     # success despite parse_fails
-                    else:
-                        success_type = "clean"         # success with all valid actions
-                else:
-                    success_type = "wrong_stop" if cause == "stop" else "no_stop"
+                n_pf = parse_fail_count
+                cause = termination_cause
                 # Compact action string: STOP=S FWD=F LEFT=L RIGHT=R PARSE=P
                 _LET = {0: "S", 1: "F", 2: "L", 3: "R", 4: "P"}
                 seq = "".join(_LET.get(min(a, 4), "?") for a in acts)
                 if len(seq) > 60:
                     seq = seq[:30] + "..." + seq[-15:]
                 # Compact DTG curve: 5 sample points
-                dists = self._distances_lists[i]
                 if dists:
                     n = len(dists)
                     samp_idx = [0, n // 4, n // 2, (3 * n) // 4, n - 1]
@@ -1178,6 +1478,11 @@ class GenarkVecEnv(gym.Env):
                     f"steps={len(acts)} parse_fail={n_pf} "
                     f"start_dtg={start_dtg:.2f}m "
                     f"final_dtg={m.get('distance_to_goal', 0):.2f}m "
+                    f"stop_dtg={stop_dtg:.2f}m "
+                    f"min_dtg={min_dtg:.2f}m "
+                    f"best_prog={best_dtg_progress:.2f}m "
+                    f"final_reg={final_regression:.2f}m "
+                    f"early_stop={int(early_stop)} "
                     f"ndtw={m.get('ndtw', 0):.3f} "
                     f"dtg_curve=[{dtg_str}] "
                     f"acts={seq}",
@@ -1193,6 +1498,16 @@ class GenarkVecEnv(gym.Env):
             np.arange(self.num_envs), done_idx
         ).astype(bool)
         return final_obs, info
+
+    def _completed_trial_count(self, scene_id: str, episode_id) -> int:
+        """Number of completed eval trials for one scene/episode pair."""
+        ep_key = str(episode_id)
+        return sum(
+            1
+            for rec in self._episode_log
+            if str(rec.get("scene_id", "")) == str(scene_id)
+            and str(rec.get("episode_id", "")) == ep_key
+        )
 
     def _maybe_reset_complete_groups(self, newly_done_idx: list[int]) -> None:
         """Group-level reset: when all envs in a GRPO group finish their episode,
@@ -1247,6 +1562,12 @@ class GenarkVecEnv(gym.Env):
             pool     = self._pool_by_scene[scene_id]
             rng      = self._rng_by_scene[scene_id]
             balancer = self._balancer_by_scene.get(scene_id)
+            eval_repeat_mode = (
+                self.is_eval
+                and self.eval_roll_through_episode_pool
+                and not self.cyclic_episode_sampling
+                and balancer is None
+            )
 
             if balancer is not None:
                 # Balanced mode: EpisodeBalancer picks next episode by
@@ -1267,8 +1588,19 @@ class GenarkVecEnv(gym.Env):
                         flush=True,
                     )
             else:
-                next_ep_idx = self._next_ep_idx_by_scene[scene_id]
-                if next_ep_idx >= len(pool):
+                current_ep = self._episodes[group_envs[0]]
+                current_ep_id = (
+                    current_ep.get("episode_id", None)
+                    if current_ep is not None else None
+                )
+                completed_trials = (
+                    self._completed_trial_count(scene_id, current_ep_id)
+                    if current_ep_id is not None else 0
+                )
+                if eval_repeat_mode and current_ep is not None and completed_trials < self.eval_repeats_per_episode:
+                    next_ep = current_ep
+                    ep_id = current_ep.get("episode_id", "?")
+                elif self._next_ep_idx_by_scene[scene_id] >= len(pool):
                     if self.cyclic_episode_sampling:
                         # Reshuffle and restart this scene's pool (train mode).
                         # Avoid immediately repeating the episode just run.
@@ -1298,20 +1630,26 @@ class GenarkVecEnv(gym.Env):
                             f"n={summ.get('num_episodes', 0)}",
                             flush=True,
                         )
+                        next_ep = pool[self._next_ep_idx_by_scene[scene_id]]
+                        ep_id = next_ep.get(
+                            "episode_id", self._next_ep_idx_by_scene[scene_id]
+                        )
+                        self._next_ep_idx_by_scene[scene_id] += 1
                     else:
                         # Single-pass mode (eval) — group enters dormant permanently.
                         print(
                             f"[GenArk][group-reset] group={group_id} scene={scene_id} "
-                            f"pool exhausted (next_ep_idx={next_ep_idx}, "
+                            f"pool exhausted (next_ep_idx={self._next_ep_idx_by_scene[scene_id]}, "
                             f"pool_size={len(pool)}); entering dormant.",
                             flush=True,
                         )
                         continue
 
-                # Assign the next pooled episode to all envs in the group
-                next_ep = pool[self._next_ep_idx_by_scene[scene_id]]
-                ep_id   = next_ep.get("episode_id", self._next_ep_idx_by_scene[scene_id])
-                self._next_ep_idx_by_scene[scene_id] += 1
+                else:
+                    # Assign the next pooled episode to all envs in the group.
+                    next_ep = pool[self._next_ep_idx_by_scene[scene_id]]
+                    ep_id   = next_ep.get("episode_id", self._next_ep_idx_by_scene[scene_id])
+                    self._next_ep_idx_by_scene[scene_id] += 1
 
             for j in group_envs:
                 self._episodes[j]     = next_ep
@@ -1336,6 +1674,13 @@ class GenarkVecEnv(gym.Env):
                 _seen_vals = list(balancer._seen.values())
                 _pool_info = (f"balanced seen min={min(_seen_vals)} max={max(_seen_vals)}"
                               f" passes={balancer._passes}")
+            elif eval_repeat_mode:
+                completed = self._completed_trial_count(scene_id, ep_id)
+                remaining = len(pool) - self._next_ep_idx_by_scene[scene_id]
+                _pool_info = (
+                    f"trial {completed + 1}/{self.eval_repeats_per_episode}, "
+                    f"pool remaining: {remaining}"
+                )
             else:
                 remaining = len(pool) - self._next_ep_idx_by_scene[scene_id]
                 _pool_info = f"pool remaining: {remaining}"
@@ -1447,6 +1792,10 @@ class GenarkVecEnv(gym.Env):
             else:
                 scan = os.path.basename(os.path.dirname(self._pinned_scene_id))
             out_path = os.path.join(base, f"per_scene_{scan}.json")
+            unique_episode_count = len({
+                (str(e.get("scene_id", "")), str(e.get("episode_id", "")))
+                for e in self._episode_log
+            })
             payload = {
                 "scene_id":  (
                     self._scene_layout.scenes
@@ -1454,22 +1803,233 @@ class GenarkVecEnv(gym.Env):
                     else self._pinned_scene_id
                 ),
                 "scan_name": scan,
-                "n_episodes": len(self._episode_log),
+                "n_episodes": unique_episode_count,
+                "n_trials": len(self._episode_log),
+                "n_unique_episodes": unique_episode_count,
                 "episodes":  self._episode_log,
                 "summary":   self._summarize_episode_log(),
             }
             with open(out_path, "w") as f:
                 json.dump(payload, f, indent=2)
             print(f"[GenArk] Per-scene metrics saved → {out_path}", flush=True)
+            self._dump_zero_shot_difficulty_summary(base)
         except Exception as e:
             print(f"[GenArk] WARNING: could not dump per-scene metrics: {e}",
                   flush=True)
+
+    def _dump_zero_shot_difficulty_summary(self, base: str) -> None:
+        """Merge eval trials and emit per-episode averaged difficulty summaries.
+
+        Multiple env workers may finish at different times, so this is deliberately
+        idempotent. The final worker to exhaust will write the complete merged view.
+        """
+        trials: list[dict] = []
+        for path in sorted(Path(base).glob("per_scene_*.json")):
+            try:
+                with open(path, "r") as f:
+                    payload = json.load(f)
+            except Exception:
+                continue
+            for ep in payload.get("episodes", []):
+                trials.append(ep)
+
+        if not trials:
+            return
+
+        trials_path = os.path.join(base, "all_episode_trials.json")
+        with open(trials_path, "w") as f:
+            json.dump({
+                "n_trials": len(trials),
+                "trials": trials,
+            }, f, indent=2)
+
+        grouped: dict[tuple[str, str], list[dict]] = {}
+        for trial in trials:
+            key = (str(trial.get("scene_id", "")), str(trial.get("episode_id", "")))
+            grouped.setdefault(key, []).append(trial)
+
+        numeric_keys = [
+            "success", "spl", "ndtw", "sdtw",
+            "distance_to_goal", "path_length", "steps_taken",
+            "parse_fail_count", "dtg_progress",
+        ]
+        episodes: list[dict] = []
+        for (scene_id, ep_id), ep_trials in sorted(grouped.items()):
+            avg = {
+                k: float(sum(float(t.get(k, 0.0)) for t in ep_trials) / len(ep_trials))
+                for k in numeric_keys
+            }
+            success_type_counts: dict[str, int] = {}
+            for t in ep_trials:
+                st = str(t.get("success_type", "unknown"))
+                success_type_counts[st] = success_type_counts.get(st, 0) + 1
+            episodes.append({
+                "scene_id": scene_id,
+                "episode_id": ep_id,
+                "n_trials": len(ep_trials),
+                **avg,
+                "success_rate": avg["success"],
+                "success_type_counts": success_type_counts,
+            })
+
+        all_path = os.path.join(base, "all_episode_metrics.json")
+        with open(all_path, "w") as f:
+            json.dump({
+                "n_episodes": len(episodes),
+                "n_trials": len(trials),
+                "eval_repeats_per_episode": self.eval_repeats_per_episode,
+                "episodes": episodes,
+            }, f, indent=2)
+
+        def _mean(key: str) -> float:
+            return float(sum(float(e.get(key, 0.0)) for e in episodes) / len(episodes))
+
+        primary_buckets = {"easy": [], "medium": [], "hard": []}
+        tags = {
+            "format_hard": [],
+            "stop_hard": [],
+            "exploration_hard": [],
+        }
+        for ep in episodes:
+            success_rate = float(ep.get("success_rate", ep.get("success", 0.0)))
+            ndtw = float(ep.get("ndtw", 0.0))
+            dtg_progress = float(ep.get("dtg_progress", 0.0))
+            success_type_counts = ep.get("success_type_counts", {})
+            ep_ref = {
+                "scene_id": ep.get("scene_id", ""),
+                "episode_id": ep.get("episode_id", ""),
+                "n_trials": ep.get("n_trials", 0),
+                "success_rate": success_rate,
+            }
+
+            if success_rate >= 0.5:
+                primary_buckets["easy"].append(ep_ref)
+            elif success_rate > 0.0 or ndtw >= 0.35 or dtg_progress > 0.0:
+                primary_buckets["medium"].append(ep_ref)
+            else:
+                primary_buckets["hard"].append(ep_ref)
+
+            if float(ep.get("parse_fail_count", 0.0)) > 0.0:
+                tags["format_hard"].append(ep_ref)
+            if int(success_type_counts.get("wrong_stop", 0)) > 0:
+                tags["stop_hard"].append(ep_ref)
+            if int(success_type_counts.get("no_stop", 0)) > 0:
+                tags["exploration_hard"].append(ep_ref)
+
+        summary = {
+            "n_episodes": len(episodes),
+            "n_trials": len(trials),
+            "eval_repeats_per_episode": self.eval_repeats_per_episode,
+            "mean_metrics": {
+                k: _mean(k)
+                for k in numeric_keys
+            },
+            "primary_buckets": {
+                k: {"count": len(v), "episodes": v}
+                for k, v in primary_buckets.items()
+            },
+            "diagnostic_tags": {
+                k: {"count": len(v), "episodes": v}
+                for k, v in tags.items()
+            },
+        }
+        summary_path = os.path.join(base, "difficulty_summary.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(
+            f"[GenArk] Zero-shot difficulty summary saved → {summary_path} "
+            f"(episodes={len(episodes)}, trials={len(trials)})",
+            flush=True,
+        )
+
+    def get_grpo_process_diagnostics(self) -> list[dict]:
+        """Return lightweight per-slot diagnostics for GRPO group monitoring.
+
+        Read-only helper used by EnvWorker after a decision-rollout collection.
+        It intentionally exposes only scalars that are cheap to aggregate and
+        never changes reward or episode state.
+        """
+        out: list[dict] = []
+        for i in range(self.num_envs):
+            rec = (
+                self._last_completed_diag_by_env[i]
+                if i < len(self._last_completed_diag_by_env)
+                else None
+            )
+            dists = self._distances_lists[i]
+            if rec is not None:
+                start_dtg = float(rec.get("start_distance_to_goal", 0.0))
+                curr_dtg = float(rec.get("distance_to_goal", start_dtg))
+                min_dtg = float(rec.get("min_dtg", curr_dtg))
+                best_dtg_progress = float(
+                    rec.get("best_dtg_progress", max(0.0, start_dtg - min_dtg))
+                )
+                final_regression = float(rec.get("final_regression", curr_dtg - min_dtg))
+            else:
+                start_dtg = float(self._start_dtg[i]) if i < len(self._start_dtg) else 0.0
+                curr_dtg = float(dists[-1]) if dists else start_dtg
+                min_dtg = float(min(dists)) if dists else curr_dtg
+                best_dtg_progress = max(0.0, start_dtg - min_dtg)
+                final_regression = curr_dtg - min_dtg
+            episode_id = (
+                rec.get("episode_id")
+                if rec is not None
+                else (self._episodes[i] or {}).get("episode_id", "")
+            )
+            out.append({
+                "env_id": int(i),
+                "episode_id": episode_id,
+                "success": float(rec.get("success", 0.0)) if rec is not None else 0.0,
+                "success_type": str(rec.get("success_type", "")) if rec is not None else "",
+                "termination_cause": str(rec.get("termination_cause", "")) if rec is not None else "",
+                "start_dtg": start_dtg,
+                "curr_dtg": curr_dtg,
+                "min_dtg": min_dtg,
+                "best_dtg_progress": best_dtg_progress,
+                "final_regression": final_regression,
+            })
+        return out
+
+    def pop_completed_episode_diagnostic(self, env_id: int) -> dict | None:
+        """Return and clear the latest completion diagnostic for one env slot."""
+        if env_id < 0 or env_id >= len(self._completed_diag_event_by_env):
+            return None
+        rec = self._completed_diag_event_by_env[env_id]
+        self._completed_diag_event_by_env[env_id] = None
+        return dict(rec) if isinstance(rec, dict) else None
+
+    @staticmethod
+    def _empty_gsam_reward_diag_counts() -> dict[str, float]:
+        return {
+            "decisions": 0.0,
+            "used": 0.0,
+            "detected": 0.0,
+            "detected_and_progress": 0.0,
+            "detected_but_regressed": 0.0,
+            "bonus": 0.0,
+        }
+
+    def pop_gsam_reward_diagnostics(self) -> dict[str, float]:
+        """Return and reset GroundedSAM reward-gate diagnostics."""
+        counts = self._gsam_reward_diag_counts
+        self._gsam_reward_diag_counts = self._empty_gsam_reward_diag_counts()
+        n = max(1.0, float(counts.get("decisions", 0.0)))
+        if counts.get("decisions", 0.0) <= 0:
+            return {}
+        return {
+            "gsam/used_rate": float(counts["used"] / n),
+            "gsam/detect_rate": float(counts["detected"] / n),
+            "gsam/detected_and_progress_rate": float(counts["detected_and_progress"] / n),
+            "gsam/detected_but_regressed_rate": float(counts["detected_but_regressed"] / n),
+            "gsam/bonus_count": float(counts["bonus"]),
+        }
 
     def _summarize_episode_log(self) -> dict:
         if not self._episode_log:
             return {}
         keys = ["success", "spl", "ndtw", "sdtw",
-                "distance_to_goal", "path_length", "steps_taken"]
+                "distance_to_goal", "path_length", "steps_taken",
+                "parse_fail_count", "dtg_progress"]
         n = len(self._episode_log)
         return {
             k: float(sum(e.get(k, 0.0) for e in self._episode_log) / n)
@@ -1518,8 +2078,13 @@ class GenarkVecEnv(gym.Env):
             if not self._active_mask[i]:
                 continue
 
-            # SR delta — binary 0→1 at success step (always computed per env step)
-            curr_sr = 1.0 if (stopped_np[i] and curr_dist_np[i] < self.success_distance) else 0.0
+            # SR delta — binary 0→1 at success step (always computed per env step).
+            # Gate: episodes BORN within success_distance ("lucky_start") get NO SR —
+            # reaching the goal you spawned next to is not navigation, and the flat
+            # +sr_coef bonus otherwise creates a degenerate "STOP immediately" optimum
+            # (curriculum spawns ≤5m → free +2). Only born-far episodes earn SR.
+            born_far = self._start_dtg[i] >= self.success_distance
+            curr_sr = 1.0 if (born_far and stopped_np[i] and curr_dist_np[i] < self.success_distance) else 0.0
             sr_delta = curr_sr - self._prev_sr[i]
             self._prev_sr[i] = curr_sr
 
@@ -1541,11 +2106,37 @@ class GenarkVecEnv(gym.Env):
             else:
                 ndtw_delta = 0.0  # deferred to compute_decision_ndtw_reward()
 
-            reward_np[i] = self.ndtw_coef * ndtw_delta + self.sr_coef * sr_delta
+            coeffs = self._reward_coeffs()
+            reward_np[i] = coeffs["ndtw"] * ndtw_delta + coeffs["sr"] * sr_delta
 
         return torch.from_numpy(reward_np).to(curr_dist.device)
 
-    def compute_decision_ndtw_reward(self, env_indices: list[int]) -> torch.Tensor:
+    def _wrong_stop_reward(self, *, curr_dtg: float, start_dtg: float) -> float:
+        """Penalty for STOP outside the success radius.
+
+        Baseline behavior is the original flat penalty.  When
+        conditional_wrong_stop_penalty is enabled, farther wrong STOPs are
+        penalized more strongly via curr_dtg / start_dtg, clipped for stability.
+        """
+        base = -abs(self._reward_coeffs()["wrong_stop"])
+        if not self.conditional_wrong_stop_penalty:
+            return base
+        denom = max(float(start_dtg), 1e-6)
+        ratio = float(curr_dtg) / denom
+        ratio = float(
+            np.clip(
+                ratio,
+                self.conditional_wrong_stop_ratio_min,
+                self.conditional_wrong_stop_ratio_max,
+            )
+        )
+        return base * ratio
+
+    def compute_decision_ndtw_reward(
+        self,
+        env_indices: list[int],
+        policy_diag_by_env: Optional[dict[int, dict]] = None,
+    ) -> torch.Tensor:
         """
         Compute decision-level rewards (nDTW delta + optional DTG delta + format bonus)
         once per LLM decision for the given env indices.
@@ -1564,49 +2155,169 @@ class GenarkVecEnv(gym.Env):
         Returns a [num_envs] float tensor; envs not in env_indices get 0.
         """
         reward_np = np.zeros(self.num_envs, dtype=np.float32)
+        coeffs = self._reward_coeffs()
         for i in env_indices:
-            if not self._active_mask[i]:
+            snapshot = self._pending_decision_reward_snapshot_by_env[i]
+            if snapshot is None and not self._active_mask[i]:
                 continue
-            ep = self._episodes[i]
-            pred = self._pred_path_lists[i]
+            if snapshot is not None:
+                self._pending_decision_reward_snapshot_by_env[i] = None
+                ep = snapshot.get("ep")
+                pred = snapshot.get("pred", [])
+                prev_ndtw = float(snapshot.get("prev_ndtw", self._prev_ndtw[i]))
+                dtg_before = float(snapshot.get("dtg_before", 0.0))
+                curr_dtg = float(snapshot.get("curr_dtg", dtg_before))
+                termination_cause = str(snapshot.get("termination_cause", ""))
+                min_dtg = float(snapshot.get("min_dtg", curr_dtg))
+                start_dtg = float(snapshot.get("start_dtg", curr_dtg))
+                process_paid = float(snapshot.get("process_paid", 0.0))
+                last_json_valid = bool(snapshot.get("last_json_valid", False))
+                last_struct_ok = bool(snapshot.get("last_struct_ok", False))
+                last_field_format_ok = bool(
+                    snapshot.get("last_field_format_ok", False)
+                )
+                last_length_ok = bool(snapshot.get("last_length_ok", False))
+                last_has_bbox = bool(snapshot.get("last_has_bbox", False))
+                structured_paid = float(snapshot.get("structured_paid", 0.0))
+                bbox_paid = float(snapshot.get("bbox_paid", 0.0))
+            else:
+                ep = self._episodes[i]
+                pred = self._pred_path_lists[i]
+                prev_ndtw = float(self._prev_ndtw[i])
+                dtg_before = float(self._dtg_decision_start[i])
+                dists = self._distances_lists[i]
+                curr_dtg = float(dists[-1]) if dists else dtg_before
+                termination_cause = ""
+                min_dtg = float(self._min_dtg_t[i].item())
+                start_dtg = float(self._start_dtg[i])
+                process_paid = float(self._process_progress_paid[i].item())
+                last_json_valid = bool(self._last_json_valid[i])
+                last_struct_ok = bool(self._last_struct_ok[i])
+                last_field_format_ok = bool(self._last_field_format_ok[i])
+                last_length_ok = bool(self._last_length_ok[i])
+                last_has_bbox = bool(self._last_has_bbox[i])
+                structured_paid = float(self._structured_reward_given[i].item())
+                bbox_paid = float(self._bbox_reward_given[i].item())
 
             # --- nDTW delta ---
             curr_ndtw = 1.0
-            if ep is not None and len(pred) >= 2:
+            if snapshot is not None:
+                curr_ndtw = float(snapshot.get("curr_ndtw", prev_ndtw))
+            elif ep is not None and len(pred) >= 2:
                 gt = np.array(ep.get("reference_path", [[0, 0, 0]]), dtype=float)
                 pred_arr = np.array(pred)
                 try:
                     dtw_d = fastdtw(pred_arr, gt, dist=euclidean)[0]
                     curr_ndtw = float(np.exp(-dtw_d / (len(gt) * self.success_distance)))
                 except Exception:
-                    curr_ndtw = self._prev_ndtw[i]
-            ndtw_r = self.ndtw_coef * (curr_ndtw - self._prev_ndtw[i])
-            self._prev_ndtw[i] = curr_ndtw
+                    curr_ndtw = prev_ndtw
+            ndtw_r = coeffs["ndtw"] * (curr_ndtw - prev_ndtw)
+            if snapshot is None:
+                self._prev_ndtw[i] = curr_ndtw
 
             # --- decision-level DTG reward (decision_nav mode only) ---
             dtg_r = 0.0
+            decision_progress = 0.0
             if self.reward_mode == "decision_nav":
-                dists = self._distances_lists[i]
-                curr_dtg = float(dists[-1]) if dists else float(self._dtg_decision_start[i])
-                dtg_before = float(self._dtg_decision_start[i])
                 delta = dtg_before - curr_dtg  # positive = made progress toward goal
-                scaled = delta * self.decision_dtg_coef if delta > 0 else 0.5 * delta * self.decision_dtg_coef
+                decision_progress = delta
+                dtg_coef = coeffs["dtg"]
+                scaled = delta * dtg_coef if delta > 0 else 0.5 * delta * dtg_coef
                 dtg_r = float(np.clip(scaled, -self.decision_dtg_clip, self.decision_dtg_clip))
-                self._dtg_decision_start[i] = curr_dtg  # update for next decision
+                if snapshot is None:
+                    self._dtg_decision_start[i] = curr_dtg  # update for next decision
 
-            # --- format reward (one bonus per valid LLM decision) ---
-            fmt_r = (
-                self.format_reward_coef
-                if (self.format_reward_coef > 0 and bool(self._last_parse_ok[i]))
-                else 0.0
-            )
+            terminal_stop_r = 0.0
+            if self.reward_mode == "decision_nav" and snapshot is not None:
+                is_stop = termination_cause == "stop"
+                born_far = start_dtg >= self.success_distance
+                if is_stop and born_far and curr_dtg < self.success_distance:
+                    terminal_stop_r += coeffs["sr"]
+                elif is_stop and curr_dtg > self.success_distance:
+                    terminal_stop_r += self._wrong_stop_reward(
+                        curr_dtg=curr_dtg,
+                        start_dtg=start_dtg,
+                    )
+
+            # --- RL-Struct style structured-output reward ---
+            # Split the old monolithic format bonus into progressive components:
+            # JSON validity → required fields → field/value format → length guard.
+            # This prevents "invalid JSON" and "point outside bbox" from sharing
+            # the same reward signal, while the per-episode cap keeps structure as
+            # a guardrail instead of letting it dominate navigation.
+            struct_r = 0.0
+            if last_json_valid:
+                struct_r += coeffs["json"]
+            if last_struct_ok:
+                struct_r += coeffs["struct"]
+            if last_field_format_ok:
+                struct_r += coeffs["field_format"]
+            if last_length_ok:
+                struct_r += coeffs["length"]
+            if struct_r > 0.0:
+                remaining = max(0.0, self.structured_reward_cap - structured_paid)
+                struct_r = min(struct_r, remaining)
+                if struct_r > 0.0 and snapshot is None:
+                    self._structured_reward_given[i] += struct_r
             # --- bbox reward (B1: bonus when policy outputs valid bbox_2d) ---
-            bbox_r = (
-                self.bbox_reward_coef
-                if (self.bbox_reward_coef > 0 and bool(self._last_has_bbox[i]))
-                else 0.0
+            # In lavira_waypoint mode this sentinel requires valid NAVIGATE bbox
+            # geometry; parser already enforces point_2d inside bbox_2d.
+            bbox_r = 0.0
+            bbox_coef = coeffs["bbox"]
+            if bbox_coef > 0 and last_has_bbox:
+                remaining = max(0.0, self.bbox_reward_cap - bbox_paid)
+                bbox_r = min(bbox_coef, remaining)
+                if bbox_r > 0.0 and snapshot is None:
+                    self._bbox_reward_given[i] += bbox_r
+
+            process_r = 0.0
+            if self.process_reward_enabled:
+                best_progress = max(0.0, start_dtg - min_dtg)
+                capped_progress = min(best_progress, max(0.0, self.process_progress_cap))
+                new_progress = max(0.0, capped_progress - process_paid)
+                if new_progress > 0.0:
+                    process_r += self.process_progress_coef * new_progress
+                    if snapshot is None:
+                        self._process_progress_paid[i] += new_progress
+                regression = curr_dtg - min_dtg
+                if regression > self.process_regression_margin:
+                    process_r += self.process_regression_penalty
+
+            gsam_r = 0.0
+            diag = policy_diag_by_env.get(i, {}) if policy_diag_by_env else {}
+            if diag:
+                gsam_used = bool(diag.get("grounded_sam_used", False))
+                gsam_detected = bool(diag.get("grounded_sam_detected", False))
+                is_stop = bool(diag.get("is_stop", False))
+                progress_positive = decision_progress > 0.0
+                counts = self._gsam_reward_diag_counts
+                counts["decisions"] += 1.0
+                counts["used"] += float(gsam_used)
+                counts["detected"] += float(gsam_detected)
+                counts["detected_and_progress"] += float(
+                    gsam_detected and progress_positive and not is_stop
+                )
+                counts["detected_but_regressed"] += float(
+                    gsam_detected and not progress_positive
+                )
+            if self.gsam_reward_enabled and diag:
+                if (
+                    bool(diag.get("grounded_sam_detected", False))
+                    and decision_progress > 0.0
+                    and not bool(diag.get("is_stop", False))
+                ):
+                    gsam_r += self.gsam_detect_progress_bonus
+                    self._gsam_reward_diag_counts["bonus"] += 1.0
+
+            reward_np[i] = (
+                ndtw_r
+                + dtg_r
+                + terminal_stop_r
+                + struct_r
+                + bbox_r
+                + process_r
+                + gsam_r
             )
-            reward_np[i] = ndtw_r + dtg_r + fmt_r + bbox_r
         return torch.from_numpy(reward_np).float()
 
     def _compute_episode_metrics(self, env_idx: list[int]) -> dict:

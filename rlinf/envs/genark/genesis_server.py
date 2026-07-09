@@ -329,9 +329,13 @@ class GenesisRemoteBackend(GenesisSimBackend):
         self._num_envs  = num_envs
         self._device    = device
 
-        # Sync initial state from actor
-        actor  = self._pool.get_actor(scene_id)
-        state  = self._safe_get(actor.get_state.remote())
+        # Sync initial state from actor (180s for slow init when vLLM also loads in parallel).
+        # During actor construction, a short health_check can time out and wrongly
+        # trigger rebuild_actor(), causing two Genesis processes to build the same
+        # scene on one GPU. Use the raw handle here and let get_state be the
+        # readiness barrier.
+        actor  = self._pool.actor_handle(scene_id)
+        state  = self._safe_get(actor.get_state.remote(), timeout=180.0)
         self._cam_h = state["cam_h"]
         self._cam_w = state["cam_w"]
         self._sync_state(state)

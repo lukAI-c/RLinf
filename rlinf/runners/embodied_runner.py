@@ -274,7 +274,6 @@ class EmbodiedRunner:
             self.metric_logger.log(data=eval_metrics, step=0)
 
             # Save JSON results (mirrors original GenArk avg_metrics.json)
-            import json, os
             log_path = self.cfg.runner.logger.get("log_path", ".")
             os.makedirs(log_path, exist_ok=True)
             json_path = os.path.join(log_path, "avg_metrics.json")
@@ -298,6 +297,7 @@ class EmbodiedRunner:
             # set global step
             self.actor.set_global_step(self.global_step)
             self.rollout.set_global_step(self.global_step)
+            self.env.set_global_step(self.global_step)
 
             with self.timer("step"):
                 with self.timer("sync_weights"):

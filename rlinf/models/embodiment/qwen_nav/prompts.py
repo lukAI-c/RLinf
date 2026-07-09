@@ -22,7 +22,7 @@ Output JSON schema:
 """
 
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, Any
 
 
 # ---------------------------------------------------------------------------
@@ -220,4 +220,177 @@ def build_merged_user_content_text(
     if stop_rejection_feedback:
         parts.append(stop_rejection_feedback)
 
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# LaViRA waypoint prompt (online macro-action policy)
+# ---------------------------------------------------------------------------
+
+LAVIRA_WAYPOINT_SYSTEM_PROMPT = """/no_think
+You are an embodied navigation agent. Using the instruction, the navigation history, and the current views, pick the next action and ground the next target in the chosen direction's view.
+"""
+
+LAVIRA_WAYPOINT_HEADER = """# Instruction
+"{instruction}"
+
+# Inputs
+
+Navigation history:"""
+
+LAVIRA_WAYPOINT_NO_HISTORY = "(no waypoint history yet)"
+LAVIRA_WAYPOINT_HISTORY_PREAMBLE = """
+On each after-turn view below, the green box and red dot mark the target chosen at that waypoint at that time."""
+LAVIRA_WAYPOINT_HISTORY_LABEL = """
+Waypoint {waypoint_id} arrival view (image labeled WP{waypoint_id}):
+<image>
+
+At Waypoint {waypoint_id} you turned {turned_direction}. After-turn view (image labeled WP{waypoint_id}); target then: {target}.
+<image>"""
+LAVIRA_WAYPOINT_CONTINUOUS_HEADER = """
+Waypoint {waypoint_id} -> Current Position (continuous frames):"""
+LAVIRA_WAYPOINT_PREVIOUS_PROGRESS = """
+Your previous progress_analysis: "{progress_analysis}\""""
+
+LAVIRA_WAYPOINT_CURRENT_VIEWS = """
+Current 4-directional views:
+
+Current FORWARD view:
+<image>
+
+Current LEFT view:
+<image>
+
+Current BEHIND view:
+<image>
+
+Current RIGHT view:
+<image>"""
+
+LAVIRA_WAYPOINT_OUTPUT = """
+# Available actions
+{available_actions}
+
+# Output
+Return exactly ONE JSON object with these fields in this order, nothing before or after it, and stop right after the closing brace:
+{{
+    "progress_analysis": "<cumulative episode-progress summary>",
+    "reasoning_plan_action": "<one-sentence justification of the planning/action>",
+    "planning": "<next sub-goals, terse>",
+    "action": "<one of the actions above>",
+    "stop": <true or false>,
+    "stair": <"up" or "down" or false>,
+    "target": "<short visual target phrase>"
+}}
+
+# Field rules
+- `progress_analysis` (<=50 words): cumulative summary of the whole episode — areas already visited and sub-goals already completed. Extend your previous progress_analysis: keep what is still true and append the latest progress. Do NOT describe the current views.
+- `reasoning_plan_action` (<=30 words): one sentence stating why the chosen action follows the instruction.
+- `planning` (<=25 words): the next sub-goals, terse.
+- `action`: exactly one of the actions above.
+- `stop`: Set stop=true whenever you have reached the target described in the instruction.
+- `stair`: "up"/"down" only when taking stairs; otherwise false.
+- `target` (<=8 words): short visible object/area phrase for GroundingDINO/SAM in the chosen direction view. Use an empty string for STOP or backtracking."""
+
+
+def _action_to_turn_label(action: str) -> str:
+    if action == "navigate to left":
+        return "left"
+    if action == "navigate to right":
+        return "right"
+    if action == "navigate to forward":
+        return "forward"
+    if action:
+        return action.replace("navigate to ", "")
+    return "unknown"
+
+
+def build_waypoint_user_content_text(
+    instruction: str,
+    waypoint_ids: Optional[list[int]] = None,
+    waypoint_infos: Optional[list[dict[str, Any]]] = None,
+    stop_rejection_feedback: str = "",
+) -> str:
+    """Build user text for lavira_waypoint style.
+
+    Image order: waypoint overlay images (chronological) + 4 current views.
+    """
+    parts = [
+        LAVIRA_WAYPOINT_HEADER.format(
+            instruction=instruction or "navigate to the goal"
+        )
+    ]
+    if waypoint_infos is None:
+        waypoint_infos = [
+            {
+                "id": wid,
+                "action": "",
+                "target": "",
+                "progress_analysis": "",
+                "continuous_count": 0,
+            }
+            for wid in (waypoint_ids or [])
+        ]
+
+    real_infos = [info for info in waypoint_infos if int(info.get("id", -1)) >= 0]
+    if waypoint_infos:
+        parts.append(LAVIRA_WAYPOINT_HISTORY_PREAMBLE)
+        last_progress = ""
+        for info in waypoint_infos:
+            wid = int(info.get("id", -1))
+            if wid >= 0:
+                action = str(info.get("action", ""))
+                target = str(info.get("target", "") or "unknown target")
+                progress = str(info.get("progress_analysis", ""))
+                continuous_count = int(info.get("continuous_count", 0))
+                if progress:
+                    last_progress = progress
+                parts.append(
+                    LAVIRA_WAYPOINT_HISTORY_LABEL.format(
+                        waypoint_id=wid,
+                        turned_direction=_action_to_turn_label(action),
+                        target=target,
+                    )
+                )
+                if continuous_count > 0:
+                    parts.append(
+                        LAVIRA_WAYPOINT_CONTINUOUS_HEADER.format(
+                            waypoint_id=wid
+                        )
+                    )
+                    parts.extend("<image>" for _ in range(continuous_count))
+            else:
+                continuous_count = int(info.get("continuous_count", 0))
+                parts.append("Padding waypoint arrival view: <image>")
+                parts.append("Padding waypoint after-turn view: <image>")
+                if continuous_count > 0:
+                    parts.append("Padding waypoint continuous frames:")
+                    parts.extend("<image>" for _ in range(continuous_count))
+        if last_progress:
+            parts.append(
+                LAVIRA_WAYPOINT_PREVIOUS_PROGRESS.format(
+                    progress_analysis=last_progress
+                )
+            )
+    else:
+        parts.append(LAVIRA_WAYPOINT_NO_HISTORY)
+
+    parts.append(LAVIRA_WAYPOINT_CURRENT_VIEWS)
+
+    actions = [
+        "   - navigate to forward - continue straight ahead",
+        "   - navigate to left - turn left and go forward",
+        "   - navigate to right - turn right and go forward",
+    ]
+    available_ids = [str(info["id"]) for info in real_infos]
+    if available_ids:
+        actions.append(
+            "   - backtrack to <waypoint_id> - return to a previous waypoint "
+            f"(Available IDs: {', '.join(available_ids)})"
+        )
+    parts.append(
+        LAVIRA_WAYPOINT_OUTPUT.format(available_actions="\n".join(actions))
+    )
+    if stop_rejection_feedback:
+        parts.append(stop_rejection_feedback)
     return "\n".join(parts)

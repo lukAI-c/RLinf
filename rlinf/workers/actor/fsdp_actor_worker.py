@@ -1168,7 +1168,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_epoch = self.cfg.algorithm.rollout_epoch
         rollout_batch = process_nested_dict_for_adv(rollout_batch, rollout_epoch)
 
-        if (
+        use_decision_rollout = (
+            self.cfg.env.train.get("max_decisions_per_rollout_epoch", None) is not None
+        )
+        if use_decision_rollout or (
             not self.cfg.env.train.auto_reset
             and not self.cfg.env.train.ignore_terminations
         ):

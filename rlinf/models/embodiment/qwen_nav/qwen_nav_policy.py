@@ -29,31 +29,72 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import DictConfig
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 
 from .prompts import (
     SYSTEM_PROMPT, STOP_CHECK_SYSTEM_PROMPT,
-    LAVIRA_MERGED_SYSTEM_PROMPT,
+    LAVIRA_MERGED_SYSTEM_PROMPT, LAVIRA_WAYPOINT_SYSTEM_PROMPT,
     build_user_content_text, build_stop_check_text,
-    build_merged_user_content_text,
+    build_merged_user_content_text, build_waypoint_user_content_text,
     expected_image_count, USER_STOP_REJECTED,
 )
 from .action_parser import (
     ParsedAction, ParsedStopCheck,
-    parse_lavira_json, parse_lavira_merged_json, parse_stop_check_json,
+    parse_lavira_json, parse_lavira_merged_json, parse_lavira_waypoint_json,
+    parse_stop_check_json,
     ACTION_STOP, ACTION_FORWARD, ACTION_TURN_LEFT, ACTION_TURN_RIGHT,
-    ACTION_PARSE_FAIL, ACTION_PARSE_OK_HAS_BBOX_BASE,
+    ACTION_PARSE_FAIL, ACTION_SCHEMA_OK_PARSE_FAIL,
+    ACTION_PARSE_OK_HAS_BBOX_BASE,
+    ACTION_STRUCTURED_PARSE_FAIL_BASE,
+    REWARD_JSON_VALID, REWARD_REQUIRED_FIELDS, REWARD_FIELD_FORMAT,
+    REWARD_GEOMETRY_VALID,
+    REWARD_LENGTH_OK,
     VALID_DIRECTIONS,
 )
-from .lavira_depth_utils import project_bbox_to_world
+from .lavira_depth_utils import project_bbox_to_world, project_point_to_world
 from .lavira_map import OccupancyMap
+from .grounded_sam import GroundedSAMWaypointRefiner
 
 
 # ---------------------------------------------------------------------------
 # Per-env episode cache
 # ---------------------------------------------------------------------------
+
+class _WaypointRecord:
+    """Compact per-env waypoint memory for lavira_waypoint prompts."""
+
+    __slots__ = (
+        "id", "pose_hab", "arrival_image", "after_turn_image",
+        "continuous_frames", "action", "bbox_2d", "point_2d", "target",
+        "progress_analysis",
+    )
+
+    def __init__(
+        self,
+        waypoint_id: int,
+        pose_hab: tuple[float, float, float],
+        arrival_image: Image.Image,
+        after_turn_image: Image.Image,
+        continuous_frames: list[Image.Image],
+        action: str,
+        bbox_2d: list[float],
+        point_2d: list[float],
+        target: str,
+        progress_analysis: str,
+    ):
+        self.id = waypoint_id
+        self.pose_hab = pose_hab
+        self.arrival_image = arrival_image
+        self.after_turn_image = after_turn_image
+        self.continuous_frames = continuous_frames
+        self.action = action
+        self.bbox_2d = bbox_2d
+        self.point_2d = point_2d
+        self.target = target
+        self.progress_analysis = progress_analysis
+
 
 class _HistoryCache:
     """
@@ -69,6 +110,9 @@ class _HistoryCache:
     __slots__ = (
         "history_images", "pending_actions", "step_count",
         "last_parse_ok", "last_err", "last_bbox",
+        "last_point", "last_waypoint_id", "last_reasoning_plan_action",
+        "last_reasoning_bbox_point", "last_backtrack_valid", "last_target",
+        "waypoints", "next_waypoint_id", "last_waypoint_history_len",
         "stop_failure_count", "stop_rejection_feedback",
     )
 
@@ -79,6 +123,15 @@ class _HistoryCache:
         self.last_parse_ok: bool = True
         self.last_err: Optional[str] = None
         self.last_bbox: Optional[list[float]] = None
+        self.last_point: Optional[list[float]] = None
+        self.last_waypoint_id: Optional[int] = None
+        self.last_reasoning_plan_action: str = ""
+        self.last_reasoning_bbox_point: str = ""
+        self.last_backtrack_valid: bool = False
+        self.last_target: str = ""
+        self.waypoints: list[_WaypointRecord] = []
+        self.next_waypoint_id: int = 0
+        self.last_waypoint_history_len: int = 0
         # Stop double-check state (Lavira-style)
         self.stop_failure_count: int = 0        # consecutive rejected STOPs
         self.stop_rejection_feedback: str = ""  # injected into next prompt if non-empty
@@ -90,6 +143,15 @@ class _HistoryCache:
         self.last_parse_ok = True
         self.last_err = None
         self.last_bbox = None
+        self.last_point = None
+        self.last_waypoint_id = None
+        self.last_reasoning_plan_action = ""
+        self.last_reasoning_bbox_point = ""
+        self.last_backtrack_valid = False
+        self.last_target = ""
+        self.waypoints.clear()
+        self.next_waypoint_id = 0
+        self.last_waypoint_history_len = 0
         self.stop_failure_count = 0
         self.stop_rejection_feedback = ""
 
@@ -128,6 +190,57 @@ def _sample_history(
     if len(indices) > max_frames:
         indices = indices[-max_frames:]
     return [images[i] for i in indices], indices
+
+
+def _sample_waypoints(
+    records: list[_WaypointRecord],
+    max_frames: int,
+) -> tuple[list[Image.Image], list[int], list[dict]]:
+    """Return recent waypoint images and metadata for prompt history.
+
+    Strict LaViRA order per waypoint:
+      arrival image, after-turn image, continuous frames.
+    """
+    if not records:
+        return [], [], []
+    chosen = records[-max_frames:] if len(records) > max_frames else records
+    images: list[Image.Image] = []
+    infos = [
+        {
+            "id": r.id,
+            "action": r.action,
+            "target": r.target,
+            "progress_analysis": r.progress_analysis,
+            "continuous_count": len(r.continuous_frames),
+        }
+        for r in chosen
+    ]
+    for r in chosen:
+        images.append(r.arrival_image)
+        images.append(r.after_turn_image)
+        images.extend(r.continuous_frames)
+    return images, [r.id for r in chosen], infos
+
+
+def _draw_waypoint_overlay(
+    img: Image.Image,
+    bbox_2d: list[float],
+    point_2d: list[float],
+    waypoint_id: int,
+) -> Image.Image:
+    """Draw bbox/point/WP label on the chosen-direction view."""
+    out = img.copy()
+    draw = ImageDraw.Draw(out)
+    w, h = out.size
+    x1, y1, x2, y2 = bbox_2d
+    px1, py1 = x1 / 1000.0 * w, y1 / 1000.0 * h
+    px2, py2 = x2 / 1000.0 * w, y2 / 1000.0 * h
+    px, py = point_2d[0] / 1000.0 * w, point_2d[1] / 1000.0 * h
+    draw.rectangle([px1, py1, px2, py2], outline=(0, 255, 0), width=3)
+    r = 5
+    draw.ellipse([px - r, py - r, px + r, py + r], fill=(255, 0, 0))
+    draw.text((px1, max(0, py1 - 14)), f"WP{waypoint_id}", fill=(0, 255, 0))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -177,10 +290,16 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         self._action_stats_counter = 0
         self._action_stats = {
             "forward": 0, "left": 0, "right": 0, "behind": 0,
-            "stop": 0, "parse_fail": 0, "total": 0,
+            "backtrack": 0, "stop": 0, "parse_fail": 0, "total": 0,
             # P1 hybrid-gated controller: per-decision bbox gate outcomes.
             "bbox_valid": 0, "bbox_fallback": 0,
+            "point_valid": 0, "backtrack_valid": 0,
+            "json_valid": 0, "struct_ok": 0, "field_format_ok": 0,
+            "geometry_ok": 0, "length_ok": 0,
+            "grounded_sam_used": 0, "grounded_sam_detected": 0,
         }
+        self._parse_fail_debug_limit = int(os.environ.get("QWEN_NAV_PARSE_FAIL_DEBUG", "3"))
+        self._parse_fail_debug_printed = 0
         # When True, skip teacher-forcing logprobs at rollout time.
         # Safe only when actor.recompute_prev_logprobs=True; actor will overwrite
         # prev_logprobs with its own eval forward before PPO training.
@@ -198,6 +317,13 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         # (P0). Separate flag, default off, so the running baseline and default runs are
         # unaffected.
         self.lavira_controller = bool(getattr(cfg, "lavira_controller", False))
+        self.grounded_sam_cfg = getattr(cfg, "grounded_sam", None)
+        self.grounded_sam_enabled = bool(
+            getattr(self.grounded_sam_cfg, "enabled", False)
+            if self.grounded_sam_cfg is not None
+            else False
+        )
+        self._grounded_sam: Optional[GroundedSAMWaypointRefiner] = None
         # Fixed image resolution fed to the VLM processor.
         # All images (env renders + history + blank pads) are resized to (W, H)
         # before tokenisation so that pixel_values shape is consistent across
@@ -233,10 +359,19 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         self._max_seq_len: int = 0
         self._total_patches: int = 0
         self._pixel_value_dim: int = 0
-        self._n_images_fixed: int = 0  # history_max_frames + n_current_views
+        # Strict LaViRA waypoint history uses 7 images per waypoint:
+        # arrival + after-turn + 5 continuous frames.
+        self._waypoint_images_per_record: int = 7
+        self._n_images_fixed: int = 0  # fixed prompt image count
         self._patches_per_image: int = 0
         self._grid_h: int = 0
         self._grid_w: int = 0
+
+        # Pluggable generation backend.  When None, uses HF model.generate (default).
+        # Set to a callable by VLLMMultiStepEmbodiedWorker before rollout starts:
+        #   fn(prompts: list[str], image_lists: list[list[Image]]) -> (list[str], list[Tensor])
+        # where the returned tensors are (1, resp_len) int64 response token ids.
+        self._vllm_generate_fn = None
 
         self._load_model()
 
@@ -320,14 +455,40 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         so all steps have identical image counts → stable pixel_values shapes.
         """
         n_current = 4 if self.use_4dir else 1
-        self._n_images_fixed = self.history_max_frames + n_current
+        if self.prompt_style == "lavira_waypoint":
+            self._n_images_fixed = (
+                self.history_max_frames * self._waypoint_images_per_record
+                + n_current
+            )
+        else:
+            self._n_images_fixed = self.history_max_frames + n_current
 
         blank = Image.new("RGB", self.image_size, (127, 127, 127))
         dummy_images = [blank] * self._n_images_fixed
 
         # Build fake step indices for history
         dummy_hist_idx = list(range(self.history_max_frames))
-        if self.prompt_style == "lavira_merged":
+        if self.prompt_style == "lavira_waypoint":
+            # Use long ids so dynamic backtrack labels do not exceed the
+            # detected prompt length once real waypoint ids grow.
+            dummy_hist_idx = [999_000 + i for i in range(self.history_max_frames)]
+            dummy_waypoint_infos = [
+                {
+                    "id": wid,
+                    "action": "navigate to forward",
+                    "target": "hallway entrance",
+                    "progress_analysis": "Moved through previous waypoints toward the goal.",
+                    "continuous_count": self._waypoint_images_per_record - 2,
+                }
+                for wid in dummy_hist_idx
+            ]
+            user_text = build_waypoint_user_content_text(
+                instruction="go to the elevator",
+                waypoint_ids=dummy_hist_idx,
+                waypoint_infos=dummy_waypoint_infos,
+            )
+            sys_prompt = LAVIRA_WAYPOINT_SYSTEM_PROMPT
+        elif self.prompt_style == "lavira_merged":
             user_text = build_merged_user_content_text(
                 instruction="go to the elevator",
                 history_step_indices=dummy_hist_idx,
@@ -420,6 +581,8 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         extra_views: Optional[list[Image.Image]] = None,
         pad_history_to: Optional[int] = None,
         stop_rejection_feedback: str = "",
+        history_waypoint_ids: Optional[list[int]] = None,
+        history_waypoint_infos: Optional[list[dict]] = None,
     ) -> tuple[str, list[Image.Image]]:
         """
         Build Qwen-VL chat-template prompt + ordered image list.
@@ -429,13 +592,42 @@ class QwenNavPolicy(nn.Module, BasePolicy):
 
         Image order: history_imgs (chronological) + 4-dir current views (F/L/R/B).
         """
-        if pad_history_to is not None and len(history_imgs) < pad_history_to:
-            pad_n = pad_history_to - len(history_imgs)
-            # Prepend blank images and prepend dummy step indices
-            history_imgs = [self._blank_image] * pad_n + list(history_imgs)
-            history_step_indices = [-1] * pad_n + list(history_step_indices)
+        if pad_history_to is not None:
+            if self.prompt_style == "lavira_waypoint":
+                n_records = len(history_waypoint_infos or [])
+                if n_records < pad_history_to:
+                    pad_records = pad_history_to - n_records
+                    pad_imgs = [self._blank_image] * (
+                        pad_records * self._waypoint_images_per_record
+                    )
+                    history_imgs = pad_imgs + list(history_imgs)
+                    pad_ids = [-1] * pad_records
+                    history_waypoint_ids = pad_ids + list(history_waypoint_ids or [])
+                    pad_infos = [
+                        {
+                            "id": -1,
+                            "action": "",
+                            "target": "",
+                            "progress_analysis": "",
+                            "continuous_count": self._waypoint_images_per_record - 2,
+                        }
+                        for _ in range(pad_records)
+                    ]
+                    history_waypoint_infos = pad_infos + list(history_waypoint_infos or [])
+            elif len(history_imgs) < pad_history_to:
+                pad_n = pad_history_to - len(history_imgs)
+                # Prepend blank images and prepend dummy step indices
+                history_imgs = [self._blank_image] * pad_n + list(history_imgs)
+                history_step_indices = [-1] * pad_n + list(history_step_indices)
 
-        if self.prompt_style == "lavira_merged":
+        if self.prompt_style == "lavira_waypoint":
+            user_text = build_waypoint_user_content_text(
+                instruction=instruction,
+                waypoint_ids=history_waypoint_ids or [],
+                waypoint_infos=history_waypoint_infos,
+                stop_rejection_feedback=stop_rejection_feedback,
+            )
+        elif self.prompt_style == "lavira_merged":
             user_text = build_merged_user_content_text(
                 instruction=instruction,
                 history_step_indices=history_step_indices,
@@ -457,7 +649,20 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         else:
             current_views = [current_view]
 
-        ordered_images = list(history_imgs) + current_views
+        if self.prompt_style == "lavira_waypoint" and len(current_views) == 4:
+            # Template order is FORWARD, LEFT, BEHIND, RIGHT.  The simulator
+            # extras are stored as LEFT, RIGHT, BEHIND, so only this prompt
+            # style reorders images to match the visible labels.
+            prompt_current_views = [
+                current_views[0],
+                current_views[1],
+                current_views[3],
+                current_views[2],
+            ]
+        else:
+            prompt_current_views = current_views
+
+        ordered_images = list(history_imgs) + prompt_current_views
 
         n_expected = expected_image_count(len(history_imgs), has_4dir=self.use_4dir)
         if len(ordered_images) != n_expected:
@@ -466,11 +671,12 @@ class QwenNavPolicy(nn.Module, BasePolicy):
                 f"prompt expects {n_expected}"
             )
 
-        sys_prompt = (
-            LAVIRA_MERGED_SYSTEM_PROMPT
-            if self.prompt_style == "lavira_merged"
-            else SYSTEM_PROMPT
-        )
+        if self.prompt_style == "lavira_waypoint":
+            sys_prompt = LAVIRA_WAYPOINT_SYSTEM_PROMPT
+        elif self.prompt_style == "lavira_merged":
+            sys_prompt = LAVIRA_MERGED_SYSTEM_PROMPT
+        else:
+            sys_prompt = SYSTEM_PROMPT
         messages = [
             {
                 "role": "system",
@@ -513,7 +719,13 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         One processor call → one model.generate per chunk.
         Returns (decoded_text_list, generated_ids_list).
         generated_ids_list[i]: (1, resp_len) int64 — response token ids per sample.
+
+        When _vllm_generate_fn is set (injected by VLLMMultiStepEmbodiedWorker),
+        delegates to vLLM and skips the HF model.generate path entirely.
         """
+        if self._vllm_generate_fn is not None:
+            return self._vllm_generate_fn(prompts, image_lists)
+
         decoded: list[str] = []
         gen_ids_list: list[torch.Tensor] = []
 
@@ -668,14 +880,16 @@ class QwenNavPolicy(nn.Module, BasePolicy):
 
         return token_logprobs.cpu(), token_entropy.cpu()
 
-    # Regex spans for narrow PPO loss mask.  We only train on the JSON *value*
-    # tokens for "action" (always) and "stop" (when LOSS_MASK_INCLUDE_STOP).
-    # The reasoning / progress_analysis / bbox / stair tokens are excluded so
-    # the PPO ratio doesn't accumulate drift over ~200 long-text tokens.
+    # Regex spans for narrow PPO loss mask.  We train on the JSON *value*
+    # tokens for action / stop / stair by default. Long free-text fields remain
+    # excluded so the PPO ratio doesn't accumulate drift over ~200 tokens.
     _ACTION_VALUE_RE = re.compile(
-        r'"action"\s*:\s*"(navigate to (?:forward|left|right|behind))"'
+        r'"action"\s*:\s*"((?:navigate to (?:forward|left|right|behind))|(?:backtrack to \d+))"'
     )
     _STOP_VALUE_RE = re.compile(r'"stop"\s*:\s*(true|false)')
+    _STAIR_VALUE_RE = re.compile(r'"stair"\s*:\s*("up"|"down"|true|false)')
+    _BBOX_VALUE_RE = re.compile(r'"bbox_2d"\s*:\s*(\[[^\]]*\])')
+    _POINT_VALUE_RE = re.compile(r'"point_2d"\s*:\s*(\[[^\]]*\])')
 
     # B2 heading correction constants (front camera, Genesis render settings)
     _B2_CAM_W: int = 640
@@ -711,6 +925,20 @@ class QwenNavPolicy(nn.Module, BasePolicy):
             return False
         return True
 
+    def point_geom_valid(self, parsed) -> bool:
+        """Return True when parsed point_2d is valid and lies inside bbox_2d."""
+        if not self.bbox_geom_valid(parsed) or parsed.point_2d is None:
+            return False
+        if parsed.raw_dir not in ("navigate to forward", "navigate to left", "navigate to right"):
+            return False
+        if len(parsed.point_2d) != 2:
+            return False
+        x, y = parsed.point_2d
+        if not (0 <= x <= 1000 and 0 <= y <= 1000):
+            return False
+        x1, y1, x2, y2 = parsed.bbox_2d
+        return x1 <= x <= x2 and y1 <= y <= y2
+
     def _bbox_to_heading_correction(self, bbox_2d: list[float]) -> list[int]:
         """Convert merged-schema bbox_2d center to heading-corrected action sequence.
 
@@ -728,16 +956,98 @@ class QwenNavPolicy(nn.Module, BasePolicy):
             return [ACTION_TURN_LEFT] * (-n) + [ACTION_FORWARD]
         return [ACTION_FORWARD]
 
+    @staticmethod
+    def _chosen_direction_view(
+        raw_dir: Optional[str],
+        current_views: list[Image.Image],
+    ) -> Image.Image:
+        """Return the current-view image matching a navigate action."""
+        if raw_dir == "navigate to left" and len(current_views) > 1:
+            return current_views[1]
+        if raw_dir == "navigate to right" and len(current_views) > 2:
+            return current_views[2]
+        return current_views[0]
+
+    def _get_grounded_sam(self) -> GroundedSAMWaypointRefiner:
+        if self._grounded_sam is None:
+            if self.grounded_sam_cfg is None:
+                raise RuntimeError("grounded_sam.enabled=true but no grounded_sam config was provided")
+            self._grounded_sam = GroundedSAMWaypointRefiner(self.grounded_sam_cfg)
+        return self._grounded_sam
+
+    def _refine_waypoint_with_grounded_sam(
+        self,
+        parsed: ParsedAction,
+        current_views: list[Image.Image],
+    ):
+        """Use GroundingDINO/SAM to refine the parsed waypoint target if possible."""
+        if not self.grounded_sam_enabled:
+            return None
+        if parsed.action_type != "NAVIGATE" or not str(parsed.target or "").strip():
+            return None
+        view = self._chosen_direction_view(parsed.raw_dir, current_views)
+        image_rgb = np.asarray(view.convert("RGB"))
+        return self._get_grounded_sam().refine(image_rgb, parsed.target)
+
+    def _save_waypoint_record(
+        self,
+        cache: _HistoryCache,
+        parsed: ParsedAction,
+        pose_row: np.ndarray,
+        current_views: list[Image.Image],
+    ) -> None:
+        """Save one LaViRA waypoint memory after a successful NAVIGATE decision."""
+        if parsed.bbox_2d is None or parsed.point_2d is None:
+            return
+        wid = cache.next_waypoint_id
+        cache.next_waypoint_id += 1
+        arrival_img = current_views[0]
+        chosen_img = self._chosen_direction_view(parsed.raw_dir, current_views)
+        overlay = _draw_waypoint_overlay(chosen_img, parsed.bbox_2d, parsed.point_2d, wid)
+        segment = cache.history_images[cache.last_waypoint_history_len:]
+        if not segment:
+            segment = [arrival_img]
+        cont_imgs, _cont_idx = _sample_history(
+            segment,
+            every_k=max(1, len(segment) // 5),
+            max_frames=5,
+        )
+        rec = _WaypointRecord(
+            waypoint_id=wid,
+            pose_hab=(float(pose_row[0]), float(pose_row[1]), float(pose_row[2])),
+            arrival_image=arrival_img.copy(),
+            after_turn_image=overlay,
+            continuous_frames=[img.copy() for img in cont_imgs],
+            action=parsed.raw_dir or "",
+            bbox_2d=list(parsed.bbox_2d),
+            point_2d=list(parsed.point_2d),
+            target=parsed.target,
+            progress_analysis=parsed.progress,
+        )
+        cache.waypoints.append(rec)
+        cache.last_waypoint_history_len = len(cache.history_images)
+        if len(cache.waypoints) > self.history_max_frames:
+            del cache.waypoints[:-self.history_max_frames]
+
+    def _find_waypoint(self, cache: _HistoryCache, waypoint_id: Optional[int]) -> Optional[_WaypointRecord]:
+        if waypoint_id is None:
+            return None
+        for rec in cache.waypoints:
+            if rec.id == waypoint_id:
+                return rec
+        return None
+
     def _compute_action_loss_mask(
         self,
         decoded_text: str,
         resp_len: int,
+        mask_mode: str = "action",
     ) -> torch.Tensor:
         """
         Build a (max_new_tokens,) bool mask that is True only on tokens
-        belonging to the `action` value (and optionally `stop` value) inside
-        the JSON response. Falls back to all-True over the response length
-        on any failure so behavior degrades gracefully.
+        belonging to action / stop / stair values inside the JSON response.
+        Falls back to all-True over the response length on any failure so
+        behavior degrades gracefully.
 
         Implementation: re-tokenize prefix text up to each char span boundary;
         the prefix token count gives the boundary token index. Assumes the
@@ -746,6 +1056,9 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         """
         full_mask = torch.zeros(self.max_new_tokens, dtype=torch.bool)
         if resp_len <= 0 or not decoded_text:
+            return full_mask
+        if mask_mode == "full":
+            full_mask[:resp_len] = True
             return full_mask
 
         try:
@@ -757,6 +1070,9 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         include_stop = os.environ.get(
             "QWEN_NAV_LOSS_MASK_INCLUDE_STOP", "1"
         ) not in ("0", "false", "False")
+        include_stair = os.environ.get(
+            "QWEN_NAV_LOSS_MASK_INCLUDE_STAIR", "1"
+        ) not in ("0", "false", "False")
 
         spans: list[tuple[int, int]] = []
         m = self._ACTION_VALUE_RE.search(decoded_text)
@@ -766,6 +1082,15 @@ class QwenNavPolicy(nn.Module, BasePolicy):
             m2 = self._STOP_VALUE_RE.search(decoded_text)
             if m2:
                 spans.append(m2.span(1))   # "true" / "false" literal
+        if include_stair:
+            m3 = self._STAIR_VALUE_RE.search(decoded_text)
+            if m3:
+                spans.append(m3.span(1))   # "up" / "down" / true / false literal
+        if mask_mode == "geometry":
+            for regex in (self._BBOX_VALUE_RE, self._POINT_VALUE_RE):
+                mg = regex.search(decoded_text)
+                if mg:
+                    spans.append(mg.span(1))
 
         if not spans:
             # No recognizable action span — fall back to full response so
@@ -803,6 +1128,7 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         inputs_single: "BatchEncoding",   # processor output for 1 sample
         response_ids: torch.Tensor,        # (1, resp_len)
         decoded_text: Optional[str] = None,
+        loss_mask_mode: str = "action",
     ) -> dict[str, torch.Tensor]:
         """
         Build a fixed-shape forward_inputs dict for one env step.
@@ -867,7 +1193,9 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         # Narrow PPO loss mask: True only on action (+stop) value tokens.
         # Falls back to full resp_mask when decoded_text not provided.
         if decoded_text is not None:
-            loss_mask = self._compute_action_loss_mask(decoded_text, resp_len)
+            loss_mask = self._compute_action_loss_mask(
+                decoded_text, resp_len, mask_mode=loss_mask_mode
+            )
         else:
             loss_mask = resp_mask.clone()
 
@@ -920,6 +1248,20 @@ class QwenNavPolicy(nn.Module, BasePolicy):
             else np.asarray(main_images)
         )
         num_envs = rgb_np.shape[0]
+        mask_mode_ids = env_obs.get("ppo_loss_mask_mode_id")
+        if isinstance(mask_mode_ids, torch.Tensor):
+            mask_mode_ids_np = mask_mode_ids.detach().cpu().numpy().astype(np.int64)
+        elif mask_mode_ids is None:
+            mask_mode_ids_np = np.full(num_envs, 2, dtype=np.int64)
+        else:
+            mask_mode_ids_np = np.asarray(mask_mode_ids, dtype=np.int64)
+        if mask_mode_ids_np.shape[0] < num_envs:
+            mask_mode_ids_np = np.pad(
+                mask_mode_ids_np,
+                (0, num_envs - mask_mode_ids_np.shape[0]),
+                constant_values=2,
+            )
+        _mask_mode_name = {0: "full", 1: "geometry", 2: "action"}
 
         extras_np  = None
         depth_np   = None   # (N, H, W) float32 metres, or None
@@ -1005,6 +1347,8 @@ class QwenNavPolicy(nn.Module, BasePolicy):
         per_env_forward_inputs: dict[int, dict] = {}
         per_env_logprobs: dict[int, torch.Tensor] = {}
         per_env_entropy: dict[int, torch.Tensor] = {}
+        parsed_actions: dict[int, ParsedAction] = {}
+        grounded_sam_diag: dict[int, dict] = {}
 
         if need_infer:
             prompts: list[str] = []
@@ -1015,12 +1359,22 @@ class QwenNavPolicy(nn.Module, BasePolicy):
 
             for env_i in need_infer:
                 cache = self._get_cache(env_i)
-                past_imgs = cache.history_images[:-1]
-                sampled, sampled_idx = _sample_history(
-                    past_imgs,
-                    every_k=self.history_every_k,
-                    max_frames=self.history_max_frames,
-                )
+                sampled_waypoint_ids = None
+                sampled_waypoint_infos = None
+                if self.prompt_style == "lavira_waypoint":
+                    sampled, sampled_idx, sampled_infos = _sample_waypoints(
+                        cache.waypoints,
+                        max_frames=self.history_max_frames,
+                    )
+                    sampled_waypoint_ids = sampled_idx
+                    sampled_waypoint_infos = sampled_infos
+                else:
+                    past_imgs = cache.history_images[:-1]
+                    sampled, sampled_idx = _sample_history(
+                        past_imgs,
+                        every_k=self.history_every_k,
+                        max_frames=self.history_max_frames,
+                    )
                 extra_views = None
                 if extras_np is not None:
                     extra_views = [_to_pil(extras_np[env_i, k]) for k in range(3)]
@@ -1039,6 +1393,8 @@ class QwenNavPolicy(nn.Module, BasePolicy):
                     extra_views=extra_views,
                     pad_history_to=pad_h,
                     stop_rejection_feedback=cache_i.stop_rejection_feedback,
+                    history_waypoint_ids=sampled_waypoint_ids,
+                    history_waypoint_infos=sampled_waypoint_infos,
                 )
                 prompts.append(prompt_text)
                 img_lists.append(ordered_imgs)
@@ -1058,7 +1414,12 @@ class QwenNavPolicy(nn.Module, BasePolicy):
                     resp_ids = gen_ids_list[idx]  # (1, resp_len)
 
                     fi = self._build_forward_inputs_for_env(
-                        single_inputs, resp_ids, decoded_text=decoded[idx]
+                        single_inputs,
+                        resp_ids,
+                        decoded_text=decoded[idx],
+                        loss_mask_mode=_mask_mode_name.get(
+                            int(mask_mode_ids_np[env_i]), "action"
+                        ),
                     )
                     per_env_forward_inputs[env_i] = fi
 
@@ -1095,19 +1456,44 @@ class QwenNavPolicy(nn.Module, BasePolicy):
                         per_env_entropy[env_i] = ent
 
             # Phase 3a: parse JSON responses
-            parsed_actions: dict[int, ParsedAction] = {}
             use_merged = self.prompt_style == "lavira_merged"
+            use_waypoint = self.prompt_style == "lavira_waypoint"
             for env_i, text in zip(need_infer, decoded):
-                parsed: ParsedAction = (
-                    parse_lavira_merged_json(text) if use_merged
-                    else parse_lavira_json(text)
-                )
+                if use_waypoint:
+                    parsed = parse_lavira_waypoint_json(text)
+                elif use_merged:
+                    parsed = parse_lavira_merged_json(text)
+                else:
+                    parsed = parse_lavira_json(text)
+                # RL-Struct style length guardrail: reward useful structured
+                # responses, not empty JSON fragments or runaway reasoning.
+                text_len = len(str(text).strip())
+                if 80 <= text_len <= 3500:
+                    parsed.reward_bits |= REWARD_LENGTH_OK
                 cache = self._get_cache(env_i)
                 cache.last_parse_ok = parsed.ok
                 cache.last_err = parsed.err
                 # For merged schema: bbox_2d is the navigation target bbox;
                 # store in last_bbox so existing bboxes diagnostics still works.
-                cache.last_bbox = parsed.bbox_2d if use_merged else parsed.bbox
+                cache.last_bbox = parsed.bbox_2d if (use_merged or use_waypoint) else parsed.bbox
+                cache.last_point = parsed.point_2d
+                cache.last_waypoint_id = parsed.waypoint_id
+                cache.last_reasoning_plan_action = parsed.reasoning_plan_action
+                cache.last_reasoning_bbox_point = parsed.reasoning_bbox_point
+                cache.last_target = parsed.target
+                cache.last_backtrack_valid = False
+                if (
+                    not parsed.ok
+                    and self._parse_fail_debug_printed < self._parse_fail_debug_limit
+                ):
+                    preview = str(text).replace("\n", "\\n")[:1200]
+                    print(
+                        f"[QwenNav][parse-fail-debug] env={env_i} "
+                        f"style={self.prompt_style} err={parsed.err} "
+                        f"text={preview!r}",
+                        flush=True,
+                    )
+                    self._parse_fail_debug_printed += 1
                 if use_merged and parsed.action_type == "BACKTRACK":
                     import logging as _log
                     _log.getLogger(__name__).debug(
@@ -1193,8 +1579,155 @@ class QwenNavPolicy(nn.Module, BasePolicy):
             # Phase 3d: apply final actions
             for env_i in need_infer:
                 parsed = parsed_actions[env_i]
-                act_seq = parsed.actions if parsed.actions else [ACTION_STOP]
+                act_seq = parsed.actions if parsed.actions else (
+                    [ACTION_PARSE_FAIL] if not parsed.ok else [ACTION_STOP]
+                )
                 cache = self._get_cache(env_i)
+
+                if (self.lavira_controller
+                        and self.prompt_style == "lavira_waypoint"
+                        and parsed.ok
+                        and not parsed.stop):
+                    if parsed.action_type == "NAVIGATE":
+                        _used_fmm = False
+                        world_goal = None
+                        sam_point_2d = None
+                        sam_bbox_2d = None
+                        if env_i in current_views_per_env:
+                            try:
+                                sam_result = self._refine_waypoint_with_grounded_sam(
+                                    parsed, current_views_per_env[env_i]
+                                )
+                            except Exception as exc:
+                                sam_result = None
+                                grounded_sam_diag[env_i] = {
+                                    "enabled": bool(self.grounded_sam_enabled),
+                                    "used": False,
+                                    "detected": False,
+                                    "target": parsed.target,
+                                    "label": "",
+                                    "confidence": 0.0,
+                                    "fallback_reason": f"exception:{type(exc).__name__}",
+                                    "point_2d": None,
+                                    "bbox_2d": None,
+                                }
+                            if sam_result is not None:
+                                sam_point_2d = sam_result.point_2d if sam_result.detected else None
+                                sam_bbox_2d = sam_result.bbox_2d if sam_result.detected else None
+                                if sam_result.detected:
+                                    parsed.point_2d = sam_point_2d
+                                    parsed.bbox_2d = sam_bbox_2d
+                                    cache.last_point = sam_point_2d
+                                    cache.last_bbox = sam_bbox_2d
+                                grounded_sam_diag[env_i] = {
+                                    "enabled": bool(self.grounded_sam_enabled),
+                                    "used": bool(sam_result.detected),
+                                    "detected": bool(sam_result.detected),
+                                    "target": parsed.target,
+                                    "label": sam_result.label,
+                                    "confidence": float(sam_result.confidence),
+                                    "fallback_reason": sam_result.fallback_reason,
+                                    "point_2d": sam_result.point_2d,
+                                    "bbox_2d": sam_result.bbox_2d,
+                                }
+                        if (depth_np is not None and pose_np is not None
+                                and env_i in self._occ_maps):
+                            if sam_point_2d is not None:
+                                world_goal = project_point_to_world(
+                                    point_2d=sam_point_2d,
+                                    depth_hw=depth_np[env_i],
+                                    gen_yaw_rad=float(pose_np[env_i, 2]),
+                                    hab_x=float(pose_np[env_i, 0]),
+                                    hab_z=float(pose_np[env_i, 1]),
+                                )
+                            if world_goal is None and sam_bbox_2d is not None:
+                                world_goal = project_bbox_to_world(
+                                    bbox_2d=sam_bbox_2d,
+                                    depth_hw=depth_np[env_i],
+                                    gen_yaw_rad=float(pose_np[env_i, 2]),
+                                    hab_x=float(pose_np[env_i, 0]),
+                                    hab_z=float(pose_np[env_i, 1]),
+                                )
+                            if world_goal is None and self.point_geom_valid(parsed):
+                                world_goal = project_point_to_world(
+                                    point_2d=parsed.point_2d,
+                                    depth_hw=depth_np[env_i],
+                                    gen_yaw_rad=float(pose_np[env_i, 2]),
+                                    hab_x=float(pose_np[env_i, 0]),
+                                    hab_z=float(pose_np[env_i, 1]),
+                                )
+                            if world_goal is None and self.bbox_geom_valid(parsed):
+                                world_goal = project_bbox_to_world(
+                                    bbox_2d=parsed.bbox_2d,
+                                    depth_hw=depth_np[env_i],
+                                    gen_yaw_rad=float(pose_np[env_i, 2]),
+                                    hab_x=float(pose_np[env_i, 0]),
+                                    hab_z=float(pose_np[env_i, 1]),
+                                )
+                            if world_goal is not None:
+                                fmm_acts = self._occ_maps[env_i].get_fmm_action_seq(
+                                    world_goal_x=float(world_goal[0]),
+                                    world_goal_z=float(world_goal[1]),
+                                    hab_x=float(pose_np[env_i, 0]),
+                                    hab_z=float(pose_np[env_i, 1]),
+                                    gen_yaw_rad=float(pose_np[env_i, 2]),
+                                )
+                                if fmm_acts:
+                                    act_seq = fmm_acts
+                                    _used_fmm = True
+                                    print(
+                                        f"[LaViRA][fmm] env={env_i} "
+                                        f"agent=({pose_np[env_i,0]:.2f},{pose_np[env_i,1]:.2f}) "
+                                        f"yaw={pose_np[env_i,2]:.2f}rad "
+                                        f"goal=({world_goal[0]:.2f},{world_goal[1]:.2f}) "
+                                        f"acts={act_seq}",
+                                        flush=True,
+                                    )
+                        if not _used_fmm:
+                            if self.bbox_geom_valid(parsed):
+                                act_seq = self._bbox_to_heading_correction(parsed.bbox_2d)
+                            else:
+                                # New waypoint schema lets the model emit only a
+                                # target phrase; GroundingDINO/SAM may fail or be
+                                # disabled. In that case keep the model's discrete
+                                # navigation action instead of converting a missing
+                                # detector result into a parse failure.
+                                act_seq = parsed.actions
+                        if (pose_np is not None and self.point_geom_valid(parsed)
+                                and env_i in current_views_per_env):
+                            self._save_waypoint_record(
+                                cache=cache,
+                                parsed=parsed,
+                                pose_row=pose_np[env_i],
+                                current_views=current_views_per_env[env_i],
+                            )
+                    elif parsed.action_type == "BACKTRACK":
+                        rec = self._find_waypoint(cache, parsed.waypoint_id)
+                        if (rec is not None and pose_np is not None
+                                and env_i in self._occ_maps):
+                            goal_x, goal_z, _goal_yaw = rec.pose_hab
+                            fmm_acts = self._occ_maps[env_i].get_fmm_action_seq(
+                                world_goal_x=float(goal_x),
+                                world_goal_z=float(goal_z),
+                                hab_x=float(pose_np[env_i, 0]),
+                                hab_z=float(pose_np[env_i, 1]),
+                                gen_yaw_rad=float(pose_np[env_i, 2]),
+                            )
+                            if fmm_acts:
+                                act_seq = fmm_acts
+                                parsed.backtrack_valid = True
+                                cache.last_backtrack_valid = True
+                                print(
+                                    f"[LaViRA][backtrack] env={env_i} "
+                                    f"wp={parsed.waypoint_id} "
+                                    f"goal=({goal_x:.2f},{goal_z:.2f}) "
+                                    f"acts={act_seq}",
+                                    flush=True,
+                                )
+                            else:
+                                act_seq = [ACTION_PARSE_FAIL]
+                        else:
+                            act_seq = [ACTION_PARSE_FAIL]
 
                 # P1 (hybrid-gated controller, train+eval): a geometrically-valid bbox
                 # drives a goal-directed primitive queue (placeholder = bbox-center
@@ -1249,12 +1782,38 @@ class QwenNavPolicy(nn.Module, BasePolicy):
                     act_seq = self._bbox_to_heading_correction(parsed.bbox_2d)
 
                 # B1: encode has_bbox sentinel when merged schema + valid bbox_2d.
-                if (self.prompt_style == "lavira_merged"
-                        and parsed.ok
-                        and parsed.bbox_2d is not None):
+                has_bbox_sentinel = (
+                    self.prompt_style == "lavira_merged"
+                    and parsed.ok
+                    and parsed.bbox_2d is not None
+                    and act_seq[0] in (
+                        ACTION_STOP, ACTION_FORWARD,
+                        ACTION_TURN_LEFT, ACTION_TURN_RIGHT,
+                    )
+                ) or (
+                    self.prompt_style == "lavira_waypoint"
+                    and parsed.ok
+                    and parsed.action_type == "NAVIGATE"
+                    and self.bbox_geom_valid(parsed)
+                    and act_seq[0] in (
+                        ACTION_STOP, ACTION_FORWARD,
+                        ACTION_TURN_LEFT, ACTION_TURN_RIGHT,
+                    )
+                )
+                if has_bbox_sentinel:
                     actions[env_i] = ACTION_PARSE_OK_HAS_BBOX_BASE + act_seq[0]
                 else:
-                    actions[env_i] = ACTION_PARSE_FAIL if not parsed.ok else act_seq[0]
+                    if parsed.ok:
+                        actions[env_i] = act_seq[0]
+                    elif int(getattr(parsed, "reward_bits", 0)) > 0:
+                        actions[env_i] = (
+                            ACTION_STRUCTURED_PARSE_FAIL_BASE
+                            + int(getattr(parsed, "reward_bits", 0))
+                        )
+                    elif getattr(parsed, "schema_ok", False):
+                        actions[env_i] = ACTION_SCHEMA_OK_PARSE_FAIL
+                    else:
+                        actions[env_i] = ACTION_PARSE_FAIL
 
                 if len(act_seq) > 1:
                     cache.pending_actions.extend(act_seq[1:])
@@ -1269,32 +1828,72 @@ class QwenNavPolicy(nn.Module, BasePolicy):
                 if p is None:
                     continue
                 self._action_stats["total"] += 1
+                bits = int(getattr(p, "reward_bits", 0))
+                if bits & REWARD_JSON_VALID:
+                    self._action_stats["json_valid"] += 1
+                if bits & REWARD_REQUIRED_FIELDS:
+                    self._action_stats["struct_ok"] += 1
+                if bits & REWARD_FIELD_FORMAT:
+                    self._action_stats["field_format_ok"] += 1
+                if bits & REWARD_GEOMETRY_VALID:
+                    self._action_stats["geometry_ok"] += 1
+                if bits & REWARD_LENGTH_OK:
+                    self._action_stats["length_ok"] += 1
                 if not p.ok:
                     self._action_stats["parse_fail"] += 1
                     continue
+                gs_diag = grounded_sam_diag.get(i, {})
+                if gs_diag.get("used", False):
+                    self._action_stats["grounded_sam_used"] += 1
+                if gs_diag.get("detected", False):
+                    self._action_stats["grounded_sam_detected"] += 1
                 if p.stop:
                     self._action_stats["stop"] += 1
+                    continue
+                if p.action_type == "BACKTRACK":
+                    self._action_stats["backtrack"] += 1
+                    if p.backtrack_valid:
+                        self._action_stats["backtrack_valid"] += 1
                     continue
                 rd = (p.raw_dir or "").replace("navigate to ", "").strip()
                 if rd in ("forward", "left", "right", "behind"):
                     self._action_stats[rd] += 1
                 # P1 hybrid-gated controller: record bbox gate outcome per decision.
-                if self.lavira_controller and self.prompt_style == "lavira_merged":
+                if self.lavira_controller and self.prompt_style in ("lavira_merged", "lavira_waypoint"):
                     if self.bbox_geom_valid(p):
                         self._action_stats["bbox_valid"] += 1
                     else:
                         self._action_stats["bbox_fallback"] += 1
+                    if self.prompt_style == "lavira_waypoint" and self.point_geom_valid(p):
+                        self._action_stats["point_valid"] += 1
             self._action_stats_counter += 1
             if self._action_stats_counter >= self._action_stats_flush_every:
                 tot = max(self._action_stats["total"], 1)
                 mode = "train" if self.collect_forward_inputs else "eval"
                 pct = lambda k: 100.0 * self._action_stats[k] / tot
                 gate_str = ""
-                if self.lavira_controller and self.prompt_style == "lavira_merged":
+                if self.lavira_controller and self.prompt_style in ("lavira_merged", "lavira_waypoint"):
                     gate_str = (
                         f" || bbox_valid={self._action_stats['bbox_valid']}({pct('bbox_valid'):.1f}%) "
                         f"fallback={self._action_stats['bbox_fallback']}({pct('bbox_fallback'):.1f}%)"
                     )
+                    if self.prompt_style == "lavira_waypoint":
+                        gate_str += (
+                            f" point_valid={self._action_stats['point_valid']}({pct('point_valid'):.1f}%) "
+                            f"backtrack_valid={self._action_stats['backtrack_valid']}({pct('backtrack_valid'):.1f}%)"
+                        )
+                        if self.grounded_sam_enabled:
+                            gate_str += (
+                                f" gsam_used={self._action_stats['grounded_sam_used']}({pct('grounded_sam_used'):.1f}%) "
+                                f"gsam_detected={self._action_stats['grounded_sam_detected']}({pct('grounded_sam_detected'):.1f}%)"
+                            )
+                struct_str = (
+                    f" || json={self._action_stats['json_valid']}({pct('json_valid'):.1f}%) "
+                    f"struct={self._action_stats['struct_ok']}({pct('struct_ok'):.1f}%) "
+                    f"field={self._action_stats['field_format_ok']}({pct('field_format_ok'):.1f}%) "
+                    f"geom={self._action_stats['geometry_ok']}({pct('geometry_ok'):.1f}%) "
+                    f"len={self._action_stats['length_ok']}({pct('length_ok'):.1f}%)"
+                )
                 print(
                     f"[QwenNav][action-dist][{mode}] batches={self._action_stats_counter} "
                     f"decisions={self._action_stats['total']} | "
@@ -1302,9 +1901,10 @@ class QwenNavPolicy(nn.Module, BasePolicy):
                     f"left={self._action_stats['left']}({pct('left'):.1f}%) "
                     f"right={self._action_stats['right']}({pct('right'):.1f}%) "
                     f"behind={self._action_stats['behind']}({pct('behind'):.1f}%) "
+                    f"backtrack={self._action_stats['backtrack']}({pct('backtrack'):.1f}%) "
                     f"stop={self._action_stats['stop']}({pct('stop'):.1f}%) "
                     f"parse_fail={self._action_stats['parse_fail']}({pct('parse_fail'):.1f}%)"
-                    f"{gate_str}",
+                    f"{struct_str}{gate_str}",
                     flush=True,
                 )
                 self._action_stats_counter = 0
@@ -1319,6 +1919,7 @@ class QwenNavPolicy(nn.Module, BasePolicy):
             dtype=np.float32,
         )
         bboxes = [self._get_cache(i).last_bbox for i in range(num_envs)]
+        points = [self._get_cache(i).last_point for i in range(num_envs)]
 
         diagnostics = {
             "parse_ok":     parse_ok,
@@ -1331,11 +1932,63 @@ class QwenNavPolicy(nn.Module, BasePolicy):
             "prev_values":  None,
         }
         # Merged-schema extra diagnostics (logged when prompt_style=lavira_merged)
-        if self.prompt_style == "lavira_merged":
+        if self.prompt_style in ("lavira_merged", "lavira_waypoint"):
             diagnostics["action_types"] = [
                 (parsed_actions[i].action_type if i in parsed_actions else "")
                 for i in range(num_envs)
             ]
+        if self.prompt_style == "lavira_waypoint":
+            def _gs(i: int, key: str, default):
+                return grounded_sam_diag.get(i, {}).get(key, default)
+
+            diagnostics.update({
+                "point_2d": points,
+                "waypoint_id": [
+                    self._get_cache(i).last_waypoint_id for i in range(num_envs)
+                ],
+                "reasoning_plan_action": [
+                    self._get_cache(i).last_reasoning_plan_action for i in range(num_envs)
+                ],
+                "reasoning_bbox_point": [
+                    self._get_cache(i).last_reasoning_bbox_point for i in range(num_envs)
+                ],
+                "backtrack_valid": np.array(
+                    [self._get_cache(i).last_backtrack_valid for i in range(num_envs)],
+                    dtype=np.float32,
+                ),
+                "target": [self._get_cache(i).last_target for i in range(num_envs)],
+                "grounded_sam_enabled": np.array(
+                    [float(_gs(i, "enabled", self.grounded_sam_enabled)) for i in range(num_envs)],
+                    dtype=np.float32,
+                ),
+                "grounded_sam_used": np.array(
+                    [float(_gs(i, "used", False)) for i in range(num_envs)],
+                    dtype=np.float32,
+                ),
+                "grounded_sam_detected": np.array(
+                    [float(_gs(i, "detected", False)) for i in range(num_envs)],
+                    dtype=np.float32,
+                ),
+                "grounded_sam_target": [
+                    _gs(i, "target", self._get_cache(i).last_target) for i in range(num_envs)
+                ],
+                "grounded_sam_label": [
+                    _gs(i, "label", "") for i in range(num_envs)
+                ],
+                "grounded_sam_confidence": np.array(
+                    [float(_gs(i, "confidence", 0.0)) for i in range(num_envs)],
+                    dtype=np.float32,
+                ),
+                "grounded_sam_fallback_reason": [
+                    _gs(i, "fallback_reason", "") for i in range(num_envs)
+                ],
+                "grounded_sam_point_2d": [
+                    _gs(i, "point_2d", None) for i in range(num_envs)
+                ],
+                "grounded_sam_bbox_2d": [
+                    _gs(i, "bbox_2d", None) for i in range(num_envs)
+                ],
+            })
 
         if self.collect_forward_inputs:
             # Aggregate per_env → batch tensors: (N, ...)

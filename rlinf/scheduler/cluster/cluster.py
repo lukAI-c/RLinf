@@ -280,18 +280,24 @@ class Cluster:
         )
         assert self._num_nodes >= 0, "num_nodes must be greater than or equal to 0."
 
-        try:
-            # First try to connect to an existing Ray cluster
-            ray.init(
-                address="auto",
-                logging_level=Cluster.LOGGING_LEVEL,
-                namespace=Cluster.NAMESPACE,
-            )
-        except ConnectionError:
+        if os.environ.get("RLINF_RAY_LOCAL", "0") == "1":
             ray.init(
                 logging_level=Cluster.LOGGING_LEVEL,
                 namespace=Cluster.NAMESPACE,
             )
+        else:
+            try:
+                # First try to connect to an existing Ray cluster
+                ray.init(
+                    address="auto",
+                    logging_level=Cluster.LOGGING_LEVEL,
+                    namespace=Cluster.NAMESPACE,
+                )
+            except ConnectionError:
+                ray.init(
+                    logging_level=Cluster.LOGGING_LEVEL,
+                    namespace=Cluster.NAMESPACE,
+                )
 
         # Ray log collector
         if distributed_log_dir is not None:

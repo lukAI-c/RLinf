@@ -1,0 +1,201 @@
+# RLinf-Qwen-only zero-shot difficulty evaluation.
+# Runs QwenNavPolicy without RFT, rolls through the OpenNav 100 episode pool,
+# and writes avg_metrics.json, per_scene_*.json, all_episode_metrics.json,
+# and difficulty_summary.json under runner.logger.log_path.
+
+defaults:
+  - env/genark_r2r@env.train
+  - env/genark_r2r@env.eval
+  - model/qwen_nav@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor:
+      placement: "4"       # placeholder; only_eval=True so actor is skipped
+    rollout:
+      placement: "4"       # single vLLM rollout rank; avoids eval batch divisibility
+    env:
+      placement: "6-7:0"   # one env worker owns GPUs 6,7 for Genesis scene actors
+
+runner:
+  task_type: embodied
+  only_eval: True
+  eval_policy_path: null
+  val_check_interval: 1
+  save_interval: 999999
+  max_epochs: 1
+  max_steps: -1
+
+  logger:
+    log_path: "/home/clk/workspace/results/genark_qwen_zeroshot"
+    project_name: rlinf
+    experiment_name: "genark_qwen_zeroshot"
+    logger_backends: ["tensorboard"]
+
+algorithm:
+  rollout_epoch: 1
+  eval_rollout_epoch: 1
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  entropy_type: token_level
+  group_size: 1
+  reward_coef: 1.0
+  normalize_advantages: True
+  loss_type: embodied_dagger
+  replay_buffer:
+    enable_cache: false
+    cache_size: 1
+    sample_window_size: 1
+    auto_save: false
+  adv_type: gae
+  recompute_logprobs: False
+  kl_penalty: kl
+  kl_beta: 0.0
+  entropy_bonus: 0
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  value_clip: 0.2
+  huber_delta: 10.0
+  gamma: 0.99
+  gae_lambda: 0.95
+  update_epoch: 1
+  loss_agg_func: "token-mean"
+  filter_rewards: False
+  rewards_lower_bound: 0.0
+  rewards_upper_bound: 1.0
+  length_params:
+    max_new_token: null
+    max_length: null
+    min_length: 1
+  sampling_params:
+    do_sample: true
+    temperature_train: 1.0
+    temperature_eval: 0.5
+    top_k: 50
+    top_p: 1.0
+    repetition_penalty: 1.0
+    add_BOS: false
+
+env:
+  group_name: "EnvGroup"
+  train:
+    total_num_envs: 1
+  eval:
+    episodes_file: /home/clk/workspace/genark/data/datasets/OpenNav_R2R-CE_100_bertidx.json
+    total_num_envs: 2
+    genesis_backend: multiscene
+    multi_scene:
+      scene_count: 2
+      scenes_per_gpu: 1
+      scenes:
+        - "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb"
+        - "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb"
+      gpu_budget: 2
+    auto_reset: True
+    ignore_terminations: False
+    is_eval: True
+    cyclic_episode_sampling: false
+    eval_roll_through_episode_pool: true
+    eval_repeats_per_episode: 5
+    group_size: 1
+    max_episode_steps: 40
+    max_steps_per_rollout_epoch: 5000
+    reward_mode: "geo_progress"
+    enable_4dir_render: true
+    success_distance: 3.0
+    scene_offset: 0
+    video_cfg:
+      save_video: false
+      video_base_dir: ${runner.logger.log_path}/video/eval
+      info_on_video: false
+      fps: 3
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "vllm_embodied"
+  enable_offload: False
+  pipeline_stage_num: 1
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.30
+  vllm_sleep_offload: false
+  max_model_len: 8192
+  max_num_seqs: 8
+  enforce_eager: true
+  enable_sleep_mode: false
+  model:
+    model_type: "qwen_nav"
+    model_path: ${actor.model.model_path}
+    precision: ${actor.model.precision}
+    collect_forward_inputs: false
+    skip_rollout_logprobs: true
+    max_new_tokens: ${actor.model.max_new_tokens}
+    history_every_k: ${actor.model.history_every_k}
+    history_max_frames: ${actor.model.history_max_frames}
+    use_4dir: ${actor.model.use_4dir}
+    chunk_size: ${actor.model.chunk_size}
+    temperature: ${actor.model.temperature}
+    do_sample: ${actor.model.do_sample}
+    trust_remote_code: ${actor.model.trust_remote_code}
+    attn_implementation: ${actor.model.attn_implementation}
+    image_size: ${actor.model.image_size}
+    prompt_style: ${actor.model.prompt_style}
+    lavira_controller: ${actor.model.lavira_controller}
+    grounded_sam: ${actor.model.grounded_sam}
+    is_lora: false
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 1
+  global_batch_size: 1
+  seed: 42
+  enable_offload: True
+  model:
+    prompt_style: "lavira_waypoint"
+    lavira_controller: true
+    attn_implementation: "sdpa"
+    history_max_frames: 2
+    max_new_tokens: 256
+    chunk_size: 8
+    grounded_sam:
+      enabled: false
+      dino_config_path: ""
+      dino_checkpoint_path: ""
+      sam_checkpoint_path: ""
+      sam_encoder_version: "vit_h"
+      device: "cuda"
+      box_threshold: 0.25
+      text_threshold: 0.25
+      max_box_area_ratio: 0.95
+      min_mask_area_px: 16
+      fail_fast_on_missing_assets: true
+    is_lora: false
+    add_value_head: false
+  fsdp_config:
+    use_orig_params: true
+    cpu_offload: true
+  optim:
+    lr: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 0.01
+    clip_grad: 1.0
+    critic_warmup_steps: 0
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

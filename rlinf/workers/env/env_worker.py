@@ -52,6 +52,7 @@ class EnvWorker(Worker):
 
         self.env_list = []
         self.eval_env_list = []
+        self.global_step = 0
 
         self.last_obs_list = []
         self.last_intervened_info_list = []
@@ -154,6 +155,31 @@ class EnvWorker(Worker):
 
         if not self.only_eval:
             self._init_env()
+
+    def set_global_step(self, global_step: int) -> None:
+        self.global_step = int(global_step)
+        for env in list(self.env_list) + list(self.eval_env_list):
+            target = getattr(env, "env", env)
+            if hasattr(target, "set_global_step"):
+                target.set_global_step(self.global_step)
+
+    def _ppo_loss_mask_mode_id(self) -> int:
+        """Curriculum-aware token loss mask mode for qwen_nav rollout.
+
+        0 = full response (format/schema stage)
+        1 = action/stop + bbox_2d/point_2d values (geometry stage)
+        2 = action/stop values only (navigation/full stage and default)
+        """
+        rcfg = getattr(self.cfg.env.train, "reward_curriculum", None)
+        enabled = bool(getattr(rcfg, "enabled", False)) if rcfg is not None else False
+        if not enabled:
+            return 2
+        step = int(self.global_step)
+        if step < int(getattr(rcfg, "format_steps", 0)):
+            return 0
+        if step < int(getattr(rcfg, "geometry_steps", 0)):
+            return 1
+        return 2
 
     def update_env_cfg(self):
         if not self.only_eval:
@@ -891,6 +917,388 @@ class EnvWorker(Worker):
             else:
                 env_metrics[key].append(value)
 
+    @staticmethod
+    def _tensor_scalar(value: Any, default: float = 0.0) -> float:
+        if value is None:
+            return default
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return default
+            return float(value.detach().reshape(-1)[0].cpu().item())
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return default
+            return float(value.reshape(-1)[0])
+        if isinstance(value, (list, tuple)):
+            if not value:
+                return default
+            return EnvWorker._tensor_scalar(value[0], default)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _policy_diag_from_forward_inputs(self, forward_inputs: dict | None) -> dict:
+        if not forward_inputs:
+            return {}
+        action = int(self._tensor_scalar(forward_inputs.get("action"), -1.0))
+        return {
+            "is_stop": action == 0,
+            "grounded_sam_enabled": bool(
+                self._tensor_scalar(forward_inputs.get("grounded_sam_enabled"), 0.0)
+            ),
+            "grounded_sam_used": bool(
+                self._tensor_scalar(forward_inputs.get("grounded_sam_used"), 0.0)
+            ),
+            "grounded_sam_detected": bool(
+                self._tensor_scalar(forward_inputs.get("grounded_sam_detected"), 0.0)
+            ),
+            "grounded_sam_confidence": self._tensor_scalar(
+                forward_inputs.get("grounded_sam_confidence"), 0.0
+            ),
+        }
+
+    def _grpo_diag_by_env(
+        self,
+        stage_id: int,
+        env_diag_snapshot: list[dict] | None = None,
+    ) -> dict[int, dict]:
+        diag_by_env = {
+            int(d.get("env_id", idx)): dict(d)
+            for idx, d in enumerate(env_diag_snapshot or [])
+            if isinstance(d, dict)
+        }
+        env_obj = self.env_list[stage_id]
+        target_env = getattr(env_obj, "env", env_obj)
+        if hasattr(target_env, "get_grpo_process_diagnostics"):
+            try:
+                for d in target_env.get_grpo_process_diagnostics():
+                    if not isinstance(d, dict):
+                        continue
+                    env_id = int(d.get("env_id", len(diag_by_env)))
+                    # Keep exact one-shot completion diagnostics when present, and
+                    # fill any missing slots from the read-only env snapshot. This
+                    # is diagnostic-only; rewards/advantages are already in
+                    # per_env_results and are not changed here.
+                    diag_by_env.setdefault(env_id, dict(d))
+            except Exception as exc:
+                print(
+                    f"[GRPO][group-diag] stage={stage_id} diagnostics unavailable: {exc}",
+                    flush=True,
+                )
+        return diag_by_env
+
+    @staticmethod
+    def _trajectory_reward_sum(result: EmbodiedRolloutResult) -> float:
+        total = 0.0
+        for reward in result.rewards:
+            if reward is not None:
+                total += float(reward.detach().float().sum().cpu().item())
+        return total
+
+    def _candidate_group_selection_cfg(self):
+        cfg = getattr(self.cfg.algorithm, "candidate_group_selection", None)
+        if cfg is None or not bool(cfg.get("enabled", False)):
+            return None
+        if bool(cfg.get("only_episode_overfit", True)):
+            overfit_cfg = getattr(self.cfg.env.train, "episode_overfit", None)
+            if overfit_cfg is None or not bool(overfit_cfg.get("enabled", False)):
+                return None
+        return cfg
+
+    def _candidate_record(
+        self,
+        env_i: int,
+        result: EmbodiedRolloutResult,
+        diag_by_env: dict[int, dict],
+    ) -> dict:
+        diag = dict(diag_by_env.get(env_i, {}))
+        success_type = str(diag.get("success_type", "unknown"))
+        success = float(diag.get("success", 0.0) or 0.0) > 0.5
+        return {
+            "env_i": env_i,
+            "episode_id": diag.get("episode_id", "?"),
+            "scene_id": diag.get("scene_id", "?"),
+            "reward_sum": self._trajectory_reward_sum(result),
+            "success": success,
+            "success_type": success_type,
+            "wrong_stop": success_type == "wrong_stop",
+            "no_stop": success_type == "no_stop",
+            "recovered": success_type == "recovered",
+            "best_dtg_progress": float(diag.get("best_dtg_progress", 0.0) or 0.0),
+            "final_dtg": float(diag.get("final_dtg", 0.0) or 0.0),
+            "min_dtg": float(diag.get("min_dtg", 0.0) or 0.0),
+            "final_regression": float(diag.get("final_regression", 0.0) or 0.0),
+            "steps_taken": float(diag.get("steps_taken", diag.get("steps", 0.0)) or 0.0),
+            "parse_fail_count": float(diag.get("parse_fail_count", diag.get("parse_fail", 0.0)) or 0.0),
+        }
+
+    @staticmethod
+    def _select_unique_candidate(
+        selected: list[int],
+        reasons: dict[int, str],
+        candidates: list[dict],
+        key_fn,
+        reason: str,
+        reverse: bool = True,
+        predicate=None,
+    ) -> None:
+        pool = [
+            c for c in candidates
+            if c["env_i"] not in selected and (predicate is None or predicate(c))
+        ]
+        if not pool:
+            return
+        pool = sorted(pool, key=key_fn, reverse=reverse)
+        env_i = int(pool[0]["env_i"])
+        selected.append(env_i)
+        reasons[env_i] = reason
+
+    def _select_candidate_group(
+        self,
+        env_metrics: dict[str, list],
+        stage_id: int,
+        per_env_results: list[EmbodiedRolloutResult],
+        env_diag_snapshot: list[dict] | None,
+    ) -> tuple[list[EmbodiedRolloutResult], list[dict]]:
+        cfg = self._candidate_group_selection_cfg()
+        if cfg is None:
+            return per_env_results, list(env_diag_snapshot or [])
+
+        candidate_k = int(cfg.get("candidate_k", len(per_env_results)))
+        train_group_size = int(cfg.get("train_group_size", self.cfg.algorithm.group_size))
+        if train_group_size <= 0 or len(per_env_results) <= train_group_size:
+            return per_env_results, list(env_diag_snapshot or [])
+
+        limited_results = per_env_results[: min(candidate_k, len(per_env_results))]
+        diag_by_env = self._grpo_diag_by_env(stage_id, env_diag_snapshot)
+        candidates = [
+            self._candidate_record(env_i, result, diag_by_env)
+            for env_i, result in enumerate(limited_results)
+        ]
+        if len(candidates) <= train_group_size:
+            return limited_results, [
+                dict(diag_by_env.get(i, {"env_id": i})) for i in range(len(limited_results))
+            ]
+
+        selected: list[int] = []
+        reasons: dict[int, str] = {}
+
+        # 1) Prefer true success/recovered if exploration produced one.
+        self._select_unique_candidate(
+            selected,
+            reasons,
+            candidates,
+            key_fn=lambda c: (c["success"], c["recovered"], c["reward_sum"], c["best_dtg_progress"]),
+            reason="success_or_recovered",
+            predicate=lambda c: c["success"] or c["recovered"],
+        )
+        # 2) Keep the best progress trajectory, even if it failed.
+        self._select_unique_candidate(
+            selected,
+            reasons,
+            candidates,
+            key_fn=lambda c: (c["best_dtg_progress"], c["reward_sum"]),
+            reason="top_progress",
+        )
+        # 3) Keep a wrong-stop representative; prefer one that got closer.
+        self._select_unique_candidate(
+            selected,
+            reasons,
+            candidates,
+            key_fn=lambda c: (c["best_dtg_progress"], -c["final_regression"], c["reward_sum"]),
+            reason="wrong_stop",
+            predicate=lambda c: c["wrong_stop"],
+        )
+        # 4) Keep a no-stop / strong regression hard negative.
+        self._select_unique_candidate(
+            selected,
+            reasons,
+            candidates,
+            key_fn=lambda c: (c["no_stop"], c["final_regression"], -c["reward_sum"]),
+            reason="no_stop_or_regression",
+            predicate=lambda c: c["no_stop"] or c["final_regression"] > 0.0,
+        )
+
+        # Fill with reward/progress diversity, not pure top-k.
+        remaining = [c for c in candidates if c["env_i"] not in selected]
+        if len(selected) < train_group_size and remaining:
+            by_reward = sorted(remaining, key=lambda c: c["reward_sum"])
+            fill_order: list[tuple[dict, str]] = []
+            fill_order.append((by_reward[-1], "reward_high"))
+            fill_order.append((by_reward[len(by_reward) // 2], "reward_mid"))
+            fill_order.append((by_reward[0], "reward_low"))
+            by_progress = sorted(remaining, key=lambda c: c["best_dtg_progress"], reverse=True)
+            fill_order.append((by_progress[0], "progress_fill"))
+            for cand, reason in fill_order:
+                env_i = int(cand["env_i"])
+                if env_i in selected:
+                    continue
+                selected.append(env_i)
+                reasons[env_i] = reason
+                if len(selected) >= train_group_size:
+                    break
+
+        for cand in candidates:
+            if len(selected) >= train_group_size:
+                break
+            env_i = int(cand["env_i"])
+            if env_i not in selected:
+                selected.append(env_i)
+                reasons[env_i] = "fallback"
+
+        selected = selected[:train_group_size]
+        selected_results = [limited_results[i] for i in selected]
+        selected_diag: list[dict] = []
+        for local_i, env_i in enumerate(selected):
+            d = dict(diag_by_env.get(env_i, {"env_id": env_i}))
+            d["original_env_id"] = env_i
+            d["env_id"] = local_i
+            selected_diag.append(d)
+
+        def _std(vals: list[float]) -> float:
+            if not vals:
+                return 0.0
+            return float(torch.tensor(vals, dtype=torch.float32).std(unbiased=False).item())
+
+        pool_rewards = [float(c["reward_sum"]) for c in candidates]
+        selected_records = [candidates[i] for i in selected]
+        selected_rewards = [float(c["reward_sum"]) for c in selected_records]
+        pool_progress = [float(c["best_dtg_progress"]) for c in candidates]
+        selected_progress = [float(c["best_dtg_progress"]) for c in selected_records]
+
+        def _metric(name: str, value: float) -> None:
+            env_metrics[name].append(torch.tensor([float(value)], dtype=torch.float32))
+
+        _metric("grpo/candidate_pool_reward_std", _std(pool_rewards))
+        _metric("grpo/candidate_selected_reward_std", _std(selected_rewards))
+        _metric("grpo/candidate_pool_best_progress_max", max(pool_progress) if pool_progress else 0.0)
+        _metric("grpo/candidate_selected_best_progress_max", max(selected_progress) if selected_progress else 0.0)
+        _metric("grpo/candidate_pool_success_rate", sum(c["success"] for c in candidates) / max(len(candidates), 1))
+        _metric("grpo/candidate_selected_success_rate", sum(c["success"] for c in selected_records) / max(len(selected_records), 1))
+
+        print(
+            "[GRPO][candidate-pool] "
+            f"stage={stage_id} candidate_k={len(candidates)} train_group_size={train_group_size} "
+            f"selected={selected} "
+            f"reward_sum={[round(c['reward_sum'], 3) for c in selected_records]} "
+            f"success_type={[c['success_type'] for c in selected_records]} "
+            f"best_progress={[round(c['best_dtg_progress'], 3) for c in selected_records]} "
+            f"final_regression={[round(c['final_regression'], 3) for c in selected_records]} "
+            f"selection_reason={[reasons.get(i, 'unknown') for i in selected]}",
+            flush=True,
+        )
+
+        return selected_results, selected_diag
+
+    def _record_grpo_group_diagnostics(
+        self,
+        env_metrics: dict[str, list],
+        stage_id: int,
+        per_env_results: list[EmbodiedRolloutResult],
+        env_diag_snapshot: list[dict] | None = None,
+    ) -> None:
+        group_size = int(getattr(self.cfg.algorithm, "group_size", 1) or 1)
+        if group_size <= 0:
+            group_size = 1
+        # AVSPO ACR uses a tiny numerical threshold for reward homogeneity:
+        # ACR = mean_j I(std(R_group_j) < tau), tau = 1e-6.
+        acr_threshold = float(
+            getattr(self.cfg.algorithm, "acr_reward_std_threshold", 1e-6)
+        )
+        low_std_threshold = float(
+            getattr(self.cfg.algorithm, "low_reward_std_threshold", 0.05)
+        )
+
+        diag_by_env = self._grpo_diag_by_env(stage_id, env_diag_snapshot)
+
+        reward_sums: list[float] = []
+        for result in per_env_results:
+            reward_sums.append(self._trajectory_reward_sum(result))
+
+        for group_start in range(0, len(per_env_results), group_size):
+            members = list(
+                range(group_start, min(group_start + group_size, len(per_env_results)))
+            )
+            if not members:
+                continue
+            vals = torch.tensor(
+                [reward_sums[i] for i in members], dtype=torch.float32
+            )
+            reward_mean = float(vals.mean().item())
+            reward_std = float(vals.std(unbiased=False).item()) if len(members) > 1 else 0.0
+            member_diag = [diag_by_env[i] for i in members if i in diag_by_env]
+            diag_count = len(member_diag)
+            diag_coverage = diag_count / max(len(members), 1)
+            full_diag = diag_count == len(members)
+
+            success_count = sum(float(d.get("success", 0.0)) > 0.5 for d in member_diag)
+            wrong_stop_count = sum(
+                str(d.get("success_type", "")) == "wrong_stop" for d in member_diag
+            )
+            no_stop_count = sum(
+                str(d.get("success_type", "")) == "no_stop" for d in member_diag
+            )
+            best_progress = [
+                float(d.get("best_dtg_progress", 0.0)) for d in member_diag
+            ]
+            if best_progress:
+                best_progress_t = torch.tensor(best_progress, dtype=torch.float32)
+                best_progress_mean = float(best_progress_t.mean().item())
+                best_progress_max = float(best_progress_t.max().item())
+                best_progress_std = (
+                    float(best_progress_t.std(unbiased=False).item())
+                    if len(best_progress) > 1
+                    else 0.0
+                )
+            else:
+                best_progress_mean = 0.0
+                best_progress_max = 0.0
+                best_progress_std = 0.0
+            all_failure = full_diag and success_count == 0
+            all_wrong_stop = full_diag and all_failure and wrong_stop_count == len(members)
+            ep_id = next(
+                (d.get("episode_id", "?") for d in member_diag if d.get("episode_id") not in (None, "")),
+                "?",
+            )
+
+            def _metric(name: str, value: float) -> None:
+                env_metrics[name].append(torch.tensor([float(value)], dtype=torch.float32))
+
+            _metric("grpo/acr", reward_std < acr_threshold)
+            _metric("grpo/low_reward_std_rate", reward_std < low_std_threshold)
+            _metric("grpo/group_diag_coverage", diag_coverage)
+            _metric("grpo/group_reward_std_mean", reward_std)
+            _metric("grpo/group_reward_mean", reward_mean)
+            if full_diag:
+                _metric("grpo/all_failure_group_rate", all_failure)
+                _metric("grpo/all_wrong_stop_group_rate", all_wrong_stop)
+                _metric("grpo/group_wrong_stop_count", wrong_stop_count)
+                _metric("grpo/group_no_stop_count", no_stop_count)
+            if diag_count > 0:
+                _metric("grpo/group_best_progress_mean", best_progress_mean)
+                _metric("grpo/group_best_progress_std", best_progress_std)
+
+            msg = (
+                f"[GRPO][group-diag] stage={stage_id} "
+                f"group={group_start // group_size} ep={ep_id} "
+                f"reward_mean={reward_mean:.3f} reward_std={reward_std:.6f} "
+                f"acr={int(reward_std < acr_threshold)} "
+                f"low_std={int(reward_std < low_std_threshold)} "
+                f"diag={diag_count}/{len(members)}"
+            )
+            if full_diag:
+                msg += (
+                    f" success_count={success_count} all_failure={int(all_failure)} "
+                    f"wrong_stop={wrong_stop_count} no_stop={no_stop_count}"
+                )
+            if diag_count > 0:
+                msg += (
+                    f" best_progress_max={best_progress_max:.2f} "
+                    f"best_progress_std={best_progress_std:.2f}"
+                )
+            print(msg, flush=True)
+
     def store_last_obs_and_intervened_info(self, env_output_list: list[EnvOutput]):
         self.last_obs_list = [env_output.obs for env_output in env_output_list]
         self.last_intervened_info_list = [
@@ -965,6 +1373,9 @@ class EnvWorker(Worker):
                 [None] * self.train_num_envs_per_stage
                 for _ in range(self.stage_num)
             ]
+            completed_episode_diag_by_stage: list[dict[int, dict]] = [
+                {} for _ in range(self.stage_num)
+            ]
         else:
             self.rollout_results: list[EmbodiedRolloutResult] = [
                 EmbodiedRolloutResult(
@@ -974,6 +1385,69 @@ class EnvWorker(Worker):
             ]
 
         env_metrics = defaultdict(list)
+
+        def _flush_pending_decision(stage_id: int, env_i: int) -> bool:
+            """Append one pending LLM decision with all rewards accumulated so far."""
+            pdata = pending_decision_data[stage_id][env_i]
+            if pdata is None:
+                return False
+
+            _env = self.env_list[stage_id]
+            if hasattr(_env, "compute_decision_ndtw_reward"):
+                policy_diag = self._policy_diag_from_forward_inputs(
+                    pdata.get("forward_inputs")
+                )
+                try:
+                    _ndtw_r = _env.compute_decision_ndtw_reward(
+                        [env_i],
+                        policy_diag_by_env={env_i: policy_diag},
+                    )
+                except TypeError:
+                    _ndtw_r = _env.compute_decision_ndtw_reward([env_i])
+                if hasattr(_env, "pop_gsam_reward_diagnostics"):
+                    for _name, _value in _env.pop_gsam_reward_diagnostics().items():
+                        env_metrics[_name].append(
+                            torch.tensor([float(_value)], dtype=torch.float32)
+                        )
+                acc_rewards[stage_id][env_i] += float(_ndtw_r[env_i])
+                if hasattr(_env, "pop_completed_episode_diagnostic"):
+                    try:
+                        _completed_diag = _env.pop_completed_episode_diagnostic(env_i)
+                    except Exception as exc:
+                        print(
+                            f"[GRPO][group-diag] stage={stage_id} env={env_i} "
+                            f"completed diagnostic unavailable: {exc}",
+                            flush=True,
+                        )
+                        _completed_diag = None
+                    if isinstance(_completed_diag, dict):
+                        completed_episode_diag_by_stage[stage_id][env_i] = _completed_diag
+
+            chunk_step_result = ChunkStepResult(
+                actions=pdata["actions"],
+                prev_logprobs=pdata["prev_logprobs"],
+                prev_values=pdata["prev_values"],
+                forward_inputs=pdata["forward_inputs"],
+                versions=pdata["versions"],
+                dones=pdata["dones"],
+                truncations=pdata["truncations"],
+                terminations=pdata["terminations"],
+                rewards=acc_rewards[stage_id][env_i:env_i + 1],
+            )
+            rollout_results_per_env[stage_id][env_i].append_step_result(
+                chunk_step_result
+            )
+            if pdata.get("save_flags") is not None:
+                rollout_results_per_env[stage_id][env_i].mark_last_step_with_flags(
+                    pdata["save_flags"]
+                )
+
+            acc_rewards[stage_id][env_i] = 0.0
+            acc_dones[stage_id][env_i] = False
+            acc_terminations[stage_id][env_i] = False
+            acc_truncations[stage_id][env_i] = False
+            pending_decision_data[stage_id][env_i] = None
+            return True
 
         for epoch in range(self.rollout_epoch):
             env_outputs = self.bootstrap_step()
@@ -985,8 +1459,15 @@ class EnvWorker(Worker):
                 # very first step also reads the global flag rather than its local
                 # all_done, keeping every step on the synchronized global path.
                 if use_decision_rollout:
+                    mask_mode_id = self._ppo_loss_mask_mode_id()
                     env_batch["obs"]["should_terminate"] = torch.zeros(
                         self.train_num_envs_per_stage, dtype=torch.bool,
+                        device=torch.device("cpu"),
+                    )
+                    env_batch["obs"]["ppo_loss_mask_mode_id"] = torch.full(
+                        (self.train_num_envs_per_stage,),
+                        int(mask_mode_id),
+                        dtype=torch.long,
                         device=torch.device("cpu"),
                     )
                 self.send_env_batch(
@@ -1044,6 +1525,8 @@ class EnvWorker(Worker):
                                             env_output.intervene_flags[env_i:env_i + 1],
                                         )
                             for env_i in range(self.train_num_envs_per_stage):
+                                _flush_pending_decision(stage_id, env_i)
+                            for env_i in range(self.train_num_envs_per_stage):
                                 bootstrap_step_result = ChunkStepResult(
                                     prev_values=(
                                         rollout_result.prev_values[env_i:env_i + 1]
@@ -1071,7 +1554,9 @@ class EnvWorker(Worker):
                         else:
                             is_dec = is_dec.cpu()
 
-                        # Detect dormant envs from task_descriptions
+                        # Detect dormant envs from the pre-action observation.
+                        # These slots should not flush a decision for the action
+                        # generated from this observation.
                         task_descs = env_output.obs.get("task_descriptions", None)
                         if task_descs is not None:
                             env_dormant = torch.tensor(
@@ -1081,28 +1566,35 @@ class EnvWorker(Worker):
                             env_dormant = torch.zeros(
                                 self.train_num_envs_per_stage, dtype=torch.bool, device=_cpu
                             )
-                        last_env_dormant[stage_id] = env_dormant
 
-                        # Accumulate rewards (with γ=1 across macro steps)
-                        if rewards is not None:
-                            # rewards shape: [B, num_action_chunks] or [B, 1]
-                            # Sum across chunk dim to get [B, 1]
-                            step_reward = rewards.sum(dim=-1, keepdim=True) if rewards.dim() > 1 else rewards
-                            acc_rewards[stage_id] += step_reward.cpu()
-                        # Accumulate done/term/trunc: any-done within the macro
-                        if env_output.dones is not None:
-                            step_done = env_output.dones.any(dim=-1, keepdim=True) if env_output.dones.dim() > 1 else env_output.dones
-                            acc_dones[stage_id] |= step_done.cpu()
-                        if env_output.terminations is not None:
-                            step_term = env_output.terminations.any(dim=-1, keepdim=True) if env_output.terminations.dim() > 1 else env_output.terminations
-                            acc_terminations[stage_id] |= step_term.cpu()
-                        if env_output.truncations is not None:
-                            step_trunc = env_output.truncations.any(dim=-1, keepdim=True) if env_output.truncations.dim() > 1 else env_output.truncations
-                            acc_truncations[stage_id] |= step_trunc.cpu()
+                        def _pre_action_done_tensor(value):
+                            if value is None:
+                                return torch.zeros(
+                                    self.train_num_envs_per_stage,
+                                    1,
+                                    dtype=torch.bool,
+                                    device=_cpu,
+                                )
+                            value = value.cpu()
+                            return (
+                                value.any(dim=-1, keepdim=True)
+                                if value.dim() > 1
+                                else value.reshape(-1, 1)
+                            )
+
+                        pre_step_done = _pre_action_done_tensor(env_output.dones)
+                        pre_step_term = _pre_action_done_tensor(env_output.terminations)
+                        pre_step_trunc = _pre_action_done_tensor(env_output.truncations)
 
                         # On decision steps: save current forward_inputs/logprobs for this env
                         for env_i in range(self.train_num_envs_per_stage):
                             if not is_dec[env_i]:
+                                continue
+                            if pending_decision_data[stage_id][env_i] is not None:
+                                _flush_pending_decision(stage_id, env_i)
+                            if env_dormant[env_i]:
+                                continue
+                            if decision_counts[stage_id][env_i] >= max_dec:
                                 continue
                             # Extract per-env slices
                             env_fi = {
@@ -1133,79 +1625,81 @@ class EnvWorker(Worker):
                                     if rollout_result.actions is not None
                                     else None
                                 ),
+                                # ChunkStepResult.dones is consumed by
+                                # compute_loss_mask() as the pre-action done
+                                # state.  Storing post-action done here masks
+                                # out the terminal action itself and removes the
+                                # reward-bearing STOP/no-stop gradient.
+                                "dones": pre_step_done[env_i:env_i + 1],
+                                "terminations": pre_step_term[env_i:env_i + 1],
+                                "truncations": pre_step_trunc[env_i:env_i + 1],
+                                "save_flags": (
+                                    rollout_result.save_flags[env_i:env_i + 1]
+                                    if rollout_result.save_flags is not None
+                                    else None
+                                ),
                             }
-
-                        # Decision-level nDTW: compute once per decision for all
-                        # flushing envs, then add to acc_rewards before flush.
-                        # This avoids per-step fastdtw calls and aligns credit
-                        # assignment with LLM decision granularity.
-                        _env = self.env_list[stage_id]
-                        if hasattr(_env, "compute_decision_ndtw_reward"):
-                            _flush_indices = [
-                                env_i
-                                for env_i in range(self.train_num_envs_per_stage)
-                                if (
-                                    is_dec[env_i]
-                                    and not env_dormant[env_i]
-                                    and decision_counts[stage_id][env_i] < max_dec
-                                    and pending_decision_data[stage_id][env_i] is not None
-                                )
-                            ]
-                            if _flush_indices:
-                                _ndtw_r = _env.compute_decision_ndtw_reward(_flush_indices)
-                                for _ei in _flush_indices:
-                                    acc_rewards[stage_id][_ei] += float(_ndtw_r[_ei])
-
-                        # Flush accumulated data on decision steps (for envs not yet at max_dec)
-                        for env_i in range(self.train_num_envs_per_stage):
-                            if not is_dec[env_i]:
-                                continue
-                            if env_dormant[env_i]:
-                                continue
-                            if decision_counts[stage_id][env_i] >= max_dec:
-                                continue
-
-                            pdata = pending_decision_data[stage_id][env_i]
-                            if pdata is None:
-                                continue
-
-                            chunk_step_result = ChunkStepResult(
-                                actions=pdata["actions"],
-                                prev_logprobs=pdata["prev_logprobs"],
-                                prev_values=pdata["prev_values"],
-                                forward_inputs=pdata["forward_inputs"],
-                                versions=pdata["versions"],
-                                dones=acc_dones[stage_id][env_i:env_i + 1],
-                                truncations=acc_truncations[stage_id][env_i:env_i + 1],
-                                terminations=acc_terminations[stage_id][env_i:env_i + 1],
-                                rewards=acc_rewards[stage_id][env_i:env_i + 1],
-                            )
-                            rollout_results_per_env[stage_id][env_i].append_step_result(
-                                chunk_step_result
-                            )
                             decision_counts[stage_id][env_i] += 1
 
-                            # Reset accumulators for this env
-                            acc_rewards[stage_id][env_i] = 0.0
-                            acc_dones[stage_id][env_i] = False
-                            acc_terminations[stage_id][env_i] = False
-                            acc_truncations[stage_id][env_i] = False
-                            pending_decision_data[stage_id][env_i] = None
-
-                        if rollout_result.save_flags is not None:
-                            # Mark last step for any env that just appended
-                            for env_i in range(self.train_num_envs_per_stage):
-                                if is_dec[env_i] and not env_dormant[env_i]:
-                                    n = len(rollout_results_per_env[stage_id][env_i].actions)
-                                    if n > 0:
-                                        rollout_results_per_env[stage_id][env_i].mark_last_step_with_flags(
-                                            rollout_result.save_flags[env_i:env_i + 1]
-                                        )
-
+                        # Execute the action before computing decision-level reward.
+                        # The reward belongs to the just-saved decision/action above.
+                        # Computing it before env_interact_step() binds reward to the
+                        # previous observation and can drop the terminal STOP/progress
+                        # segment entirely.
                         env_output, env_info = self.env_interact_step(
                             rollout_result.actions, stage_id
                         )
+
+                        rewards = self.compute_bootstrap_rewards(
+                            env_output, rollout_result.bootstrap_values, reward_model_output
+                        )
+
+                        # Accumulate rewards (with γ=1 across macro steps)
+                        if rewards is not None:
+                            # rewards shape: [B, num_action_chunks] or [B, 1]
+                            # Sum across chunk dim to get [B, 1]
+                            step_reward = rewards.sum(dim=-1, keepdim=True) if rewards.dim() > 1 else rewards
+                            acc_rewards[stage_id] += step_reward.cpu()
+                        # Accumulate done/term/trunc from the action result.
+                        if env_output.dones is not None:
+                            acc_dones[stage_id] |= _pre_action_done_tensor(env_output.dones)
+                        if env_output.terminations is not None:
+                            acc_terminations[stage_id] |= _pre_action_done_tensor(env_output.terminations)
+                        if env_output.truncations is not None:
+                            acc_truncations[stage_id] |= _pre_action_done_tensor(env_output.truncations)
+
+                        # Terminal decisions must be flushed immediately after the
+                        # env step that completed the episode. Once GenArk marks a
+                        # slot done, the next obs is dormant (empty instruction), so
+                        # waiting for the next decision boundary can leave the STOP /
+                        # timeout reward detached from the action that caused it.
+                        terminal_now = (
+                            _pre_action_done_tensor(env_output.dones)
+                            | _pre_action_done_tensor(env_output.terminations)
+                            | _pre_action_done_tensor(env_output.truncations)
+                        )
+                        for env_i in range(self.train_num_envs_per_stage):
+                            if bool(terminal_now[env_i].item()):
+                                _flush_pending_decision(stage_id, env_i)
+
+                        # Non-terminal decisions stay pending while cached low-level
+                        # actions replay, accumulating rewards into acc_rewards. They
+                        # are flushed at the next LLM decision boundary or bootstrap.
+
                         env_batch = env_output.to_dict()
+                        next_task_descs = env_batch["obs"].get("task_descriptions", None)
+                        if next_task_descs is not None:
+                            last_env_dormant[stage_id] = torch.tensor(
+                                [desc == "" for desc in next_task_descs],
+                                dtype=torch.bool,
+                                device=_cpu,
+                            )
+                        else:
+                            last_env_dormant[stage_id] = torch.zeros(
+                                self.train_num_envs_per_stage,
+                                dtype=torch.bool,
+                                device=_cpu,
+                            )
                         # Global termination signal for synchronized rollout-rank exit.
                         # The env worker is the sole coordinator: it sees every stage's
                         # decision_counts/dormant state (the full global batch), so it
@@ -1226,6 +1720,12 @@ class EnvWorker(Worker):
                             (self.train_num_envs_per_stage,),
                             bool(should_terminate),
                             dtype=torch.bool,
+                            device=_cpu,
+                        )
+                        env_batch["obs"]["ppo_loss_mask_mode_id"] = torch.full(
+                            (self.train_num_envs_per_stage,),
+                            int(self._ppo_loss_mask_mode_id()),
+                            dtype=torch.long,
                             device=_cpu,
                         )
                         self.send_env_batch(
@@ -1256,6 +1756,9 @@ class EnvWorker(Worker):
                                     env_output.intervene_actions[env_i:env_i + 1],
                                     env_output.intervene_flags[env_i:env_i + 1],
                                 )
+
+                    for env_i in range(self.train_num_envs_per_stage):
+                        _flush_pending_decision(stage_id, env_i)
 
                     reward_model_output = None
                     if reward_channel is not None:
@@ -1507,6 +2010,29 @@ class EnvWorker(Worker):
                         assert all(
                             len(r.versions) == n_steps for r in per_env_results
                         ), "decision rollout padding incomplete: versions length mismatch"
+
+                    selected_diag_snapshot = list(
+                        completed_episode_diag_by_stage[stage_id].values()
+                    )
+                    per_env_results, selected_diag_snapshot = (
+                        self._select_candidate_group(
+                            env_metrics,
+                            stage_id,
+                            per_env_results,
+                            selected_diag_snapshot,
+                        )
+                    )
+                    n_envs = len(per_env_results)
+                    if n_envs == 0:
+                        continue
+                    ref_result = next(r for r in per_env_results if r.actions)
+
+                    self._record_grpo_group_diagnostics(
+                        env_metrics,
+                        stage_id,
+                        per_env_results,
+                        selected_diag_snapshot,
+                    )
 
                     merged = EmbodiedRolloutResult(
                         max_episode_length=self.cfg.env.train.max_episode_steps,

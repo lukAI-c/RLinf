@@ -30,13 +30,13 @@ cluster:
   num_nodes: 1
   component_placement:
     rollout:
-      placement: "6-7"      # physical GPUs 6,7 → 2-GPU rollout (FSDP)
+      placement: "4-7"      # physical GPUs 4,5,6,7 → 4-GPU rollout (vLLM ranks)
     actor:
-      placement: "6-7"      # collocated with rollout
+      placement: "4-7"      # collocated with rollout (FSDP world_size 4)
     env:
-      placement: "4-5:0"    # 1 env worker process that "owns" physical GPUs 4,5
-                            # K=8 GenesisSceneActors packed onto 2 GPUs
-                            # (scenes_per_gpu=4; our own cards, no external jobs)
+      placement: "0-3:0"    # 1 env worker process that "owns" physical GPUs 0,1,2,3
+                            # 8 GenesisSceneActors packed onto 4 GPUs
+                            # (scenes_per_gpu=2; 2 scenes/GPU proven ~42GB)
 
 runner:
   task_type: embodied
@@ -60,6 +60,11 @@ algorithm:
   normalize_advantages: True
   kl_penalty: kl
   group_size: 4               # 4 episodes per instruction for GRPO
+  # AVSPO ACR collapse threshold: tau=1e-6 is a numerical-precision
+  # threshold for reward homogeneity, not a task-tuned low-variance cutoff.
+  acr_reward_std_threshold: 1.0e-6
+  # Separate engineering diagnostic: weak but nonzero reward variance.
+  low_reward_std_threshold: 0.05
 
   # Decision-rollout path caps each env at max_decisions_per_rollout_epoch within
   # ONE epoch (decision_counts/rollout_results_per_env persist across the epoch
@@ -112,23 +117,40 @@ env:
 
   train:
     # ── Multi-scene config ────────────────────────────────────────────────────
-    # 1 env worker, K=8 scenes, 32 slots → K_s=4 slots/scene (1 GRPO group each).
-    # 2 env GPUs (4,5) × scenes_per_gpu=4 = capacity 8 → 4 scenes packed per GPU.
-    # group_size=4 → 8 GRPO groups/rollout epoch (one per scene).
+    # DIAGNOSTIC SPEED MODE: K=4 scenes, 16 slots → K_s=4 slots/scene (1 GRPO group
+    # each). Halved from 28/7 to iterate ~1.5x faster while verifying the reward-
+    # shaping fix (lucky_start SR gate + success_distance 3 + flat wrong_stop).
+    # group_size=4 REQUIRES K_s>=4 → 16 slots ⇒ exactly 4 scenes (can't keep 7).
+    # Picked the 4 highest-episode-count scenes from the prior 7-list (zsNo=20,
+    # QUCTc=16, 2azQ=14, TbHJr=14). Scale back to 28/7 once real clean SR appears.
+    # 2 env GPUs (4,5) × scenes_per_gpu=4 = capacity 8 → 4 scenes fit easily.
+    # group_size=4 → 4 GRPO groups/rollout epoch (one per scene).
     # rollout_epoch MUST be 1 for the decision-rollout path (see algorithm block).
     # global_batch_size = 128, micro_batch_size = 1, actor world_size = 2
-    #   → 128 / (1 × 2) = 64 gradient accumulation steps ✓
-    # NOTE: 32 slots ≈ 4× rollout inference cost vs the K=2/8-slot config.
-    #       Covers all 8 scenes with >= group_size episodes (2 tiny scenes with
-    #       1 / 3 episodes can't fill a group_size=4 block and are excluded).
+    #   → 128 / (1 × 2) = 64 gradient accumulation steps ✓ (independent of slots)
     # ─────────────────────────────────────────────────────────────────────────
-    total_num_envs: 32            # 1 worker × 32 slots (K_s=4 per scene × K=8)
+    # ── MODE A (8 GPU, OpenNav R2R-CE 100 subset) ────────────────────────────
+    # Use the curated OpenNav_R2R-CE_100_bertidx.json episode subset for training.
+    # The scene list below should stay within scenes with available GLB meshes.
+    # 8 scenes × group_size 4 = 32 slots. env on GPU 0-3 (scenes_per_gpu=2 → cap 8),
+    # rollout+actor on GPU 4-7 (world_size 4 → global_batch 128/(1×4)=32 grad-accum ✓).
+    # ─────────────────────────────────────────────────────────────────────────
+    episodes_file: /home/clk/workspace/genark/data/datasets/OpenNav_R2R-CE_100_bertidx.json
+    total_num_envs: 32            # 8 scenes × K_s=4 slots/scene
     genesis_backend: multiscene
     multi_scene:
-      scene_count: 8             # K=8 scenes per worker (all coverable scenes)
-      scenes_per_gpu: 4          # pack up to 4 scene actors per physical GPU
-      scenes: null
-      gpu_budget: 2              # physical GPUs 4,5; capacity = 2 × 4 = 8
+      scene_count: 8             # 8 OpenNav scenes with >=4 episodes
+      scenes_per_gpu: 2          # 2 scene actors per GPU (~42GB proven)
+      scenes:
+        - "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb"
+        - "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb"
+        - "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb"
+        - "mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb"
+        - "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb"
+        - "mp3d/x8F5xyUWy9e/x8F5xyUWy9e.glb"
+        - "mp3d/X7HyMhZNoso/X7HyMhZNoso.glb"
+        - "mp3d/EU6Fwq7SyZv/EU6Fwq7SyZv.glb"
+      gpu_budget: 4              # physical GPUs 0-3; capacity = 4 × 2 = 8
 
     reward_coef: ${algorithm.reward_coef}
     group_size: ${algorithm.group_size}
@@ -140,34 +162,85 @@ env:
 
     cyclic_episode_sampling: true
     episode_balanced_sampling: true   # within-scene (seen_count, success_rate) balanced sampling
-    curriculum_dtg_start: 5.0         # cold-start: only episodes ≤5m (match success_distance)
+    curriculum_dtg_start: 5.0         # cold-start: only episodes ≤5m euclidean. With
+                                      # success_distance=3, these need 0–2m real nav.
     curriculum_dtg_step: 5.0          # each coverage pass unlocks +5m (5→10→15→… up to full pool)
     reward_mode: "decision_nav"   # geo_ndtw→decision_nav: per-DECISION DTG progress
                                   # (net meters closer, clip ±2) — dense gradient WITHOUT
                                   # macro-length bias (why geo_coef was kept 0). Activates
                                   # the already-set decision_dtg_coef=1.0.
+    # Reward profile:
+    #   nav             = task reward for navigation / correct STOP.
+    #   format_learning = schema + bbox warm-up for cold-start checkpoints.
+    reward_profile: "nav"
     decision_level_ndtw: true
     geo_coef: 0.0
-    ndtw_coef: 1.0
+    ndtw_coef: 0.5
     sr_coef: 2.0
-    format_reward_coef: 0.2        # 0.0→0.2: direct schema correctness signal (parse_fail ~35%)
+    # LaViRA waypoint schema shaping: dense valid-schema reward capped per episode,
+    # plus bbox/point geometry reward via ACTION_PARSE_OK_HAS_BBOX sentinel.
+    format_reward_coef: 0.05
+    format_reward_cap: 1.0
+    structured_reward_cap: 1.0
+    json_reward_coef: 0.05
+    struct_reward_coef: 0.05
+    field_format_reward_coef: 0.05
+    length_reward_coef: 0.02
+    bbox_reward_cap: 2.0
+    bbox_reward_coef: 0.2
+    parse_fail_penalty: -1.0
     decision_dtg_coef: 1.0         # no-op in geo_ndtw mode (only used by decision_nav)
     decision_dtg_clip: 2.0
+    # DTG process reward + GroundedSAM gated bonus. Defaults stay off so existing
+    # runs preserve old rewards unless a launch script explicitly enables them.
+    process_reward_enabled: false
+    process_progress_coef: 0.2
+    process_progress_cap: 1.0
+    process_regression_penalty: -0.2
+    process_regression_margin: 1.0
+    gsam_reward_enabled: false
+    gsam_detect_progress_bonus: 0.05
     enable_4dir_render: true
-    # Aligned with the proven single-scene lora run (run_qwen_rft.sh):
-    # wrong_stop_penalty -0.5(code default)→-2.0 strengthens the early-stop
-    # penalty so the model is pushed to keep exploring instead of STOP-ing early
-    # (96% of episodes were wrong_stop). success_distance 3.0→5.0 widens the
-    # success threshold so cold-start GRPO groups get positive samples and
-    # within-group reward variance (otherwise advantages collapse to 0).
-    wrong_stop_penalty: -2.0
-    success_distance: 5.0
+    # Reward-shaping fix (degenerate "STOP-in-place" optimum diagnosis):
+    # - success_distance 5.0→3.0: 5m was so wide that curriculum-spawned (≤5m)
+    #   episodes were "born successful" → STOP immediately harvested +sr_coef for
+    #   ~0 navigation. 3m forces real approach (paired with lucky_start SR gate in
+    #   genark_env._compute_ndtw_sr_delta_reward — born-within-3m gets NO SR).
+    # - wrong_stop_penalty -2.0→-0.5 flat by default.  For the STOP ablation,
+    #   conditional_wrong_stop_penalty can be enabled from the launch script to
+    #   scale this penalty by clipped stop_dtg/start_dtg.
+    wrong_stop_penalty: -0.5
+    conditional_wrong_stop_penalty: false
+    conditional_wrong_stop_ratio_min: 0.5
+    conditional_wrong_stop_ratio_max: 2.0
+    success_distance: 3.0
 
     scene_offset: 0
 
   eval:
-    total_num_envs: 4
-    genesis_backend: local        # eval uses single-scene local backend
+    # ── Multi-scene eval ───────────────────────────────────────────────────────
+    # Evaluate on the same OpenNav_R2R-CE_100_bertidx.json file.  Eval uses
+    # group_size=1, so the low-count scenes (3 eps / 1 ep) are valid here even
+    # though they are excluded from train's group_size=4 layout.
+    # ───────────────────────────────────────────────────────────────────────────
+    episodes_file: /home/clk/workspace/genark/data/datasets/OpenNav_R2R-CE_100_bertidx.json
+    total_num_envs: 10
+    genesis_backend: multiscene
+    multi_scene:
+      scene_count: 10
+      scenes_per_gpu: 3
+      scenes:
+        - "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb"
+        - "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb"
+        - "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb"
+        - "mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb"
+        - "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb"
+        - "mp3d/x8F5xyUWy9e/x8F5xyUWy9e.glb"
+        - "mp3d/X7HyMhZNoso/X7HyMhZNoso.glb"
+        - "mp3d/EU6Fwq7SyZv/EU6Fwq7SyZv.glb"
+        - "mp3d/oLBMNvg9in8/oLBMNvg9in8.glb"
+        - "mp3d/8194nk5LbLH/8194nk5LbLH.glb"
+      gpu_budget: 4
     group_size: 1
     max_episode_steps: 80
     max_steps_per_rollout_epoch: 400
@@ -175,7 +248,7 @@ env:
     ignore_terminations: True
     reward_mode: "geo_progress"
     enable_4dir_render: true
-    success_distance: 5.0          # match train threshold (proven single-scene)
+    success_distance: 3.0          # match train threshold (reverted 5.0→3.0)
     scene_offset: 0
     video_cfg:
       save_video: True
@@ -183,9 +256,23 @@ env:
 
 rollout:
   group_name: "RolloutGroup"
-  backend: "huggingface"
+  backend: "vllm_embodied"          # vllm_embodied | huggingface
   enable_offload: False
   pipeline_stage_num: 1
+
+  # ── vLLM engine parameters (only used when backend=vllm_embodied) ─────────
+  tensor_parallel_size: 1           # 1 GPU per vLLM engine (shares GPU 6,7 with FSDP actor)
+  gpu_memory_utilization: 0.18      # opt2 sleep is DISABLED (vLLM mm-cache corrupts across
+                                    # sleep/wake), so vLLM stays resident during the actor
+                                    # train step. With opt1 (rollout HF on CPU, ~14G freed):
+                                    # actor(~49G)+vLLM(0.18→~16G)+HF(CPU,0)=~65G/79G — fits.
+                                    # KV concurrency doesn't bottleneck rollout (Genesis-bound).
+  vllm_sleep_offload: false         # do NOT enable until vLLM sleep/wake mm-cache bug fixed
+  max_model_len: 4096
+  max_num_seqs: 32
+  enforce_eager: true               # skip CUDA graph capture for first run; set false once stable
+  enable_sleep_mode: true           # release KV cache when actor is training
+  # ─────────────────────────────────────────────────────────────────────────
   model:
     model_type: "qwen_nav"
     model_path: ${actor.model.model_path}
@@ -202,6 +289,7 @@ rollout:
     trust_remote_code: ${actor.model.trust_remote_code}
     attn_implementation: ${actor.model.attn_implementation}
     image_size: ${actor.model.image_size}
+    grounded_sam: ${actor.model.grounded_sam}
     is_lora: ${actor.model.is_lora}
     lora_rank: ${actor.model.lora_rank}
     lora_alpha: ${actor.model.lora_alpha}
@@ -221,6 +309,9 @@ actor:
 
   model:
     collect_forward_inputs: true
+    # flash_attn not installed in genesis-vllm (vLLM backend replaces generation
+    # anyway). Use sdpa for HF forward/logprob path; vLLM uses its own kernel.
+    attn_implementation: "sdpa"
     # Memory-footprint overrides matching the proven single-scene lora run.
     # Without these the base qwen_nav defaults (max_new_tokens=512,
     # history_max_frames=8, action_dim=512) inflate the rollout KV-cache +
@@ -228,7 +319,7 @@ actor:
     # env.train.model / rollout via the ${actor.model.*} references.
     action_dim: 256                 # was 512
     max_new_tokens: 256             # base 512 → 256 (shorter gen, smaller KV cache)
-    history_max_frames: 4           # base 8 → 4 (fewer vision tokens)
+    history_max_frames: 2           # base 8 → 4 (fewer vision tokens)
     chunk_size: 16                  # base 4 → 16 (matches single-scene)
     # LoRA (matches the proven single-scene config). Full FT (is_lora=false) of
     # Qwen3.5-4B needs ~48GB (model+grad+Adam fp32 states) and OOMs when the env
@@ -253,6 +344,14 @@ actor:
 
   fsdp_config:
     strategy: "fsdp"
+    # MUST stay False: Qwen3_5GatedDeltaNet is a recurrent *stateful* layer (delta-rule
+    # linear attention updates a running hidden state per token). torch.utils.checkpoint
+    # assumes the checkpointed fn is PURE — recomputing the stateful layer in backward
+    # corrupts logprobs, so the prev-recompute path (no_grad, no ckpt) diverges from the
+    # training forward (ckpt) → PPO ratio mismatch, amplified by action-level token-sum
+    # → exp() blows up to 1e9~1e20. We briefly set True to fix a collocation OOM, but
+    # opt1 (rollout HF parked on CPU) + opt2 (vLLM sleep during actor train) already free
+    # ~42G, so the actor's ~49G fits without checkpointing. Keep False.
     gradient_checkpointing: False
     mixed_precision:
       param_dtype: bf16

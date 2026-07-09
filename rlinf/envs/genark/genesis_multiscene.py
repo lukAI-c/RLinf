@@ -145,16 +145,22 @@ class SceneLayout:
                     f"num_envs={num_envs} may be too small for {K} scenes."
                 )
 
-        # Bug #5: fully-active blocks
+        # Bug #5: each GROUP needs one distinct episode (not each slot).
+        # A group's group_size slots all replay the SAME episode (standard GRPO —
+        # see GenarkVecEnv._assign_episodes_to_envs: pool indexed by local_group,
+        # not by slot). So a scene block of k_s slots = k_s//gs groups needs only
+        # k_s//gs distinct episodes, NOT k_s. The old `eps_count < k_s` guard was
+        # over-strict and wrongly excluded small scenes (e.g. 1-/3-episode scans).
         for s, scene_id in enumerate(scenes):
             eps_count = episode_counts[s]
             k_s = sizes[s]
-            if eps_count < k_s:
+            n_groups_s = k_s // gs
+            if eps_count < n_groups_s:
                 raise ValueError(
                     f"SceneLayout: scene '{scene_id}' has only {eps_count} episodes "
-                    f"but was allocated {k_s} slots. "
+                    f"but was allocated {k_s} slots = {n_groups_s} GRPO groups. "
                     f"Either reduce scene_count, reduce num_envs, or use a scene with "
-                    f">= {k_s} episodes."
+                    f">= {n_groups_s} episodes."
                 )
 
         slot_to_scene_idx = np.empty(num_envs, dtype=np.int32)

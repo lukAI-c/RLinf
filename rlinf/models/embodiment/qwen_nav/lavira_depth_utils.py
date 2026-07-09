@@ -117,3 +117,52 @@ def project_bbox_to_world(
     world_z = hab_z + local_z * sin_h - local_x * cos_h
 
     return np.array([world_x, world_z], dtype=np.float32)
+
+
+def project_point_to_world(
+        point_2d:    list,            # [x,y] in 0-1000 normalised space
+        depth_hw:    np.ndarray,      # (H, W) float32, metric metres
+        gen_yaw_rad: float,           # Genesis cam_yaw (rad); 0=+X, CCW positive
+        hab_x:       float,           # Habitat agent X (metres)
+        hab_z:       float,           # Habitat agent Z (metres) = −Genesis Y
+        K:           Optional[np.ndarray] = None,
+        render_w:    int   = _DEFAULT_RENDER_W,
+        render_h:    int   = _DEFAULT_RENDER_H,
+        window_px:   int   = 5,
+) -> Optional[np.ndarray]:
+    """
+    Project a normalized point_2d to Habitat world (XZ) coordinates.
+
+    Depth is taken as the median in a small window around the point so one bad
+    depth pixel does not kill the planner target. Returns None if depth is invalid.
+    """
+    if K is None:
+        K = _DEFAULT_K
+
+    x, y = point_2d
+    H, W = depth_hw.shape
+    u = max(0, min(int(round(x / 1000.0 * W)), W - 1))
+    v = max(0, min(int(round(y / 1000.0 * H)), H - 1))
+
+    r = max(1, int(window_px))
+    x1, x2 = max(0, u - r), min(W, u + r + 1)
+    y1, y2 = max(0, v - r), min(H, v + r + 1)
+    roi = depth_hw[y1:y2, x1:x2]
+    valid_mask = (roi > 0) & np.isfinite(roi) & (roi < _MAX_DEPTH_M)
+    valid_depths = roi[valid_mask]
+    if len(valid_depths) == 0:
+        return None
+    depth = float(np.median(valid_depths))
+
+    K_inv = np.linalg.inv(K)
+    cam = depth * (K_inv @ np.array([float(u), float(v), 1.0], dtype=np.float64))
+    local_x = float(cam[0])
+    local_z = float(cam[2])
+
+    heading = -gen_yaw_rad
+    cos_h = math.cos(heading)
+    sin_h = math.sin(heading)
+
+    world_x = hab_x + local_z * cos_h + local_x * sin_h
+    world_z = hab_z + local_z * sin_h - local_x * cos_h
+    return np.array([world_x, world_z], dtype=np.float32)
