@@ -110,19 +110,17 @@ env:
 
     cyclic_episode_sampling: true   # reshuffle pool when exhausted (train only)
     episode_balanced_sampling: false  # P1: balanced scene-internal episode coverage (default off)
-    reward_mode: "geo_ndtw"         # "geo_progress" | "ndtw_sr_delta" | "geo_ndtw" | "decision_nav"
-    # geo_ndtw    = geo_progress (per step, dense) + decision-level nDTW (per decision) + SR
-    # decision_nav = decision-level DTG + decision-level nDTW + SR (no step-level geo)
-    #   DTG reward = clip(DTG_before - DTG_after, -dtg_clip, dtg_clip), asymmetric:
-    #   positive progress × 1.0, regression × 0.5 (preserve exploration)
+    reward_mode: "geo_ndtw"         # low-level geo progress + terminal navigation reward
     decision_level_ndtw: true       # nDTW computed once per LLM decision (not per env step)
-    geo_coef: 0.0                   # 0=关闭 step-level geo_progress（宏动作长度偏差+early-stop下无效）
+    geo_coef: 0.1
+    geo_step_clip: 0.5
     ndtw_coef: 1.0                  # scales decision-level nDTW delta
     sr_coef: 2.0                    # 10.0→2.0: 与 nDTW/geo 同量级，降低 advantage 方差
     format_reward_coef: 0.0         # 0 = pure navigation signal (set > 0 only for cold-start)
-    # decision_nav mode params (ignored in other modes)
-    decision_dtg_coef: 1.0          # scales decision-level DTG delta
-    decision_dtg_clip: 2.0          # clip reward to [-dtg_clip, dtg_clip] per decision
+    nav_terminal_reward_enabled: false
+    nav_path_coef: 1.0
+    nav_endpoint_coef: 1.0
+    nav_endpoint_decay: 0.2
     enable_4dir_render: true
 
     scene_offset: 0

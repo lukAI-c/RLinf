@@ -66,11 +66,14 @@ env:
 
     reward_mode: "decision_nav"
     decision_level_ndtw: true
-    geo_coef: 0.0
+    geo_coef: 0.1
+    geo_step_clip: 0.5
     ndtw_coef: 0.5
     sr_coef: 2.0
-    decision_dtg_coef: 1.0
-    decision_dtg_clip: 2.0
+    nav_terminal_reward_enabled: false
+    nav_path_coef: 1.0
+    nav_endpoint_coef: 1.0
+    nav_endpoint_decay: 0.2
     # LaViRA waypoint schema shaping: dense but capped.  This overfit run first
     # needs to leave the parse-fail regime before navigation reward can dominate.
     format_reward_coef: 0.05
@@ -83,6 +86,7 @@ env:
     bbox_reward_cap: 2.0
     bbox_reward_coef: 0.2
     parse_fail_penalty: -1.0
+    no_stop_penalty: 0.0
     wrong_stop_penalty: -0.5
     success_distance: 3.0
     reward_curriculum:

@@ -296,9 +296,16 @@ class GenarkVecEnv(gym.Env):
         self.geo_coef        = float(getattr(cfg, "geo_coef",  1.0))
         self.ndtw_coef       = float(getattr(cfg, "ndtw_coef", 1.0))
         self.sr_coef         = float(getattr(cfg, "sr_coef",   10.0))
-        # decision_nav mode params
-        self.decision_dtg_coef  = float(getattr(cfg, "decision_dtg_coef",  1.0))
-        self.decision_dtg_clip  = float(getattr(cfg, "decision_dtg_clip",  2.0))
+        # Navigation reward: low-level geometric progress plus terminal
+        # path/endpoint quality.  The terminal terms follow Nav-R1's
+        # trajectory-fidelity + endpoint formulation.
+        self.nav_terminal_reward_enabled = bool(
+            getattr(cfg, "nav_terminal_reward_enabled", False)
+        )
+        self.nav_path_coef = float(getattr(cfg, "nav_path_coef", 1.0))
+        self.nav_endpoint_coef = float(getattr(cfg, "nav_endpoint_coef", 1.0))
+        self.nav_endpoint_decay = float(getattr(cfg, "nav_endpoint_decay", 0.2))
+        self.geo_step_clip = float(getattr(cfg, "geo_step_clip", 0.5))
         # decision_level_ndtw: when True and reward_mode="ndtw_sr_delta", skip per-step
         # nDTW computation in step(). nDTW delta is computed once per LLM decision via
         # compute_decision_ndtw_reward(), called by env_worker at decision flush time.
@@ -364,6 +371,10 @@ class GenarkVecEnv(gym.Env):
         # from the goal (DTG > success_distance * wrong_stop_dist_factor).
         # Episode still ends (STOP is honored); penalty makes "give-up stop" costly.
         self.wrong_stop_penalty = float(getattr(cfg, "wrong_stop_penalty", -0.5))
+        # no_stop_penalty: applied once when an episode times out without STOP.
+        # Keep this weaker than a far wrong STOP so the model does not learn to
+        # stop randomly just to avoid timeout.
+        self.no_stop_penalty = float(getattr(cfg, "no_stop_penalty", 0.0))
         self.wrong_stop_dist_factor = float(getattr(cfg, "wrong_stop_dist_factor", 1.5))
         # Optional experiment-1 STOP shaping: replace the flat wrong_stop penalty
         # with a distance-conditioned penalty.  Disabled by default so baseline
@@ -384,8 +395,6 @@ class GenarkVecEnv(gym.Env):
         self.process_reward_enabled = bool(getattr(cfg, "process_reward_enabled", False))
         self.process_progress_coef = float(getattr(cfg, "process_progress_coef", 0.2))
         self.process_progress_cap = float(getattr(cfg, "process_progress_cap", 1.0))
-        self.process_regression_penalty = float(getattr(cfg, "process_regression_penalty", -0.2))
-        self.process_regression_margin = float(getattr(cfg, "process_regression_margin", 1.0))
         # GroundedSAM reward is intentionally gated by DTG progress; raw detection
         # confidence is diagnostic only and never used directly as reward.
         self.gsam_reward_enabled = bool(getattr(cfg, "gsam_reward_enabled", False))
@@ -490,6 +499,9 @@ class GenarkVecEnv(gym.Env):
         self._slot_active = np.zeros(num_envs, dtype=bool)   # set after scene pinning
         self._slot_done   = np.zeros(num_envs, dtype=bool)
         self._episode_log: list[dict] = []
+        self._reward_component_totals: list[dict[str, float]] = [
+            {} for _ in range(num_envs)
+        ]
         self._last_completed_diag_by_env: list[dict | None] = [None] * num_envs
         self._completed_diag_event_by_env: list[dict | None] = [None] * num_envs
         # One-shot bridge for terminal decision rewards.  In cyclic train mode a
@@ -760,6 +772,7 @@ class GenarkVecEnv(gym.Env):
                 "bbox": max(self.bbox_reward_coef, 0.50),
                 "parse_fail": min(self.parse_fail_penalty, -1.0),
                 "wrong_stop": 0.0,
+                "no_stop": 0.0,
             }
         if profile != "nav":
             raise ValueError(
@@ -769,7 +782,6 @@ class GenarkVecEnv(gym.Env):
         return {
             "ndtw": self.ndtw_coef,
             "sr": self.sr_coef,
-            "dtg": self.decision_dtg_coef,
             "json": self.json_reward_coef,
             "struct": self.struct_reward_coef,
             "field_format": self.field_format_reward_coef,
@@ -778,6 +790,7 @@ class GenarkVecEnv(gym.Env):
             "bbox": self.bbox_reward_coef,
             "parse_fail": self.parse_fail_penalty,
             "wrong_stop": self.wrong_stop_penalty,
+            "no_stop": self.no_stop_penalty,
         }
 
     def _assign_episodes_to_envs(self, env_idx: Optional[list[int]] = None):
@@ -920,6 +933,9 @@ class GenarkVecEnv(gym.Env):
         valid_idx = [i for i in env_idx if self._episodes[i] is not None]
         if not valid_idx:
             return
+
+        for i in valid_idx:
+            self._reward_component_totals[i] = {}
 
         positions = torch.zeros(len(valid_idx), 3, dtype=torch.float32)
         yaws      = torch.zeros(len(valid_idx),    dtype=torch.float32)
@@ -1162,11 +1178,15 @@ class GenarkVecEnv(gym.Env):
             )
             reward = geo_reward + sr_and_ndtw
         elif self.reward_mode == "decision_nav":
-            # Decision-level DTG + decision-level nDTW + terminal STOP reward.
-            # All navigation/STOP rewards are settled in compute_decision_ndtw_reward()
-            # at decision flush time.  Do not compute SR here: STOP marks
-            # _active_mask=False before this point, which would drop successful STOP.
-            reward = torch.zeros_like(curr_dist)
+            # Dense low-level potential shaping. EnvWorker accumulates these
+            # physical-step rewards into the current LLM decision; terminal
+            # path/endpoint and STOP rewards are added at decision flush.
+            dense_progress = self._prev_geo_dist.to(curr_dist.device) - curr_dist
+            reward = torch.clamp(
+                self.geo_coef * dense_progress,
+                min=-self.geo_step_clip,
+                max=self.geo_step_clip,
+            )
         else:
             # Default: dense d2g progress + sparse success bonus
             reward = self._prev_geo_dist.to(curr_dist.device) - curr_dist
@@ -1174,16 +1194,15 @@ class GenarkVecEnv(gym.Env):
             reward[just_succeeded] += self.success_bonus
         self._prev_geo_dist = curr_dist.clone()
 
-        # --- Parse-fail penalty (episode continues, malformed output costs) ---
+        if self.reward_mode == "decision_nav":
+            for i in range(self.num_envs):
+                if active_undone_np[i]:
+                    self._reward_component_totals[i]["dense_geo"] = (
+                        self._reward_component_totals[i].get("dense_geo", 0.0)
+                        + float(reward[i].detach().float().cpu().item())
+                    )
+
         coeffs = self._reward_coeffs()
-        parse_fail_penalty = coeffs["parse_fail"]
-        if parse_fail_penalty != 0.0:
-            active_undone_t = torch.tensor(
-                active_undone_np, dtype=torch.bool, device=reward.device,
-            )
-            pf_mask = (~self._last_parse_ok.to(reward.device)) & active_undone_t
-            if pf_mask.any():
-                reward[pf_mask] += parse_fail_penalty
 
         # --- Wrong-stop penalty (STOP issued when still far from goal) ---
         # FIXED small penalty (no distance scaling). Scaling by DTG made "explore
@@ -1203,6 +1222,56 @@ class GenarkVecEnv(gym.Env):
         )
         terminated = newly_stopped.cpu() & torch.tensor(active_undone_np, device="cpu")
         truncated  = newly_timed_out
+
+        if self.reward_mode == "decision_nav":
+            # Terminal action rewards must be emitted by step() itself so they
+            # stay attached to the STOP/timeout action in EnvWorker.acc_rewards.
+            # The previous snapshot-only path could miss this boundary when a
+            # slot was reset or became dormant before the decision flush.
+            for i in range(N_act):
+                if not active_undone_np[i]:
+                    continue
+                start_dtg = float(self._start_dtg[i])
+                curr_dtg_i = float(curr_dist[i].detach().cpu().item())
+                born_far = start_dtg >= self.success_distance
+                is_success_stop = bool(
+                    newly_stopped[i].item()
+                    and born_far
+                    and curr_dtg_i < self.success_distance
+                )
+                if is_success_stop:
+                    success_r = coeffs["sr"]
+                    endpoint_r = 0.0
+                    if self.nav_terminal_reward_enabled:
+                        endpoint_r = self.nav_endpoint_coef * float(
+                            np.exp(-self.nav_endpoint_decay * max(curr_dtg_i, 0.0))
+                        )
+                    reward[i] += success_r + endpoint_r
+                    self._reward_component_totals[i]["success"] = (
+                        self._reward_component_totals[i].get("success", 0.0)
+                        + success_r
+                    )
+                    self._reward_component_totals[i]["endpoint"] = (
+                        self._reward_component_totals[i].get("endpoint", 0.0)
+                        + endpoint_r
+                    )
+                elif bool(newly_stopped[i].item()) and curr_dtg_i > self.success_distance:
+                    wrong_r = self._wrong_stop_reward(
+                        curr_dtg=curr_dtg_i,
+                        start_dtg=start_dtg,
+                    )
+                    reward[i] += wrong_r
+                    self._reward_component_totals[i]["wrong_stop"] = (
+                        self._reward_component_totals[i].get("wrong_stop", 0.0)
+                        + wrong_r
+                    )
+                elif bool(newly_timed_out[i].item()):
+                    no_stop_r = coeffs["no_stop"]
+                    reward[i] += no_stop_r
+                    self._reward_component_totals[i]["no_stop"] = (
+                        self._reward_component_totals[i].get("no_stop", 0.0)
+                        + no_stop_r
+                    )
 
         # --- Info ---
         success_np = (
@@ -1417,6 +1486,8 @@ class GenarkVecEnv(gym.Env):
                 "best_dtg_progress": float(best_dtg_progress),
                 "final_regression": float(final_regression),
                 "early_stop": float(early_stop),
+                "reward_components": dict(self._reward_component_totals[i]),
+                "reward_sum": float(sum(self._reward_component_totals[i].values())),
                 **{k: float(v) for k, v in m.items()},
             }
             self._episode_log.append(ep_record)
@@ -1435,6 +1506,8 @@ class GenarkVecEnv(gym.Env):
                 "min_dtg": min_dtg,
                 "start_dtg": start_dtg,
                 "process_paid": float(self._process_progress_paid[i].item()),
+                "reward_components": dict(self._reward_component_totals[i]),
+                "last_parse_ok": bool(self._last_parse_ok[i]),
                 "last_json_valid": bool(self._last_json_valid[i]),
                 "last_struct_ok": bool(self._last_struct_ok[i]),
                 "last_field_format_ok": bool(self._last_field_format_ok[i]),
@@ -2146,10 +2219,9 @@ class GenarkVecEnv(gym.Env):
         last decision up to the current env step, including intermediate macro steps.
         This means detours within a macro action are correctly captured by DTW.
 
-        For reward_mode="decision_nav", also computes decision-level DTG reward:
-            delta = DTG_before_decision - DTG_after_decision
-            reward = clip(delta * dtg_coef, -dtg_clip, dtg_clip), asymmetric:
-                     positive delta (progress) × 1.0, negative delta (regress) × 0.5
+        For reward_mode="decision_nav", terminal flush adds Nav-R1-style
+        path-fidelity and endpoint rewards. Low-level DTG progress is emitted
+        from step() and accumulated by EnvWorker into the current decision.
 
         Updates self._prev_ndtw[i] and self._dtg_decision_start[i] for each env.
         Returns a [num_envs] float tensor; envs not in env_indices get 0.
@@ -2172,6 +2244,7 @@ class GenarkVecEnv(gym.Env):
                 start_dtg = float(snapshot.get("start_dtg", curr_dtg))
                 process_paid = float(snapshot.get("process_paid", 0.0))
                 last_json_valid = bool(snapshot.get("last_json_valid", False))
+                last_parse_ok = bool(snapshot.get("last_parse_ok", last_json_valid))
                 last_struct_ok = bool(snapshot.get("last_struct_ok", False))
                 last_field_format_ok = bool(
                     snapshot.get("last_field_format_ok", False)
@@ -2192,6 +2265,7 @@ class GenarkVecEnv(gym.Env):
                 start_dtg = float(self._start_dtg[i])
                 process_paid = float(self._process_progress_paid[i].item())
                 last_json_valid = bool(self._last_json_valid[i])
+                last_parse_ok = bool(self._last_parse_ok[i])
                 last_struct_ok = bool(self._last_struct_ok[i])
                 last_field_format_ok = bool(self._last_field_format_ok[i])
                 last_length_ok = bool(self._last_length_ok[i])
@@ -2211,33 +2285,46 @@ class GenarkVecEnv(gym.Env):
                     curr_ndtw = float(np.exp(-dtw_d / (len(gt) * self.success_distance)))
                 except Exception:
                     curr_ndtw = prev_ndtw
-            ndtw_r = coeffs["ndtw"] * (curr_ndtw - prev_ndtw)
+            # When terminal Nav-R1 path reward is enabled, do not also pay a
+            # per-decision nDTW delta: that would count path fidelity twice.
+            ndtw_r = 0.0 if self.nav_terminal_reward_enabled else (
+                coeffs["ndtw"] * (curr_ndtw - prev_ndtw)
+            )
             if snapshot is None:
                 self._prev_ndtw[i] = curr_ndtw
 
-            # --- decision-level DTG reward (decision_nav mode only) ---
-            dtg_r = 0.0
-            decision_progress = 0.0
-            if self.reward_mode == "decision_nav":
-                delta = dtg_before - curr_dtg  # positive = made progress toward goal
-                decision_progress = delta
-                dtg_coef = coeffs["dtg"]
-                scaled = delta * dtg_coef if delta > 0 else 0.5 * delta * dtg_coef
-                dtg_r = float(np.clip(scaled, -self.decision_dtg_clip, self.decision_dtg_clip))
-                if snapshot is None:
-                    self._dtg_decision_start[i] = curr_dtg  # update for next decision
-
             terminal_stop_r = 0.0
+            terminal_success_r = 0.0
+            terminal_wrong_stop_r = 0.0
+            terminal_no_stop_r = 0.0
+            terminal_path_r = 0.0
+            terminal_endpoint_r = 0.0
+            parse_r = 0.0
+            decision_progress = dtg_before - curr_dtg
+            if snapshot is None:
+                self._dtg_decision_start[i] = curr_dtg
             if self.reward_mode == "decision_nav" and snapshot is not None:
-                is_stop = termination_cause == "stop"
-                born_far = start_dtg >= self.success_distance
-                if is_stop and born_far and curr_dtg < self.success_distance:
-                    terminal_stop_r += coeffs["sr"]
-                elif is_stop and curr_dtg > self.success_distance:
-                    terminal_stop_r += self._wrong_stop_reward(
-                        curr_dtg=curr_dtg,
-                        start_dtg=start_dtg,
+                # Success/STOP/timeout rewards are emitted by step() and are
+                # already attached to the current action. Keep only the
+                # decision-level path-fidelity term here.
+                if self.nav_terminal_reward_enabled:
+                    terminal_path_r = self.nav_path_coef * float(
+                        np.clip(curr_ndtw, 0.0, 1.0)
                     )
+                terminal_stop_r = (
+                    terminal_success_r
+                    + terminal_wrong_stop_r
+                    + terminal_no_stop_r
+                    + terminal_path_r
+                    + terminal_endpoint_r
+                )
+
+            # Parse failures are decision-level events. The previous step-level
+            # implementation charged the same malformed decision on every
+            # physical simulator step of its macro action, allowing formatting
+            # noise to overwhelm navigation reward and invert trajectory ranking.
+            if not last_parse_ok:
+                parse_r = coeffs["parse_fail"]
 
             # --- RL-Struct style structured-output reward ---
             # Split the old monolithic format bonus into progressive components:
@@ -2279,9 +2366,6 @@ class GenarkVecEnv(gym.Env):
                     process_r += self.process_progress_coef * new_progress
                     if snapshot is None:
                         self._process_progress_paid[i] += new_progress
-                regression = curr_dtg - min_dtg
-                if regression > self.process_regression_margin:
-                    process_r += self.process_regression_penalty
 
             gsam_r = 0.0
             diag = policy_diag_by_env.get(i, {}) if policy_diag_by_env else {}
@@ -2309,10 +2393,49 @@ class GenarkVecEnv(gym.Env):
                     gsam_r += self.gsam_detect_progress_bonus
                     self._gsam_reward_diag_counts["bonus"] += 1.0
 
+            component_values = {
+                "ndtw": ndtw_r,
+                "parse": parse_r,
+                "process": process_r,
+                "struct": struct_r,
+                "bbox": bbox_r,
+                "path": terminal_path_r,
+                "endpoint": terminal_endpoint_r,
+                "success": terminal_success_r,
+                "wrong_stop": terminal_wrong_stop_r,
+                "no_stop": terminal_no_stop_r,
+                "gsam": gsam_r,
+            }
+            base_components = (
+                dict(snapshot.get("reward_components", {}))
+                if snapshot is not None
+                else dict(self._reward_component_totals[i])
+            )
+            for name, value in component_values.items():
+                if value:
+                    base_components[name] = base_components.get(name, 0.0) + float(value)
+            if snapshot is None:
+                self._reward_component_totals[i] = base_components
+            else:
+                completed = self._last_completed_diag_by_env[i]
+                if isinstance(completed, dict):
+                    completed["reward_components"] = base_components
+                    completed["reward_sum"] = float(sum(base_components.values()))
+
+                if termination_cause:
+                    print(
+                        "[GenArk][reward-debug] "
+                        f"env={i} success={float(snapshot.get('success', 0.0)):.0f} "
+                        f"cause={termination_cause} "
+                        f"components={component_values} "
+                        f"decision_reward={float(ndtw_r + sum(component_values.values())):.6f}",
+                        flush=True,
+                    )
+
             reward_np[i] = (
                 ndtw_r
-                + dtg_r
                 + terminal_stop_r
+                + parse_r
                 + struct_r
                 + bbox_r
                 + process_r

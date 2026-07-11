@@ -1393,6 +1393,23 @@ class EnvWorker(Worker):
                 return False
 
             _env = self.env_list[stage_id]
+            _target_env = _env
+            _snapshots = None
+            for _ in range(8):
+                _snapshots = getattr(
+                    _target_env, "_pending_decision_reward_snapshot_by_env", None
+                )
+                if isinstance(_snapshots, list):
+                    break
+                _next_env = getattr(_target_env, "env", _target_env)
+                if _next_env is _target_env:
+                    break
+                _target_env = _next_env
+            _terminal_snapshot = (
+                _snapshots[env_i]
+                if isinstance(_snapshots, list) and env_i < len(_snapshots)
+                else None
+            )
             if hasattr(_env, "compute_decision_ndtw_reward"):
                 policy_diag = self._policy_diag_from_forward_inputs(
                     pdata.get("forward_inputs")
@@ -1409,7 +1426,22 @@ class EnvWorker(Worker):
                         env_metrics[_name].append(
                             torch.tensor([float(_value)], dtype=torch.float32)
                         )
-                acc_rewards[stage_id][env_i] += float(_ndtw_r[env_i])
+                _acc_before_terminal = float(acc_rewards[stage_id][env_i].item())
+                _decision_reward = float(_ndtw_r[env_i])
+                acc_rewards[stage_id][env_i] += _decision_reward
+                if isinstance(_terminal_snapshot, dict) and _terminal_snapshot.get(
+                    "termination_cause"
+                ):
+                    print(
+                        "[GRPO][reward-debug] "
+                        f"stage={stage_id} env={env_i} "
+                        f"success={float(_terminal_snapshot.get('success', 0.0)):.0f} "
+                        f"cause={_terminal_snapshot.get('termination_cause')} "
+                        f"decision_reward={_decision_reward:.6f} "
+                        f"acc_before={_acc_before_terminal:.6f} "
+                        f"acc_after={float(acc_rewards[stage_id][env_i].item()):.6f}",
+                        flush=True,
+                    )
                 if hasattr(_env, "pop_completed_episode_diagnostic"):
                     try:
                         _completed_diag = _env.pop_completed_episode_diagnostic(env_i)
@@ -1423,6 +1455,10 @@ class EnvWorker(Worker):
                     if isinstance(_completed_diag, dict):
                         completed_episode_diag_by_stage[stage_id][env_i] = _completed_diag
 
+            # acc_rewards is reused and cleared immediately below. Clone the
+            # one-env slice so EmbodiedRolloutResult owns an immutable reward
+            # tensor; `.contiguous()` alone can preserve the slice's storage.
+            trajectory_reward = acc_rewards[stage_id][env_i:env_i + 1].clone()
             chunk_step_result = ChunkStepResult(
                 actions=pdata["actions"],
                 prev_logprobs=pdata["prev_logprobs"],
@@ -1432,7 +1468,7 @@ class EnvWorker(Worker):
                 dones=pdata["dones"],
                 truncations=pdata["truncations"],
                 terminations=pdata["terminations"],
-                rewards=acc_rewards[stage_id][env_i:env_i + 1],
+                rewards=trajectory_reward,
             )
             rollout_results_per_env[stage_id][env_i].append_step_result(
                 chunk_step_result

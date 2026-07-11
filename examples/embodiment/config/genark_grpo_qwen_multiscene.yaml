@@ -165,16 +165,14 @@ env:
     curriculum_dtg_start: 5.0         # cold-start: only episodes ≤5m euclidean. With
                                       # success_distance=3, these need 0–2m real nav.
     curriculum_dtg_step: 5.0          # each coverage pass unlocks +5m (5→10→15→… up to full pool)
-    reward_mode: "decision_nav"   # geo_ndtw→decision_nav: per-DECISION DTG progress
-                                  # (net meters closer, clip ±2) — dense gradient WITHOUT
-                                  # macro-length bias (why geo_coef was kept 0). Activates
-                                  # the already-set decision_dtg_coef=1.0.
+    reward_mode: "decision_nav"   # low-level DTG progress + terminal navigation reward
     # Reward profile:
     #   nav             = task reward for navigation / correct STOP.
     #   format_learning = schema + bbox warm-up for cold-start checkpoints.
     reward_profile: "nav"
     decision_level_ndtw: true
-    geo_coef: 0.0
+    geo_coef: 0.1
+    geo_step_clip: 0.5
     ndtw_coef: 0.5
     sr_coef: 2.0
     # LaViRA waypoint schema shaping: dense valid-schema reward capped per episode,
@@ -189,15 +187,16 @@ env:
     bbox_reward_cap: 2.0
     bbox_reward_coef: 0.2
     parse_fail_penalty: -1.0
-    decision_dtg_coef: 1.0         # no-op in geo_ndtw mode (only used by decision_nav)
-    decision_dtg_clip: 2.0
-    # DTG process reward + GroundedSAM gated bonus. Defaults stay off so existing
-    # runs preserve old rewards unless a launch script explicitly enables them.
+    no_stop_penalty: 0.0
+    # Nav-R1-style terminal reward: path fidelity (nDTW proxy) + endpoint accuracy.
+    nav_terminal_reward_enabled: false
+    nav_path_coef: 1.0
+    nav_endpoint_coef: 1.0
+    nav_endpoint_decay: 0.2
+    # Best-progress is retained as a small auxiliary signal for all-failure groups.
     process_reward_enabled: false
     process_progress_coef: 0.2
     process_progress_cap: 1.0
-    process_regression_penalty: -0.2
-    process_regression_margin: 1.0
     gsam_reward_enabled: false
     gsam_detect_progress_bonus: 0.05
     enable_4dir_render: true
