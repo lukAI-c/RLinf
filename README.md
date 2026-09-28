@@ -28,6 +28,52 @@ RLinf is a flexible and scalable open-source RL infrastructure designed for Embo
   <img src="https://github.com/RLinf/misc/raw/main/pic/overview.svg" alt="RLinf-overview"/>
 </div>
 
+## LaViRA-RFT for Vision-Language Navigation
+
+This branch adds an experimental RL fine-tuning pipeline for LaViRA-style
+vision-language navigation. It connects Qwen visual decisions, GroundedSAM
+target grounding, metric-depth projection, semantic mapping, and FMM control
+to RLinf's distributed rollout and actor training stack.
+
+The current endpoint-only objective uses the final Euclidean distance to the
+goal, `S = -max(2 m, final DTG)`, as the trajectory score. On a frozen
+evaluation over the same six training episodes with five trials each, the
+step-6 policy improves endpoint navigation without reducing the observed
+clean-STOP count:
+
+<div align="center">
+  <img src="docs/assets/lavira_rft/endpoint_metrics.png" alt="LaViRA-RFT endpoint navigation metrics" width="900"/>
+</div>
+
+| Metric | SFT checkpoint-1200 | Endpoint-only RFT step 6 |
+| --- | ---: | ---: |
+| Final distance to goal | 9.56 m | **7.31 m** |
+| nDTW | 0.083 | **0.104** |
+| Path length | 17.70 m | **16.92 m** |
+| SPL | 0.163 | **0.217** |
+| Clean STOP | 6/30 | 6/30 |
+
+The map below is a frozen post-RFT clean-STOP rollout for episode 586,
+trial 2. The agent stops after 26 steps at `0.097 m` DTG with `0.968` SPL and
+`0.557` nDTW. Blue is the agent position, red is the current FMM goal, white
+is mapped obstacle structure, and darker cells have lower FMM cost.
+
+<div align="center">
+  <img src="docs/assets/lavira_rft/episode586_clean_stop.gif" alt="LaViRA-RFT episode 586 clean-STOP FMM rollout" width="420"/>
+</div>
+
+This is an in-distribution training-set result, not a claim of held-out
+generalization. Current held-out transfer remains mixed; see the
+[endpoint report](docs/ROBOSTRAL_ENDPOINT_SCORE_REPORT_20260818.md),
+[held-out report](docs/ROBOSTRAL_HELDOUT_INTERIM_20260824.md), and
+[implementation plan](docs/ROBOSTRAL_RFT_IMPLEMENTATION_PLAN_20260817.md).
+The primary launcher is
+[`launch_robostral_terminal_rft.sh`](launch_robostral_terminal_rft.sh).
+
+The visualization is derived from Matterport3D data and is provided for
+non-commercial academic use under the
+[Matterport Academic-Use EULA](https://matterport.com/legal/matterport-end-user-license-agreement-academic-use-model-data).
+
 
 ## What's NEW!
 - [2026/04] 🔥 RLinf supports Dexmal DOS-W1 for real-world reinforcement learning. Doc: [Real-World RL on Dexmal DOS-W1](https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/dosw1.html).
