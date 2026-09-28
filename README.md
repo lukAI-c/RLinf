@@ -54,11 +54,11 @@ clean-STOP count:
 | Clean STOP | 6/30 | 6/30 |
 
 The synchronized visualization below shows a longer on-policy RFT clean-STOP
-rollout for episode 609. Each frame pairs the GroundedSAM-selected RGB view
-with the LaViRA map from the same simulator step. The agent follows a
-multi-turn indoor route and stops after 69 steps at `0.85 m` DTG with `0.751`
-SPL. Cyan is the accumulated agent path, green is the reference path, dark
-cells are mapped obstacles, and light gray is mapped free space.
+rollout for episode 609. Each frame pairs the physical forward RGB observation
+with the post-observation LaViRA map from the same simulator step. The agent
+follows a multi-turn indoor route and stops after 69 steps at `0.85 m` DTG
+with `0.751` SPL. Cyan is the accumulated agent path, green is the reference
+path, dark cells are mapped obstacles, and light gray is mapped free space.
 
 <div align="center">
   <img src="docs/assets/lavira_rft/episode609_synced_rgb_map.gif" alt="Synchronized RGB and LaViRA map views from the same episode 609 clean-STOP rollout" width="820"/>
