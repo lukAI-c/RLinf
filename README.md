@@ -53,13 +53,14 @@ clean-STOP count:
 | SPL | 0.163 | **0.217** |
 | Clean STOP | 6/30 | 6/30 |
 
-The map below is a frozen post-RFT clean-STOP rollout for episode 586,
-trial 2. The agent stops after 26 steps at `0.097 m` DTG with `0.968` SPL and
-`0.557` nDTW. Blue is the agent position, red is the current FMM goal, white
-is mapped obstacle structure, and darker cells have lower FMM cost.
+The map below shows a longer on-policy RFT clean-STOP rollout for episode 609.
+The agent follows a multi-turn indoor route and stops after 69 steps at
+`0.85 m` DTG with `0.751` SPL. Cyan is the accumulated agent path, green is
+the reference path, dark cells are mapped obstacles, and light gray is mapped
+free space. Every animation frame comes from the original LaViRA map trace.
 
 <div align="center">
-  <img src="docs/assets/lavira_rft/episode586_clean_stop.gif" alt="LaViRA-RFT episode 586 clean-STOP FMM rollout" width="420"/>
+  <img src="docs/assets/lavira_rft/episode609_complex_clean_stop.gif" alt="LaViRA-RFT episode 609 multi-turn clean-STOP rollout" width="520"/>
 </div>
 
 This is an in-distribution training-set result, not a claim of held-out
