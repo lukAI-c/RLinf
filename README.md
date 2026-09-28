@@ -53,22 +53,15 @@ clean-STOP count:
 | SPL | 0.163 | **0.217** |
 | Clean STOP | 6/30 | 6/30 |
 
-The map below shows a longer on-policy RFT clean-STOP rollout for episode 609.
-The agent follows a multi-turn indoor route and stops after 69 steps at
-`0.85 m` DTG with `0.751` SPL. Cyan is the accumulated agent path, green is
-the reference path, dark cells are mapped obstacles, and light gray is mapped
-free space. Every animation frame comes from the original LaViRA map trace.
+The synchronized visualization below shows a longer on-policy RFT clean-STOP
+rollout for episode 609. Each frame pairs the GroundedSAM-selected RGB view
+with the LaViRA map from the same simulator step. The agent follows a
+multi-turn indoor route and stops after 69 steps at `0.85 m` DTG with `0.751`
+SPL. Cyan is the accumulated agent path, green is the reference path, dark
+cells are mapped obstacles, and light gray is mapped free space.
 
 <div align="center">
-  <img src="docs/assets/lavira_rft/episode609_complex_clean_stop.gif" alt="LaViRA-RFT episode 609 multi-turn clean-STOP rollout" width="520"/>
-</div>
-
-The companion GIF below shows the eight RGB views selected for GroundedSAM
-at decision points along the same rollout. These are sparse visual-decision
-frames rather than every simulator primitive frame.
-
-<div align="center">
-  <img src="docs/assets/lavira_rft/episode609_selected_rgb.gif" alt="Selected RGB decision views from the same LaViRA-RFT episode 609 rollout" width="520"/>
+  <img src="docs/assets/lavira_rft/episode609_synced_rgb_map.gif" alt="Synchronized RGB and LaViRA map views from the same episode 609 clean-STOP rollout" width="820"/>
 </div>
 
 This is an in-distribution training-set result, not a claim of held-out
