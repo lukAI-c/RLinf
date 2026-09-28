@@ -63,6 +63,14 @@ free space. Every animation frame comes from the original LaViRA map trace.
   <img src="docs/assets/lavira_rft/episode609_complex_clean_stop.gif" alt="LaViRA-RFT episode 609 multi-turn clean-STOP rollout" width="520"/>
 </div>
 
+The companion GIF below shows the eight RGB views selected for GroundedSAM
+at decision points along the same rollout. These are sparse visual-decision
+frames rather than every simulator primitive frame.
+
+<div align="center">
+  <img src="docs/assets/lavira_rft/episode609_selected_rgb.gif" alt="Selected RGB decision views from the same LaViRA-RFT episode 609 rollout" width="520"/>
+</div>
+
 This is an in-distribution training-set result, not a claim of held-out
 generalization. Current held-out transfer remains mixed; see the
 [endpoint report](docs/ROBOSTRAL_ENDPOINT_SCORE_REPORT_20260818.md),
