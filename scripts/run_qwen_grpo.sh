@@ -15,7 +15,7 @@ ENV_GPUS=${2:-3-5}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RLINF_ROOT="$(dirname "$SCRIPT_DIR")"
-CONDA_PYTHON="/home/clk/miniconda3/envs/genesis/bin/python"
+CONDA_PYTHON="/home/clk/miniconda3/envs/genesis-vllm/bin/python"
 EMBODIED_PATH="$RLINF_ROOT/examples/embodiment"
 
 pkill -9 -f "ray::" 2>/dev/null || true

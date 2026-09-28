@@ -523,6 +523,69 @@ class MultiSceneBackend(GenesisSimBackend):
             )
         return rgb_out, depth_out
 
+    def render_4dir_with_depth(self, active_slot_count: int):
+        """Fan out aligned extra RGB/depth rendering across scene actors."""
+        N = self._layout.num_envs
+        rgb_out = np.zeros((N, 3, self._cam_h, self._cam_w, 3), dtype=np.uint8)
+        depth_out = np.zeros((N, 3, self._cam_h, self._cam_w), dtype=np.float32)
+        pending = [
+            (s, sub, sub.render_4dir_with_depth_async(self._layout.sizes[s]))
+            for s, sub in enumerate(self._subs)
+        ]
+        crashed: list[SceneCrashError] = []
+        for s, sub, ref in pending:
+            off, k_s = self._layout.offsets[s], self._layout.sizes[s]
+            try:
+                rgb_block, depth_block = sub.fetch_render_4dir_with_depth(ref)
+                if rgb_block is None or depth_block is None:
+                    return None, None
+                assert rgb_block.shape == (k_s, 3, self._cam_h, self._cam_w, 3)
+                assert depth_block.shape == (k_s, 3, self._cam_h, self._cam_w)
+                rgb_out[off:off + k_s] = rgb_block
+                depth_out[off:off + k_s] = depth_block
+            except SceneCrashError as exc:
+                crashed.append(exc)
+        if crashed:
+            raise SceneCrashError(
+                scene_id=crashed[0].scene_id,
+                cause=Exception("scene actor crashed during render_4dir_with_depth: " + ", ".join(map(str, crashed))),
+            )
+        return rgb_out, depth_out
+
+    def render_panorama_with_depth(self, active_slot_count: int):
+        """Fan out each scene's atomic 12-view panorama concurrently."""
+        N = self._layout.num_envs
+        rgb_out = np.zeros(
+            (N, 12, self._cam_h, self._cam_w, 3), dtype=np.uint8
+        )
+        depth_out = np.zeros(
+            (N, 12, self._cam_h, self._cam_w), dtype=np.float32
+        )
+        yaw_out = np.zeros((N, 12), dtype=np.float32)
+        pending = [
+            (s, sub, sub.render_panorama_with_depth_async(self._layout.sizes[s]))
+            for s, sub in enumerate(self._subs)
+        ]
+        crashed: list[SceneCrashError] = []
+        for s, sub, ref in pending:
+            off, k_s = self._layout.offsets[s], self._layout.sizes[s]
+            try:
+                rgb, depth, yaw = sub.fetch_render_panorama_with_depth(ref)
+                rgb_out[off:off + k_s] = rgb
+                depth_out[off:off + k_s] = depth
+                yaw_out[off:off + k_s] = yaw
+            except SceneCrashError as exc:
+                crashed.append(exc)
+        if crashed:
+            raise SceneCrashError(
+                scene_id=crashed[0].scene_id,
+                cause=Exception(
+                    "scene actor crashed during render_panorama_with_depth: "
+                    + ", ".join(map(str, crashed))
+                ),
+            )
+        return rgb_out, depth_out, yaw_out
+
     def render_4dir(self, active_slot_count: int) -> Optional[np.ndarray]:
         """Render 4-dir views for all scenes concurrently, or None if any is None.
 

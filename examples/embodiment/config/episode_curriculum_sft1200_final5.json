@@ -1,0 +1,927 @@
+{
+  "schema_version": 1,
+  "classification": {
+    "clean_seed": "active_clean_count >= 3",
+    "stop_frontier": "active_clean_count < 3 and meaningful_reach_count >= 2",
+    "nav_frontier": "active_clean_count < 3, meaningful_reach_count < 2, and (meaningful_reach_count >= 1 or mean_dtg_progress > 0)",
+    "hard": "active_clean_count == 0, meaningful_reach_count == 0, and mean_dtg_progress <= 0",
+    "active_clean_types": [
+      "clean",
+      "recovered"
+    ],
+    "meaningful_reach_types": [
+      "clean",
+      "proximity",
+      "recovered"
+    ],
+    "lucky_start_excluded": true
+  },
+  "tier_counts": {
+    "clean_seed": 8,
+    "hard": 7,
+    "nav_frontier": 39,
+    "stop_frontier": 46
+  },
+  "episodes": [
+    {
+      "scene_id": "mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb",
+      "episode_id": "1087",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 3,
+      "mean_dtg_progress": 2.904510974884033,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb",
+      "episode_id": "11",
+      "tier": "stop_frontier",
+      "active_clean_count": 1,
+      "meaningful_reach_count": 3,
+      "mean_dtg_progress": 3.838884949684143,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb",
+      "episode_id": "116",
+      "tier": "stop_frontier",
+      "active_clean_count": 1,
+      "meaningful_reach_count": 4,
+      "mean_dtg_progress": -0.5463769674301148,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb",
+      "episode_id": "140",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 1.2315532207489013,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb",
+      "episode_id": "166",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 1.3146404027938843,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb",
+      "episode_id": "265",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 3.151339530944824,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb",
+      "episode_id": "330",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 1.3263046264648437,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb",
+      "episode_id": "403",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": -0.6931836605072021,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb",
+      "episode_id": "513",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": -6.277624869346619,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb",
+      "episode_id": "643",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 1.993820357322693,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb",
+      "episode_id": "70",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 1.8279117584228515,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb",
+      "episode_id": "721",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": -0.5498702526092529,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb",
+      "episode_id": "804",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 6.3326762318611145,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb",
+      "episode_id": "810",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 2.193318223953247,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/8194nk5LbLH/8194nk5LbLH.glb",
+      "episode_id": "1148",
+      "tier": "nav_frontier",
+      "active_clean_count": 1,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 3.146894860267639,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/EU6Fwq7SyZv/EU6Fwq7SyZv.glb",
+      "episode_id": "321",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 0.7802419304847718,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/EU6Fwq7SyZv/EU6Fwq7SyZv.glb",
+      "episode_id": "348",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 0.1622903823852539,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/EU6Fwq7SyZv/EU6Fwq7SyZv.glb",
+      "episode_id": "461",
+      "tier": "clean_seed",
+      "active_clean_count": 3,
+      "meaningful_reach_count": 3,
+      "mean_dtg_progress": 0.7192410826683044,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/EU6Fwq7SyZv/EU6Fwq7SyZv.glb",
+      "episode_id": "526",
+      "tier": "stop_frontier",
+      "active_clean_count": 1,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 2.637310194969177,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/EU6Fwq7SyZv/EU6Fwq7SyZv.glb",
+      "episode_id": "620",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 1.3895545482635498,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/EU6Fwq7SyZv/EU6Fwq7SyZv.glb",
+      "episode_id": "755",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 3.510538864135742,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/EU6Fwq7SyZv/EU6Fwq7SyZv.glb",
+      "episode_id": "765",
+      "tier": "clean_seed",
+      "active_clean_count": 4,
+      "meaningful_reach_count": 5,
+      "mean_dtg_progress": 5.044757968187332,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/EU6Fwq7SyZv/EU6Fwq7SyZv.glb",
+      "episode_id": "781",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 4,
+      "mean_dtg_progress": 3.296501898765564,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb",
+      "episode_id": "1061",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 2.6521944046020507,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb",
+      "episode_id": "1106",
+      "tier": "stop_frontier",
+      "active_clean_count": 1,
+      "meaningful_reach_count": 4,
+      "mean_dtg_progress": 4.897474408149719,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb",
+      "episode_id": "1139",
+      "tier": "stop_frontier",
+      "active_clean_count": 2,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 4.5911429762840275,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb",
+      "episode_id": "1142",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 2.078077793121338,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb",
+      "episode_id": "150",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 2.5767619609832764,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb",
+      "episode_id": "176",
+      "tier": "stop_frontier",
+      "active_clean_count": 1,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": -1.1782219886779786,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb",
+      "episode_id": "190",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 3.2014508962631227,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb",
+      "episode_id": "191",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 2.660234546661377,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb",
+      "episode_id": "423",
+      "tier": "hard",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": -1.1425205230712892,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb",
+      "episode_id": "454",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 2.1885531902313233,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb",
+      "episode_id": "568",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 7.497802472114563,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb",
+      "episode_id": "609",
+      "tier": "hard",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": -3.5741250038146974,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb",
+      "episode_id": "677",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": -1.119082260131836,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb",
+      "episode_id": "739",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 5.080045366287232,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb",
+      "episode_id": "842",
+      "tier": "hard",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": -0.6379773139953613,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/QUCTc6BB5sX/QUCTc6BB5sX.glb",
+      "episode_id": "94",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 5.938635969161988,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb",
+      "episode_id": "1077",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 3.3910598754882812,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb",
+      "episode_id": "1284",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 3,
+      "mean_dtg_progress": 5.835928338766098,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb",
+      "episode_id": "1307",
+      "tier": "stop_frontier",
+      "active_clean_count": 1,
+      "meaningful_reach_count": 4,
+      "mean_dtg_progress": 4.429100644588471,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb",
+      "episode_id": "1406",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 0.9014096736907959,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb",
+      "episode_id": "171",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 1.9662335395812989,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb",
+      "episode_id": "181",
+      "tier": "hard",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": -0.4093297004699707,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb",
+      "episode_id": "259",
+      "tier": "stop_frontier",
+      "active_clean_count": 1,
+      "meaningful_reach_count": 5,
+      "mean_dtg_progress": 4.666980993747711,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb",
+      "episode_id": "275",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 1.5845213413238526,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb",
+      "episode_id": "308",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 3,
+      "mean_dtg_progress": 3.985991561412811,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb",
+      "episode_id": "338",
+      "tier": "nav_frontier",
+      "active_clean_count": 1,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": -1.2912395477294922,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb",
+      "episode_id": "377",
+      "tier": "stop_frontier",
+      "active_clean_count": 2,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 4.22389702796936,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb",
+      "episode_id": "411",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 3,
+      "mean_dtg_progress": 3.2696548879146574,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb",
+      "episode_id": "531",
+      "tier": "stop_frontier",
+      "active_clean_count": 1,
+      "meaningful_reach_count": 5,
+      "mean_dtg_progress": 3.219105231761932,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/TbHJrupSAjP/TbHJrupSAjP.glb",
+      "episode_id": "698",
+      "tier": "clean_seed",
+      "active_clean_count": 5,
+      "meaningful_reach_count": 5,
+      "mean_dtg_progress": 5.427496242523193,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/X7HyMhZNoso/X7HyMhZNoso.glb",
+      "episode_id": "1092",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 3,
+      "mean_dtg_progress": 0.04413595199584961,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/X7HyMhZNoso/X7HyMhZNoso.glb",
+      "episode_id": "218",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 4,
+      "mean_dtg_progress": 3.9505933046340944,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/X7HyMhZNoso/X7HyMhZNoso.glb",
+      "episode_id": "226",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 2.343086528778076,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/X7HyMhZNoso/X7HyMhZNoso.glb",
+      "episode_id": "244",
+      "tier": "stop_frontier",
+      "active_clean_count": 1,
+      "meaningful_reach_count": 5,
+      "mean_dtg_progress": 4.233215939998627,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/X7HyMhZNoso/X7HyMhZNoso.glb",
+      "episode_id": "371",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 3,
+      "mean_dtg_progress": 4.649399185180664,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/X7HyMhZNoso/X7HyMhZNoso.glb",
+      "episode_id": "602",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 3.53317608833313,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/X7HyMhZNoso/X7HyMhZNoso.glb",
+      "episode_id": "748",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 6.513190746307373,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb",
+      "episode_id": "1133",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 1.6029454708099364,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb",
+      "episode_id": "1301",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 4.1327451229095455,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb",
+      "episode_id": "207",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 2.8584200859069826,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb",
+      "episode_id": "432",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 2.07409782409668,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb",
+      "episode_id": "469",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 2.3758476257324217,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb",
+      "episode_id": "550",
+      "tier": "hard",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": -2.971464920043945,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb",
+      "episode_id": "559",
+      "tier": "hard",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": -0.7346616744995117,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb",
+      "episode_id": "576",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 1.6262616634368896,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb",
+      "episode_id": "586",
+      "tier": "clean_seed",
+      "active_clean_count": 4,
+      "meaningful_reach_count": 4,
+      "mean_dtg_progress": 3.424819755554199,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb",
+      "episode_id": "705",
+      "tier": "hard",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": -2.783330726623535,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb",
+      "episode_id": "824",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 1.0168459057807921,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/oLBMNvg9in8/oLBMNvg9in8.glb",
+      "episode_id": "232",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 0.312333869934082,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/oLBMNvg9in8/oLBMNvg9in8.glb",
+      "episode_id": "479",
+      "tier": "stop_frontier",
+      "active_clean_count": 2,
+      "meaningful_reach_count": 3,
+      "mean_dtg_progress": 4.145621061325073,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/oLBMNvg9in8/oLBMNvg9in8.glb",
+      "episode_id": "787",
+      "tier": "stop_frontier",
+      "active_clean_count": 1,
+      "meaningful_reach_count": 3,
+      "mean_dtg_progress": 4.508992052078247,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/x8F5xyUWy9e/x8F5xyUWy9e.glb",
+      "episode_id": "1051",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 2.481502914428711,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/x8F5xyUWy9e/x8F5xyUWy9e.glb",
+      "episode_id": "1056",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 5,
+      "mean_dtg_progress": 4.092642021179199,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/x8F5xyUWy9e/x8F5xyUWy9e.glb",
+      "episode_id": "1117",
+      "tier": "clean_seed",
+      "active_clean_count": 3,
+      "meaningful_reach_count": 5,
+      "mean_dtg_progress": 6.322530508041382,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/x8F5xyUWy9e/x8F5xyUWy9e.glb",
+      "episode_id": "187",
+      "tier": "clean_seed",
+      "active_clean_count": 3,
+      "meaningful_reach_count": 3,
+      "mean_dtg_progress": 5.5944276571273805,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/x8F5xyUWy9e/x8F5xyUWy9e.glb",
+      "episode_id": "312",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 4,
+      "mean_dtg_progress": 4.98709647655487,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/x8F5xyUWy9e/x8F5xyUWy9e.glb",
+      "episode_id": "7",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 6.826984500885009,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "1071",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 1.3914424896240234,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "1084",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 0.10654771327972412,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "1085",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": -0.3550912857055664,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "13",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 8.35797159075737,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "156",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 4.860165357589722,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "247",
+      "tier": "clean_seed",
+      "active_clean_count": 3,
+      "meaningful_reach_count": 4,
+      "mean_dtg_progress": 5.2177769303321835,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "362",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 1.729680585861206,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "387",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 3,
+      "mean_dtg_progress": 6.635175967216492,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "40",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 7.954256868362426,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "42",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 5.986428594589233,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "439",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": -3.7151848316192626,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "447",
+      "tier": "nav_frontier",
+      "active_clean_count": 1,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 5.182814449071884,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "516",
+      "tier": "stop_frontier",
+      "active_clean_count": 1,
+      "meaningful_reach_count": 2,
+      "mean_dtg_progress": 6.754909765720368,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "52",
+      "tier": "nav_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 0,
+      "mean_dtg_progress": 4.696120643615723,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "546",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 4,
+      "mean_dtg_progress": -0.6105869770050049,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "655",
+      "tier": "nav_frontier",
+      "active_clean_count": 1,
+      "meaningful_reach_count": 1,
+      "mean_dtg_progress": 0.7318646669387817,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "670",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 3,
+      "mean_dtg_progress": -0.5766542673110961,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "715",
+      "tier": "stop_frontier",
+      "active_clean_count": 2,
+      "meaningful_reach_count": 3,
+      "mean_dtg_progress": 7.895978331565857,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "743",
+      "tier": "clean_seed",
+      "active_clean_count": 3,
+      "meaningful_reach_count": 4,
+      "mean_dtg_progress": 8.167685437202454,
+      "num_trials": 5
+    },
+    {
+      "scene_id": "mp3d/zsNo4HB9uLZ/zsNo4HB9uLZ.glb",
+      "episode_id": "821",
+      "tier": "stop_frontier",
+      "active_clean_count": 0,
+      "meaningful_reach_count": 3,
+      "mean_dtg_progress": 0.07847135066986084,
+      "num_trials": 5
+    }
+  ]
+}

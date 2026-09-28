@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 import time
 from functools import partial
@@ -26,6 +27,14 @@ from torch.multiprocessing.reductions import reduce_tensor
 from torch.utils import _pytree
 
 import rlinf.algorithms  # noqa: F401
+from rlinf.algorithms.advantages import (
+    compute_decision_maxrl_outcome_advantages,
+    compute_decision_rloo_outcome_advantages,
+)
+from rlinf.envs.genark.terminal_navigation_score import (
+    compute_terminal_grpo_outcome_advantages,
+    validate_robostral_rft_contract,
+)
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
     kl_penalty,
@@ -1003,6 +1012,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Worker.__init__(self)
         super().__init__(cfg.actor, self._world_size, self._rank)
         self.cfg = cfg
+        contract_errors = validate_robostral_rft_contract(cfg)
+        if contract_errors:
+            raise ValueError(
+                "Robostral RFT contract failed before actor allocation: "
+                + "; ".join(contract_errors)
+            )
         self._env_group_name = cfg.env.group_name
         self._rollout_group_name = cfg.rollout.group_name
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
@@ -1296,17 +1311,153 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+            "episode_success": self.rollout_batch.get("episode_success", None),
+            "episode_terminal_score": self.rollout_batch.get(
+                "episode_terminal_score", None
+            ),
+            "maxrl_process_coef": self.cfg.algorithm.get("maxrl_process_coef", 1.0),
+            "maxrl_epsilon": self.cfg.algorithm.get("maxrl_epsilon", 1e-6),
+            "rloo_process_coef": self.cfg.algorithm.get("rloo_process_coef", 1.0),
+            "maxrl_aux_coef": self.cfg.algorithm.get("maxrl_aux_coef", 0.25),
+            "rloo_aux_coef": self.cfg.algorithm.get("rloo_aux_coef", 0.25),
         }
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
 
         self.rollout_batch.update(advantages_and_returns)
+        maxrl_metrics = {}
+        if self.cfg.algorithm.adv_type == "decision_terminal_grpo":
+            scores = kwargs["episode_terminal_score"]
+            if scores is None:
+                raise RuntimeError(
+                    "decision_terminal_grpo rollout batch is missing episode_terminal_score"
+                )
+            group_size = int(kwargs["group_size"])
+            score_flat = scores.reshape(-1).float()
+            score_groups = score_flat.reshape(-1, group_size)
+            outcome = compute_terminal_grpo_outcome_advantages(
+                episode_terminal_score=score_flat,
+                group_size=group_size,
+            ).reshape_as(score_groups)
+            success = kwargs.get("episode_success")
+            success_flat = (
+                success.reshape(-1).float()
+                if success is not None
+                else torch.zeros_like(score_flat)
+            )
+            success_groups = success_flat.reshape(-1, group_size)
+            advantages = advantages_and_returns["advantages"]
+            loss_mask = kwargs.get("loss_mask")
+            valid_adv = advantages
+            if loss_mask is not None:
+                valid_adv = advantages.masked_select(loss_mask.to(dtype=torch.bool))
+            zero_std = (
+                score_groups.std(dim=-1, unbiased=True) < 1e-6
+            ).float()
+            maxrl_metrics = {
+                "train/terminal_score_mean": float(score_flat.mean().item()),
+                "train/terminal_score_std": float(score_flat.std(unbiased=False).item()),
+                "train/terminal_score_min": float(score_flat.min().item()),
+                "train/terminal_score_max": float(score_flat.max().item()),
+                "train/terminal_zero_std_group_rate": float(zero_std.mean().item()),
+                "train/clean_stop_count": float(success_groups.sum(dim=-1).mean().item()),
+                "train/in_goal_range_count": float(
+                    (score_groups > -3.0).float().sum(dim=-1).mean().item()
+                ),
+                "train/advantage_mean": float(
+                    valid_adv.mean().item() if valid_adv.numel() else 0.0
+                ),
+                "train/advantage_std": float(
+                    valid_adv.std(unbiased=False).item() if valid_adv.numel() > 1 else 0.0
+                ),
+                "train/advantage_max": float(
+                    valid_adv.max().item() if valid_adv.numel() else 0.0
+                ),
+                "train/advantage_min": float(
+                    valid_adv.min().item() if valid_adv.numel() else 0.0
+                ),
+                "train/effective_advantage_fraction": float(
+                    (valid_adv.abs() > 1e-12).float().mean().item()
+                    if valid_adv.numel()
+                    else 0.0
+                ),
+            }
+        if self.cfg.algorithm.adv_type in (
+            "decision_maxrl",
+            "decision_rloo",
+            "decision_maxrl_aux_rloo",
+            "decision_rloo_aux_rloo",
+        ):
+            adv_type = self.cfg.algorithm.adv_type
+            success = kwargs["episode_success"]
+            if success is None:
+                raise RuntimeError(f"{adv_type} rollout batch is missing episode_success")
+            success = success.reshape(-1).float()
+            group_size = int(kwargs["group_size"])
+            success_groups = success.reshape(-1, group_size)
+            success_count = success_groups.sum(dim=-1)
+            p_hat = success_groups.mean(dim=-1, keepdim=True)
+            if adv_type in ("decision_maxrl", "decision_maxrl_aux_rloo"):
+                outcome_adv = compute_decision_maxrl_outcome_advantages(
+                    episode_success=success,
+                    group_size=group_size,
+                    epsilon=float(kwargs["maxrl_epsilon"]),
+                ).reshape_as(success_groups)
+                metric_prefix = (
+                    "maxrl_aux_rloo"
+                    if adv_type == "decision_maxrl_aux_rloo"
+                    else "maxrl"
+                )
+            else:
+                outcome_adv = compute_decision_rloo_outcome_advantages(
+                    episode_success=success,
+                    group_size=group_size,
+                ).reshape_as(success_groups)
+                metric_prefix = (
+                    "rloo_aux_rloo"
+                    if adv_type == "decision_rloo_aux_rloo"
+                    else "rloo"
+                )
+            success_values = outcome_adv[success_groups.bool()]
+            failure_values = outcome_adv[~success_groups.bool()]
+            maxrl_metrics = {
+                f"grpo/{metric_prefix}_success_count": success_count.mean().item(),
+                f"grpo/{metric_prefix}_p_hat": p_hat.mean().item(),
+                f"grpo/{metric_prefix}_p_hat_min": p_hat.min().item(),
+                f"grpo/{metric_prefix}_p_hat_max": p_hat.max().item(),
+                f"grpo/{metric_prefix}_all_failure_group_rate": (
+                    (success_count == 0).float().mean().item()
+                ),
+                f"grpo/{metric_prefix}_update_eligible_group_rate": (
+                    (success_count > 0).float().mean().item()
+                ),
+                f"grpo/{metric_prefix}_success_outcome_advantage": (
+                    success_values.mean().item() if success_values.numel() else 0.0
+                ),
+                f"grpo/{metric_prefix}_failure_outcome_advantage": (
+                    failure_values.mean().item() if failure_values.numel() else 0.0
+                ),
+            }
+            if adv_type == "decision_maxrl_aux_rloo":
+                maxrl_metrics["grpo/maxrl_aux_coef"] = float(
+                    kwargs["maxrl_aux_coef"]
+                )
+            elif adv_type == "decision_rloo_aux_rloo":
+                maxrl_metrics["grpo/rloo_aux_coef"] = float(
+                    kwargs["rloo_aux_coef"]
+                )
+        # This trajectory-level label was only needed by the advantage estimator.
+        # Keeping it would make the later decision-level training flattening see a
+        # shorter tensor than the action/reward tensors.
+        self.rollout_batch.pop("episode_success", None)
+        self.rollout_batch.pop("episode_terminal_score", None)
         if kwargs["loss_mask"] is not None:
             self.rollout_batch.update({"loss_mask": kwargs["loss_mask"]})
         if kwargs["loss_mask_sum"] is not None:
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        rollout_metrics.update(maxrl_metrics)
         return rollout_metrics
 
     def _build_sft_data_loader(self):
@@ -1517,6 +1668,143 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             return True
 
     @torch.no_grad()
+    def _collect_termination_shadow_embodied(self) -> int:
+        """Run and persist the read-only DITA termination shadow judge."""
+        shadow_cfg = self.cfg.actor.model.get("termination_shadow", None)
+        if shadow_cfg is None or not bool(shadow_cfg.get("enabled", False)):
+            return 0
+        forward_inputs = self.rollout_batch.get("forward_inputs")
+        if not forward_inputs or "termination_shadow_input_ids" not in forward_inputs:
+            raise RuntimeError(
+                "termination shadow is enabled but rollout shadow inputs are missing"
+            )
+
+        n_step, batch_size = self.rollout_batch["prev_logprobs"].shape[:2]
+        rollout_size = n_step * batch_size
+        micro_bsz = int(self.cfg.actor.micro_batch_size)
+        truncated = (rollout_size // micro_bsz) * micro_bsz
+        if self._world_size > 1:
+            truncated = all_reduce_int(truncated)
+        if truncated == 0:
+            return 0
+
+        indices = torch.arange(truncated)
+        loss_mask = self.rollout_batch.get("loss_mask")
+        if loss_mask is None:
+            training_valid = torch.ones(
+                n_step, batch_size, 1, dtype=torch.bool
+            )
+        else:
+            training_valid = loss_mask.reshape(n_step, batch_size, -1).any(
+                dim=-1, keepdim=True
+            )
+        flat_batch = process_nested_dict_for_train(
+            {
+                "forward_inputs": forward_inputs,
+                "termination_shadow_training_valid": training_valid,
+            },
+            indices,
+        )
+        num_mbs = truncated // micro_bsz
+        mbs_iter = split_dict_to_chunk(flat_batch, num_mbs)
+
+        was_training = self.model.training
+        self.model.eval()
+        feature_chunks = []
+        probability_chunks = []
+        training_valid_chunks = []
+        metadata: dict[str, list[torch.Tensor]] = {}
+        metadata_keys = (
+            "termination_shadow_valid",
+            "termination_shadow_dtg",
+            "termination_shadow_start_dtg",
+            "termination_shadow_success_distance",
+            "termination_shadow_oracle_within_radius",
+            "termination_shadow_eligible_clean_stop",
+            "termination_shadow_episode_id",
+            "termination_shadow_trial_id",
+            "termination_shadow_decision_index",
+        )
+        try:
+            for micro_batch in mbs_iter:
+                micro_batch = put_tensor_device(
+                    micro_batch,
+                    f"{Worker.torch_device_type}:{int(os.environ['LOCAL_RANK'])}",
+                )
+                with self.amp_context:
+                    output = self.model(
+                        forward_inputs=micro_batch["forward_inputs"],
+                        compute_logprobs=False,
+                        compute_entropy=False,
+                        compute_values=False,
+                        use_cache=False,
+                        termination_shadow_only=True,
+                    )
+                feature_chunks.append(
+                    output["termination_shadow_hidden"].detach().to("cpu")
+                )
+                probability_chunks.append(
+                    output["termination_shadow_probability"].detach().to("cpu")
+                )
+                training_valid_chunks.append(
+                    micro_batch["termination_shadow_training_valid"]
+                    .detach()
+                    .to("cpu")
+                )
+                for key in metadata_keys:
+                    value = micro_batch["forward_inputs"].get(key)
+                    if value is None:
+                        raise RuntimeError(
+                            f"termination shadow metadata is missing {key!r}"
+                        )
+                    metadata.setdefault(key, []).append(value.detach().to("cpu"))
+        finally:
+            if was_training:
+                self.model.train()
+
+        features = torch.cat(feature_chunks, dim=0)
+        probabilities = torch.cat(probability_chunks, dim=0).reshape(-1)
+        merged_metadata = {
+            key: torch.cat(chunks, dim=0).reshape(-1)
+            for key, chunks in metadata.items()
+        }
+        valid = merged_metadata["termination_shadow_valid"].bool()
+        valid &= torch.cat(training_valid_chunks, dim=0).reshape(-1).bool()
+        valid &= torch.isfinite(merged_metadata["termination_shadow_dtg"].float())
+        valid &= torch.isfinite(features).all(dim=1)
+        valid &= torch.isfinite(probabilities)
+
+        output_dir = os.path.abspath(str(shadow_cfg.get("output_dir", "")))
+        if not output_dir:
+            raise ValueError("termination_shadow.output_dir must be configured")
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(
+            output_dir,
+            f"shadow_rank{self._rank:02d}_step{self.optimizer_steps:06d}_"
+            f"{time.time_ns()}.npz",
+        )
+        np.savez_compressed(
+            output_path,
+            hidden=features[valid].to(torch.float16).numpy(),
+            probability=probabilities[valid].float().numpy(),
+            prediction=(probabilities[valid] >= 0.5).numpy(),
+            **{
+                key.removeprefix("termination_shadow_"): value[valid].numpy()
+                for key, value in merged_metadata.items()
+                if key != "termination_shadow_valid"
+            },
+        )
+        count = int(valid.sum().item())
+        print(
+            "[DITA-shadow] "
+            f"rank={self._rank} samples={count}/{truncated} path={output_path}",
+            flush=True,
+        )
+        del feature_chunks, probability_chunks, features, probabilities, flat_batch
+        torch.cuda.empty_cache()
+        return count
+
+    @torch.no_grad()
     def _recompute_prev_logprobs_embodied(self) -> None:
         """
         Embodied path: recompute prev_logprobs with the current actor weights in
@@ -1627,6 +1915,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.model.eval()
 
         recompute_chunks = []
+        validate_visual_replay = os.environ.get(
+            "RLINF_VALIDATE_ACTOR_VISUAL_REPLAY", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        visual_replay_validated = False
         try:
             for mb in mbs_iter:
                 mb = put_tensor_device(
@@ -1641,6 +1933,49 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         compute_values=False,
                         use_cache=False,
                     )
+                if validate_visual_replay and not visual_replay_validated:
+                    replay_inputs = mb["forward_inputs"]
+                    grid = replay_inputs.get("image_grid_thw")
+                    pixels = replay_inputs.get("pixel_values")
+                    active_images = int(
+                        (grid.prod(dim=-1) > 0).sum().item()
+                    ) if grid is not None else 0
+                    active_patches = int(
+                        grid.prod(dim=-1).sum().item()
+                    ) if grid is not None else 0
+                    if pixels is None or active_images == 0 or active_patches == 0:
+                        raise RuntimeError(
+                            "[actor-visual-replay] validation batch contains no "
+                            "active visual input"
+                        )
+                    zeroed_inputs = dict(replay_inputs)
+                    zeroed_inputs["pixel_values"] = torch.zeros_like(pixels)
+                    with self.amp_context:
+                        zeroed = self.model(
+                            forward_inputs=zeroed_inputs,
+                            compute_logprobs=True,
+                            compute_entropy=False,
+                            compute_values=False,
+                            use_cache=False,
+                        )
+                    response_mask = replay_inputs["response_mask"].bool()
+                    delta = (out["logprobs"] - zeroed["logprobs"]).abs()
+                    delta = delta.masked_select(response_mask)
+                    delta_max = float(delta.max().item()) if delta.numel() else 0.0
+                    delta_mean = float(delta.mean().item()) if delta.numel() else 0.0
+                    if not math.isfinite(delta_max) or delta_max <= 1e-6:
+                        raise RuntimeError(
+                            "[actor-visual-replay] actor response log-prob is not "
+                            f"sensitive to pixels: delta_max={delta_max}"
+                        )
+                    print(
+                        "[actor-visual-replay] PASS "
+                        f"rank={self._rank} images={active_images} "
+                        f"patches={active_patches} delta_mean={delta_mean:.6f} "
+                        f"delta_max={delta_max:.6f}",
+                        flush=True,
+                    )
+                    visual_replay_validated = True
                 recompute_chunks.append(out["logprobs"].detach().to("cpu"))
         finally:
             if was_training:
@@ -1692,13 +2027,81 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.is_optimizer_offloaded:
             self.load_optimizer(self.device)
 
+        shadow_cfg = self.cfg.actor.model.get("termination_shadow", None)
+        recomputed_for_shadow = False
+        if shadow_cfg is not None and bool(shadow_cfg.get("enabled", False)):
+            # Exercise the established actor multimodal forward first.  Besides
+            # preserving the normal recompute contract, this separates actor/FSDP
+            # vision failures from shadow-prompt failures during diagnostics.
+            self._recompute_prev_logprobs_embodied()
+            recomputed_for_shadow = bool(
+                self.cfg.algorithm.get("recompute_prev_logprobs", False)
+            )
+            shadow_samples = self._collect_termination_shadow_embodied()
+            if bool(shadow_cfg.get("collect_only", False)):
+                self.optimizer.zero_grad()
+                return {
+                    "actor/termination_shadow_samples": float(shadow_samples),
+                    "actor/termination_shadow_collect_only": 1.0,
+                    "actor/grad_norm": 0.0,
+                    "actor/policy_loss": 0.0,
+                }
+
+        if self.cfg.algorithm.adv_type in (
+            "decision_maxrl_aux_rloo",
+            "decision_rloo_aux_rloo",
+            "decision_terminal_grpo",
+        ):
+            advantages = self.rollout_batch.get("advantages")
+            loss_mask = self.rollout_batch.get("loss_mask")
+            if advantages is not None:
+                valid = torch.isfinite(advantages)
+                if loss_mask is not None:
+                    valid &= loss_mask.to(dtype=torch.bool)
+                local_nonzero = bool(
+                    valid.any()
+                    and advantages.masked_select(valid).abs().max().item() > 1e-12
+                )
+                global_nonzero = torch.tensor(
+                    float(local_nonzero),
+                    device=f"{Worker.torch_device_type}:{int(os.environ['LOCAL_RANK'])}",
+                )
+                if torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(
+                        global_nonzero, op=torch.distributed.ReduceOp.MAX
+                    )
+                if global_nonzero.item() == 0.0:
+                    self.optimizer.zero_grad()
+                    if self._rank == 0:
+                        print(
+                            "[FSDPActor] Skipping optimizer step: "
+                            f"{self.cfg.algorithm.adv_type} has zero valid advantage",
+                            flush=True,
+                        )
+                    return {
+                        "actor/skipped_zero_advantage": 1.0,
+                        "actor/grad_norm": 0.0,
+                        "actor/policy_loss": 0.0,
+                    }
+
         # Actor-side recompute of prev_logprobs (no-op unless algorithm.recompute_prev_logprobs=True).
         # Must run BEFORE shuffle/training so the recomputed tensor flows through the
         # same process_nested_dict_for_train path along with rollout_prev_logprobs.
-        self._recompute_prev_logprobs_embodied()
+        if not recomputed_for_shadow:
+            self._recompute_prev_logprobs_embodied()
 
         self.model.train()
         actor_ratio_debug_prints = 0
+        early_stop_approx_kl = self.cfg.algorithm.get(
+            "early_stop_approx_kl", None
+        )
+        if early_stop_approx_kl is not None:
+            early_stop_approx_kl = float(early_stop_approx_kl)
+            if early_stop_approx_kl <= 0.0:
+                raise ValueError("algorithm.early_stop_approx_kl must be positive")
+        early_stop_triggered = False
+        max_observed_approx_kl = 0.0
+        optimizer_steps_this_update = 0
 
         rollout_size = (
             self.rollout_batch["prev_logprobs"].shape[0]
@@ -1769,6 +2172,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             for global_batch_idx, train_global_batch in enumerate(
                 rollout_dataloader_iter
             ):
+                global_batch_approx_kls = []
                 # split batch into micro_batches
                 train_global_batch_size = train_global_batch["prev_logprobs"].shape[0]
                 assert (
@@ -1883,6 +2287,38 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         < self.critic_warmup_steps,
                     }
                     loss, metrics_data = policy_loss(**kwargs)
+                    approx_kl_metric = metrics_data.get("actor/approx_kl")
+                    if approx_kl_metric is not None:
+                        global_batch_approx_kls.append(
+                            torch.as_tensor(
+                                approx_kl_metric,
+                                device=output_dict["logprobs"].device,
+                                dtype=torch.float32,
+                            ).detach()
+                        )
+                    action_token_mask = None
+                    if forward_inputs is not None and \
+                       "ppo_token_loss_mask" in forward_inputs:
+                        action_token_mask = forward_inputs["ppo_token_loss_mask"].to(
+                            output_dict["logprobs"].device
+                        ).bool()
+                        if action_token_mask.shape != output_dict["logprobs"].shape:
+                            action_token_mask = None
+                        elif loss_mask is not None and loss_mask.shape == action_token_mask.shape:
+                            action_token_mask &= loss_mask.to(
+                                action_token_mask.device
+                            ).bool()
+                    if action_token_mask is not None:
+                        valid_action_logprobs = output_dict["logprobs"].detach()[
+                            action_token_mask
+                        ]
+                        if valid_action_logprobs.numel():
+                            metrics_data["actor/action_token_nll"] = (
+                                -valid_action_logprobs.mean()
+                            ).item()
+                            metrics_data["actor/action_token_logprob_std"] = (
+                                valid_action_logprobs.float().std(unbiased=False)
+                            ).item()
                     if self._debug_actor_ratio(
                         output_logprobs=output_dict["logprobs"],
                         prev_logprobs=prev_logprobs,
@@ -1924,7 +2360,40 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                 self.torch_platform.empty_cache()
 
+                if global_batch_approx_kls:
+                    batch_approx_kl = torch.stack(global_batch_approx_kls).mean()
+                    if torch.distributed.is_initialized():
+                        torch.distributed.all_reduce(
+                            batch_approx_kl, op=torch.distributed.ReduceOp.SUM
+                        )
+                        batch_approx_kl /= torch.distributed.get_world_size()
+                    batch_approx_kl_value = float(batch_approx_kl.item())
+                    if np.isfinite(batch_approx_kl_value):
+                        max_observed_approx_kl = max(
+                            max_observed_approx_kl, batch_approx_kl_value
+                        )
+                    if (
+                        early_stop_approx_kl is not None
+                        and np.isfinite(batch_approx_kl_value)
+                        and batch_approx_kl_value >= early_stop_approx_kl
+                    ):
+                        # The gradients from this already-diverged minibatch are
+                        # intentionally discarded. Earlier optimizer steps in the
+                        # same actor update remain valid.
+                        self.optimizer.zero_grad()
+                        early_stop_triggered = True
+                        if self._rank == 0:
+                            print(
+                                "[FSDPActor][approx-kl-early-stop] "
+                                f"observed={batch_approx_kl_value:.6f} "
+                                f"threshold={early_stop_approx_kl:.6f} "
+                                f"optimizer_steps={optimizer_steps_this_update}",
+                                flush=True,
+                            )
+                        break
+
                 grad_norm, lr_list = self.optimizer_step()
+                optimizer_steps_this_update += 1
                 data = {
                     "actor/grad_norm": grad_norm,
                     "actor/lr": lr_list[0],
@@ -1932,14 +2401,35 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 if len(lr_list) > 1:
                     data["critic/lr"] = lr_list[1]
                 append_to_dict(metrics, data)
+            if early_stop_triggered:
+                break
         # put LR scheduler step here
-        self.lr_scheduler.step()
+        if optimizer_steps_this_update > 0:
+            self.lr_scheduler.step()
         self.optimizer.zero_grad()
         clear_memory()
+        append_to_dict(
+            metrics,
+            {
+                "actor/early_stop_approx_kl_triggered": float(
+                    early_stop_triggered
+                ),
+                "actor/early_stop_approx_kl_max": max_observed_approx_kl,
+                "actor/optimizer_steps_this_update": float(
+                    optimizer_steps_this_update
+                ),
+            },
+        )
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )
+        if self.cfg.algorithm.adv_type in (
+            "decision_maxrl_aux_rloo",
+            "decision_rloo_aux_rloo",
+            "decision_terminal_grpo",
+        ):
+            mean_metric_dict["actor/skipped_zero_advantage"] = 0.0
 
         return mean_metric_dict
 

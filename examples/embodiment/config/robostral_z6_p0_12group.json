@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "scene_id": "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb",
+  "group_size": 8,
+  "notes": "P0 12-group early-learning check. Stratified by start Euclidean DTG quartiles and reference-path length. Eval IDs excluded. Original start pose and instruction unchanged.",
+  "held_out_dev": [
+    "207",
+    "432",
+    "550",
+    "559",
+    "705"
+  ],
+  "anchor": [
+    "586"
+  ],
+  "groups": [
+    {
+      "episode_id": "1558",
+      "trial_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "start_dtg_m": 5.029,
+      "ref_path_len_m": 5.051
+    },
+    {
+      "episode_id": "918",
+      "trial_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "start_dtg_m": 6.792,
+      "ref_path_len_m": 6.809
+    },
+    {
+      "episode_id": "1134",
+      "trial_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "start_dtg_m": 7.984,
+      "ref_path_len_m": 13.061
+    },
+    {
+      "episode_id": "625",
+      "trial_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "start_dtg_m": 8.243,
+      "ref_path_len_m": 8.243
+    },
+    {
+      "episode_id": "1400",
+      "trial_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "start_dtg_m": 8.383,
+      "ref_path_len_m": 10.612
+    },
+    {
+      "episode_id": "1239",
+      "trial_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "start_dtg_m": 8.706,
+      "ref_path_len_m": 11.944
+    },
+    {
+      "episode_id": "1300",
+      "trial_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "start_dtg_m": 9.893,
+      "ref_path_len_m": 9.894
+    },
+    {
+      "episode_id": "1251",
+      "trial_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "start_dtg_m": 10.607,
+      "ref_path_len_m": 11.086
+    },
+    {
+      "episode_id": "1311",
+      "trial_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "start_dtg_m": 9.759,
+      "ref_path_len_m": 14.61
+    },
+    {
+      "episode_id": "205",
+      "trial_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "start_dtg_m": 11.509,
+      "ref_path_len_m": 11.51
+    },
+    {
+      "episode_id": "1495",
+      "trial_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "start_dtg_m": 14.84,
+      "ref_path_len_m": 15.705
+    },
+    {
+      "episode_id": "552",
+      "trial_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "start_dtg_m": 14.967,
+      "ref_path_len_m": 17.908
+    }
+  ]
+}

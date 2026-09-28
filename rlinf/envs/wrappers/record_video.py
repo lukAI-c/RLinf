@@ -407,6 +407,16 @@ class RecordVideo(gym.Wrapper):
                 self.add_new_frames(obs_list, infos_list, rewards, terminations)
         return result
 
+    def force_eval_timeout(self):
+        """Forward an environment-specific evaluation finalization hook.
+
+        ``gymnasium.Wrapper`` does not proxy arbitrary custom methods. Habitat
+        evaluation uses this hook to turn an unfinished rollout horizon into a
+        terminal timeout and return its episode metrics. Without an explicit
+        forwarder, EnvWorker skips the hook when this video wrapper is present.
+        """
+        return self.env.force_eval_timeout()
+
     def flush_video(self, video_sub_dir: Optional[str] = None):
         """Write buffered frames to an MP4 file (async)."""
         if not self.render_images:
@@ -447,6 +457,17 @@ class RecordVideo(gym.Wrapper):
     def _prune_futures(self) -> None:
         """Remove finished futures to avoid unbounded growth."""
         self._save_futures = [f for f in self._save_futures if not f.done()]
+
+    def wait_for_video_writes(self) -> None:
+        """Wait for videos flushed during the current rollout to finish.
+
+        EnvWorker may finish an evaluation rollout without closing the wrapper.
+        Waiting here preserves the existing asynchronous write path while
+        ensuring the process does not exit with a truncated MP4.
+        """
+        for future in self._save_futures:
+            future.result()
+        self._save_futures = []
 
     def close(self):
         """Wait for pending video writes before closing."""

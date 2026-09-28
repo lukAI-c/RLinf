@@ -38,7 +38,232 @@ from rlinf.utils.nested_dict_process import (
     split_dict,
     update_nested_cfg,
 )
+from rlinf.envs.genark.terminal_navigation_score import (
+    freeze_completed_episode_outcome,
+    score_from_completed_diagnostic,
+    validate_robostral_rft_contract,
+)
 from rlinf.utils.placement import HybridComponentPlacement
+
+
+def _mask_completed_episode_observations(
+    obs: dict[str, Any], completed: torch.Tensor
+) -> dict[str, Any]:
+    """Keep completed decision-rollout slots dormant after an env group reset."""
+    completed = completed.detach().to(device="cpu", dtype=torch.bool).reshape(-1)
+    if not bool(completed.any().item()):
+        return obs
+
+    masked = dict(obs)
+    task_descriptions = masked.get("task_descriptions")
+    if task_descriptions is not None:
+        if len(task_descriptions) != completed.numel():
+            raise ValueError(
+                "task_descriptions and completed mask must have the same length"
+            )
+        masked["task_descriptions"] = [
+            "" if bool(completed[i].item()) else description
+            for i, description in enumerate(task_descriptions)
+        ]
+
+    episode_active = masked.get("episode_active")
+    if episode_active is not None:
+        if isinstance(episode_active, torch.Tensor):
+            active = episode_active.clone()
+            flat = active.reshape(-1)
+            if flat.numel() != completed.numel():
+                raise ValueError(
+                    "episode_active and completed mask must have the same length"
+                )
+            flat[completed.to(device=flat.device)] = False
+            masked["episode_active"] = active
+        else:
+            active = np.asarray(episode_active).copy().reshape(-1)
+            if active.size != completed.numel():
+                raise ValueError(
+                    "episode_active and completed mask must have the same length"
+                )
+            active[completed.numpy()] = False
+            masked["episode_active"] = active
+    return masked
+
+
+def _all_episode_slots_inactive(obs: dict[str, Any]) -> bool:
+    """Return true only for an explicit, non-empty dormant-slot signal."""
+    episode_active = obs.get("episode_active")
+    if episode_active is None:
+        return False
+    active = torch.as_tensor(episode_active, dtype=torch.bool).reshape(-1)
+    return bool(active.numel() > 0 and not active.any().item())
+
+
+def _validate_decision_rloo_terminal_group(
+    episode_success: torch.Tensor,
+    diagnostics: list[dict],
+    *,
+    expected_size: int,
+    stage_id: int,
+    group_size: int | None = None,
+) -> None:
+    """Reject partial, duplicate, mixed, or verifier-inconsistent RLOO groups.
+
+    A batch may contain several same-episode groups. Each chunk of
+    ``group_size`` must be one GRPO/RLOO group. ``group_size`` defaults to
+    ``expected_size`` (one group per batch), matching the historical 8-env job.
+    """
+    success = episode_success.reshape(-1)
+    if success.numel() != expected_size or len(diagnostics) != expected_size:
+        raise RuntimeError(
+            "Decision-RLOO terminal group is incomplete: "
+            f"stage={stage_id} expected={expected_size} "
+            f"outcomes={success.numel()} diagnostics={len(diagnostics)}"
+        )
+    chunk = int(group_size) if group_size is not None else int(expected_size)
+    if chunk < 2 or expected_size % chunk != 0:
+        raise RuntimeError(
+            "Decision-RLOO batch is not aligned to group_size: "
+            f"stage={stage_id} expected={expected_size} group_size={chunk}"
+        )
+    for start in range(0, expected_size, chunk):
+        end = start + chunk
+        _validate_one_decision_rloo_group(
+            success[start:end],
+            diagnostics[start:end],
+            stage_id=stage_id,
+            group_index=start // chunk,
+        )
+
+
+def _validate_one_decision_rloo_group(
+    success: torch.Tensor,
+    diagnostics: list[dict],
+    *,
+    stage_id: int,
+    group_index: int,
+) -> None:
+    """One same-episode group of K trajectories."""
+    group_keys = {
+        (
+            int(diag.get("rft_group_id", -1)),
+            int(diag.get("rft_group_generation", -1)),
+        )
+        for diag in diagnostics
+    }
+    if len(group_keys) != 1 or next(iter(group_keys)) == (-1, -1):
+        raise RuntimeError(
+            "Decision-RLOO batch mixed terminal groups: "
+            f"stage={stage_id} group_index={group_index} groups={sorted(group_keys)}"
+        )
+
+    trial_keys = {
+        (
+            str(diag.get("episode_id", "")),
+            int(diag.get("trial_index", -1)),
+        )
+        for diag in diagnostics
+    }
+    if len(trial_keys) != success.numel() or any(
+        not episode_id or trial_index < 0
+        for episode_id, trial_index in trial_keys
+    ):
+        raise RuntimeError(
+            "Decision-RLOO batch contains invalid or duplicate trials: "
+            f"stage={stage_id} group_index={group_index} trials={sorted(trial_keys)}"
+        )
+
+    episode_ids = {str(diag.get("episode_id", "")) for diag in diagnostics}
+    if len(episode_ids) != 1 or "" in episode_ids:
+        raise RuntimeError(
+            "Decision-RLOO group mixed or missing episode IDs: "
+            f"stage={stage_id} group_index={group_index} episodes={sorted(episode_ids)}"
+        )
+
+    verifier_success = int(success.sum().item())
+    diagnostic_success = sum(
+        int(float(diag.get("clean_stop_success", 0.0)) > 0.5)
+        for diag in diagnostics
+    )
+    if verifier_success != diagnostic_success:
+        raise RuntimeError(
+            "Decision-RLOO outcome disagrees with terminal diagnostics: "
+            f"stage={stage_id} group_index={group_index} actor={verifier_success} "
+            f"curriculum={diagnostic_success}"
+        )
+
+
+def _validate_decision_terminal_grpo_group(
+    episode_success: torch.Tensor,
+    episode_terminal_score: torch.Tensor,
+    diagnostics: list[dict],
+    *,
+    expected_size: int,
+    stage_id: int,
+    distance_floor_m: float = 2.0,
+    clean_stop_bonus: float = 0.0,
+    success_distance: float = 3.0,
+    group_size: int | None = None,
+) -> None:
+    """Reject partial, mixed-episode, or score-inconsistent terminal-GRPO groups.
+
+    Multiple same-episode groups may share one batch. Each ``group_size`` chunk
+    must be one episode on one scene with finite, recomputable scores.
+    """
+    chunk = int(group_size) if group_size is not None else int(expected_size)
+    _validate_decision_rloo_terminal_group(
+        episode_success,
+        diagnostics,
+        expected_size=expected_size,
+        stage_id=stage_id,
+        group_size=chunk,
+    )
+    scores = episode_terminal_score.reshape(-1)
+    if scores.numel() != expected_size:
+        raise RuntimeError(
+            "decision_terminal_grpo terminal group is incomplete: "
+            f"stage={stage_id} expected={expected_size} scores={scores.numel()}"
+        )
+    if not torch.isfinite(scores).all():
+        raise RuntimeError(
+            "decision_terminal_grpo received a non-finite terminal score: "
+            f"stage={stage_id}"
+        )
+    for start in range(0, expected_size, chunk):
+        end = start + chunk
+        group_index = start // chunk
+        diags = diagnostics[start:end]
+        episode_ids = {str(diag.get("episode_id", "")) for diag in diags}
+        scene_ids = {str(diag.get("scene_id", "")) for diag in diags}
+        if len(episode_ids) != 1 or "" in episode_ids:
+            raise RuntimeError(
+                "decision_terminal_grpo mixed or missing episode IDs: "
+                f"stage={stage_id} group_index={group_index} "
+                f"episodes={sorted(episode_ids)}"
+            )
+        if len(scene_ids) != 1 or "" in scene_ids:
+            raise RuntimeError(
+                "decision_terminal_grpo mixed or missing scene IDs: "
+                f"stage={stage_id} group_index={group_index} "
+                f"scenes={sorted(scene_ids)}"
+            )
+        recomputed = torch.tensor(
+            [
+                score_from_completed_diagnostic(
+                    diag,
+                    distance_floor_m=distance_floor_m,
+                    clean_stop_bonus=clean_stop_bonus,
+                    success_distance=success_distance,
+                )
+                for diag in diags
+            ],
+            dtype=scores.dtype,
+        )
+        chunk_scores = scores[start:end].cpu()
+        if not torch.allclose(chunk_scores, recomputed, atol=1e-5, rtol=0.0):
+            raise RuntimeError(
+                "decision_terminal_grpo score disagrees with completed diagnostics: "
+                f"stage={stage_id} group_index={group_index} "
+                f"frozen={chunk_scores.tolist()} recomputed={recomputed.tolist()}"
+            )
 
 
 class EnvWorker(Worker):
@@ -46,6 +271,12 @@ class EnvWorker(Worker):
         Worker.__init__(self)
 
         self.cfg = cfg
+        contract_errors = validate_robostral_rft_contract(cfg)
+        if contract_errors:
+            raise ValueError(
+                "Robostral RFT contract failed before env allocation: "
+                + "; ".join(contract_errors)
+            )
         self.train_video_cnt = 0
         self.eval_video_cnt = 0
         self.should_stop = False
@@ -122,6 +353,15 @@ class EnvWorker(Worker):
                 for _ in range(self.stage_num)
             ]
 
+        # Reinforce-Ada candidate state is deliberately local to an EnvWorker.
+        # The runner holds actor updates while this pool is collected, so every
+        # entry in a pool comes from the same policy version.
+        self._reinforce_ada_pool_results: list[list[EmbodiedRolloutResult]] | None = None
+        self._reinforce_ada_pool_diags: list[list[dict]] | None = None
+        self._reinforce_ada_attempts = 0
+        self._reinforce_ada_ready_results: list[list[EmbodiedRolloutResult]] | None = None
+        self._reinforce_ada_ready_diags: list[list[dict]] | None = None
+
     def init_worker(self):
         self.dst_rank_map = self._setup_dst_rank_map()
         self.src_rank_map = self._setup_src_rank_map()
@@ -169,7 +409,24 @@ class EnvWorker(Worker):
         0 = full response (format/schema stage)
         1 = action/stop + bbox_2d/point_2d values (geometry stage)
         2 = action/stop values only (navigation/full stage and default)
+        3 = action/stop + target value (projection-aware RFT only)
         """
+        explicit_mode = str(
+            getattr(self.cfg.env.train, "ppo_loss_mask_mode", "auto")
+        ).lower()
+        explicit_ids = {
+            "full": 0,
+            "geometry": 1,
+            "action": 2,
+            "action_target": 3,
+        }
+        if explicit_mode != "auto":
+            if explicit_mode not in explicit_ids:
+                raise ValueError(
+                    f"Unknown ppo_loss_mask_mode={explicit_mode!r}; expected "
+                    "'auto', 'full', 'geometry', 'action', or 'action_target'."
+                )
+            return explicit_ids[explicit_mode]
         rcfg = getattr(self.cfg.env.train, "reward_curriculum", None)
         enabled = bool(getattr(rcfg, "enabled", False)) if rcfg is not None else False
         if not enabled:
@@ -476,7 +733,10 @@ class EnvWorker(Worker):
         return env_output, env_info
 
     def env_evaluate_step(
-        self, raw_actions: torch.Tensor, stage_id: int
+        self,
+        raw_actions: torch.Tensor,
+        stage_id: int,
+        force_eval_timeout: bool = False,
     ) -> tuple[EnvOutput, dict[str, Any]]:
         """
         This function is used to evaluate the environment.
@@ -495,6 +755,15 @@ class EnvWorker(Worker):
         obs_list, _, chunk_terminations, chunk_truncations, infos_list = (
             self.eval_env_list[stage_id].chunk_step(chunk_actions)
         )
+        if force_eval_timeout and hasattr(
+            self.eval_env_list[stage_id], "force_eval_timeout"
+        ):
+            forced_obs, forced_info, forced_done = (
+                self.eval_env_list[stage_id].force_eval_timeout()
+            )
+            obs_list[-1] = forced_obs
+            infos_list[-1] = forced_info
+            chunk_truncations[:, -1] |= torch.from_numpy(forced_done)
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):
@@ -725,6 +994,7 @@ class EnvWorker(Worker):
                     self.env_list[i], RecordVideo
                 ):
                     self.env_list[i].flush_video()
+                    self.env_list[i].wait_for_video_writes()
                 self.env_list[i].update_reset_state_ids()
         elif mode == "eval":
             for i in range(self.stage_num):
@@ -732,6 +1002,7 @@ class EnvWorker(Worker):
                     self.eval_env_list[i], RecordVideo
                 ):
                     self.eval_env_list[i].flush_video()
+                    self.eval_env_list[i].wait_for_video_writes()
                 if not self.cfg.env.eval.auto_reset:
                     self.eval_env_list[i].update_reset_state_ids()
 
@@ -944,6 +1215,19 @@ class EnvWorker(Worker):
         action = int(self._tensor_scalar(forward_inputs.get("action"), -1.0))
         return {
             "is_stop": action == 0,
+            "termination_shadow_valid": bool(
+                self._tensor_scalar(
+                    forward_inputs.get("termination_shadow_valid"), 0.0
+                )
+            ),
+            "termination_shadow_probability": self._tensor_scalar(
+                forward_inputs.get("termination_shadow_probability"), 0.0
+            ),
+            "termination_shadow_prediction": bool(
+                self._tensor_scalar(
+                    forward_inputs.get("termination_shadow_prediction"), 0.0
+                )
+            ),
             "grounded_sam_enabled": bool(
                 self._tensor_scalar(forward_inputs.get("grounded_sam_enabled"), 0.0)
             ),
@@ -955,6 +1239,16 @@ class EnvWorker(Worker):
             ),
             "grounded_sam_confidence": self._tensor_scalar(
                 forward_inputs.get("grounded_sam_confidence"), 0.0
+            ),
+            "projection_depth_exhausted": bool(
+                self._tensor_scalar(
+                    forward_inputs.get("projection_depth_exhausted"), 0.0
+                )
+            ),
+            "projection_backoff_count": int(
+                self._tensor_scalar(
+                    forward_inputs.get("projection_backoff_count"), 0.0
+                )
             ),
         }
 
@@ -1006,6 +1300,16 @@ class EnvWorker(Worker):
                 return None
         return cfg
 
+    def _reinforce_ada_cfg(self):
+        cfg = getattr(self.cfg.algorithm, "reinforce_ada", None)
+        if cfg is None or not bool(cfg.get("enabled", False)):
+            return None
+        if bool(cfg.get("only_episode_overfit", True)):
+            overfit_cfg = getattr(self.cfg.env.train, "episode_overfit", None)
+            if overfit_cfg is None or not bool(overfit_cfg.get("enabled", False)):
+                return None
+        return cfg
+
     def _candidate_record(
         self,
         env_i: int,
@@ -1014,12 +1318,28 @@ class EnvWorker(Worker):
     ) -> dict:
         diag = dict(diag_by_env.get(env_i, {}))
         success_type = str(diag.get("success_type", "unknown"))
-        success = float(diag.get("success", 0.0) or 0.0) > 0.5
+        # Fail closed: evaluator proximity is never a MaxRL success label.
+        success = float(diag.get("clean_stop_success", 0.0) or 0.0) > 0.5
+        reward_components = dict(diag.get("reward_components", {}) or {})
+        trajectory_reward_sum = self._trajectory_reward_sum(result)
+        component_sum = float(sum(float(v) for v in reward_components.values()))
+        terminal_component = float(
+            reward_components.get("success", 0.0)
+            + reward_components.get("wrong_stop", 0.0)
+            + reward_components.get("no_stop", 0.0)
+            + reward_components.get("path", 0.0)
+            + reward_components.get("endpoint", 0.0)
+        )
         return {
             "env_i": env_i,
             "episode_id": diag.get("episode_id", "?"),
             "scene_id": diag.get("scene_id", "?"),
-            "reward_sum": self._trajectory_reward_sum(result),
+            "reward_sum": trajectory_reward_sum,
+            "trajectory_reward_sum": trajectory_reward_sum,
+            "reward_components": reward_components,
+            "reward_component_sum": component_sum,
+            "reward_component_sum_gap": trajectory_reward_sum - component_sum,
+            "terminal_component": terminal_component,
             "success": success,
             "success_type": success_type,
             "wrong_stop": success_type == "wrong_stop",
@@ -1031,7 +1351,383 @@ class EnvWorker(Worker):
             "final_regression": float(diag.get("final_regression", 0.0) or 0.0),
             "steps_taken": float(diag.get("steps_taken", diag.get("steps", 0.0)) or 0.0),
             "parse_fail_count": float(diag.get("parse_fail_count", diag.get("parse_fail", 0.0)) or 0.0),
+            "ndtw": float(diag.get("ndtw", 0.0) or 0.0),
         }
+
+    @staticmethod
+    def _record_candidate_metric(env_metrics: dict[str, list], name: str, value: float) -> None:
+        env_metrics[name].append(torch.tensor([float(value)], dtype=torch.float32))
+
+    def _record_candidate_reward_attribution(
+        self, env_metrics: dict[str, list], candidates: list[dict]
+    ) -> None:
+        if not candidates:
+            return
+        wrong_stops = [c for c in candidates if c["wrong_stop"]]
+        successes = [c for c in candidates if c["success"]]
+        self._record_candidate_metric(
+            env_metrics,
+            "grpo/reward_component_sum_gap_mean",
+            float(np.mean([c["reward_component_sum_gap"] for c in candidates])),
+        )
+        self._record_candidate_metric(
+            env_metrics,
+            "grpo/wrong_stop_terminal_reward_mean",
+            float(np.mean([c["terminal_component"] for c in wrong_stops])) if wrong_stops else 0.0,
+        )
+        self._record_candidate_metric(
+            env_metrics,
+            "grpo/wrong_stop_positive_terminal_rate",
+            float(np.mean([c["terminal_component"] > 0.0 for c in wrong_stops])) if wrong_stops else 0.0,
+        )
+        self._record_candidate_metric(
+            env_metrics,
+            "grpo/success_terminal_reward_mean",
+            float(np.mean([c["terminal_component"] for c in successes])) if successes else 0.0,
+        )
+
+    def _select_reinforce_ada_pos_group(
+        self,
+        env_metrics: dict[str, list],
+        stage_id: int,
+        per_env_results: list[EmbodiedRolloutResult],
+        env_diag_snapshot: list[dict] | None,
+    ) -> tuple[list[EmbodiedRolloutResult], list[dict], bool]:
+        """Build one success-anchored GRPO group, or explicitly skip it.
+
+        Unlike the legacy diverse selector, this path never treats a recovered
+        failure as a success and never fills an all-failure group merely to make
+        reward variance non-zero.
+        """
+        cfg = self._reinforce_ada_cfg()
+        assert cfg is not None
+        train_group_size = int(cfg.get("train_group_size", self.cfg.algorithm.group_size))
+        min_successes = int(cfg.get("min_successes", 1))
+        min_failures = int(cfg.get("min_failures", train_group_size - min_successes))
+        diag_by_env = self._grpo_diag_by_env(stage_id, env_diag_snapshot)
+        candidates = [
+            self._candidate_record(env_i, result, diag_by_env)
+            for env_i, result in enumerate(per_env_results)
+        ]
+        self._record_candidate_reward_attribution(env_metrics, candidates)
+
+        successes = [c for c in candidates if c["success"]]
+        failures = [c for c in candidates if not c["success"]]
+        self._record_candidate_metric(env_metrics, "grpo/candidate_count", len(candidates))
+        self._record_candidate_metric(
+            env_metrics, "grpo/pool_success_rate", len(successes) / max(len(candidates), 1)
+        )
+
+        if len(successes) < min_successes or len(failures) < min_failures:
+            self._record_candidate_metric(env_metrics, "grpo/selected_success_count", 0.0)
+            print(
+                "[ReinforceAda][pos-skip] "
+                f"stage={stage_id} candidates={len(candidates)} "
+                f"successes={len(successes)} failures={len(failures)}",
+                flush=True,
+            )
+            return [], [], False
+
+        selected: list[int] = []
+        reasons: dict[int, str] = {}
+        # One true-success anchor. Ties prefer a closer, more faithful and shorter path.
+        self._select_unique_candidate(
+            selected,
+            reasons,
+            candidates,
+            key_fn=lambda c: (-c["final_dtg"], c["ndtw"], -c["steps_taken"], c["reward_sum"]),
+            reason="true_success",
+            predicate=lambda c: c["success"],
+        )
+        # Distinct failure roles keep the comparison interpretable without using
+        # raw reward as the primary selector.
+        self._select_unique_candidate(
+            selected,
+            reasons,
+            candidates,
+            key_fn=lambda c: (c["best_dtg_progress"], -c["final_dtg"]),
+            reason="progress_failure",
+            predicate=lambda c: not c["success"],
+        )
+        self._select_unique_candidate(
+            selected,
+            reasons,
+            candidates,
+            key_fn=lambda c: (-c["final_dtg"], c["best_dtg_progress"]),
+            reason="wrong_stop",
+            predicate=lambda c: c["wrong_stop"],
+        )
+        self._select_unique_candidate(
+            selected,
+            reasons,
+            candidates,
+            key_fn=lambda c: (c["final_regression"], -c["best_dtg_progress"]),
+            reason="no_stop_or_regression",
+            predicate=lambda c: c["no_stop"] or (not c["success"] and c["final_regression"] > 0.0),
+        )
+
+        # Fill only with failures. A pos group has exactly one success in v1.
+        remaining_failures = [
+            c for c in failures if c["env_i"] not in selected
+        ]
+        remaining_failures.sort(
+            key=lambda c: (c["best_dtg_progress"], c["final_regression"]), reverse=True
+        )
+        for candidate in remaining_failures:
+            if len(selected) >= train_group_size:
+                break
+            selected.append(int(candidate["env_i"]))
+            reasons[int(candidate["env_i"])] = "failure_fill"
+
+        if len(selected) != train_group_size:
+            raise RuntimeError(
+                "Reinforce-Ada pos selection could not construct a complete GRPO group: "
+                f"selected={len(selected)} expected={train_group_size}"
+            )
+
+        selected_results = [per_env_results[i] for i in selected]
+        selected_diag: list[dict] = []
+        selected_records = [candidates[i] for i in selected]
+        for local_i, env_i in enumerate(selected):
+            diag = dict(diag_by_env.get(env_i, {"env_id": env_i}))
+            diag["original_env_id"] = env_i
+            diag["env_id"] = local_i
+            selected_diag.append(diag)
+
+        rewards = torch.tensor([c["reward_sum"] for c in selected_records], dtype=torch.float32)
+        advantages = (rewards - rewards.mean()) / (rewards.std(unbiased=True) + 1e-6)
+        success_advantages = [
+            float(advantages[i]) for i, c in enumerate(selected_records) if c["success"]
+        ]
+        failure_advantages = [
+            float(advantages[i]) for i, c in enumerate(selected_records) if not c["success"]
+        ]
+        self._record_candidate_metric(env_metrics, "grpo/selected_success_count", sum(c["success"] for c in selected_records))
+        self._record_candidate_metric(
+            env_metrics, "grpo/success_advantage_mean", float(np.mean(success_advantages))
+        )
+        self._record_candidate_metric(
+            env_metrics, "grpo/failure_advantage_mean", float(np.mean(failure_advantages))
+        )
+        print(
+            "[ReinforceAda][pos-group] "
+            f"stage={stage_id} selected={selected} "
+            f"reward_sum={[round(c['reward_sum'], 3) for c in selected_records]} "
+            f"success_type={[c['success_type'] for c in selected_records]} "
+            f"components={[c['reward_components'] for c in selected_records]} "
+            f"selection_reason={[reasons[i] for i in selected]}",
+            flush=True,
+        )
+        return selected_results, selected_diag, True
+
+    def _clear_reinforce_ada_pool(self) -> None:
+        self._reinforce_ada_pool_results = None
+        self._reinforce_ada_pool_diags = None
+        self._reinforce_ada_attempts = 0
+        self._reinforce_ada_ready_results = None
+        self._reinforce_ada_ready_diags = None
+
+    def _collect_reinforce_ada_attempt(
+        self,
+        env_metrics: dict[str, list],
+        rollout_results_per_env: list[list[EmbodiedRolloutResult]],
+        completed_episode_diag_by_stage: list[dict[int, dict]],
+    ) -> dict:
+        """Append one rollout attempt and decide whether to retry or train."""
+        cfg = self._reinforce_ada_cfg()
+        assert cfg is not None
+        if self._reinforce_ada_pool_results is None:
+            self._reinforce_ada_pool_results = [[] for _ in range(self.stage_num)]
+            self._reinforce_ada_pool_diags = [[] for _ in range(self.stage_num)]
+
+        assert self._reinforce_ada_pool_diags is not None
+        self._reinforce_ada_attempts += 1
+        for stage_id, attempt_results in enumerate(rollout_results_per_env):
+            completed_by_env = completed_episode_diag_by_stage[stage_id]
+            expected_env_ids = set(range(len(attempt_results)))
+            if set(completed_by_env) != expected_env_ids:
+                raise RuntimeError(
+                    "Reinforce-Ada candidate attempt must contain exactly one completed "
+                    "episode per slot before it is added to the pool: "
+                    f"stage={stage_id} completed_env_ids={sorted(completed_by_env)} "
+                    f"expected_env_ids={sorted(expected_env_ids)}."
+                )
+            base = len(self._reinforce_ada_pool_results[stage_id])
+            attempt_diags = self._grpo_diag_by_env(
+                stage_id,
+                [completed_by_env[env_i] for env_i in range(len(attempt_results))],
+            )
+            for local_i, result in enumerate(attempt_results):
+                diag = dict(attempt_diags.get(local_i, {"env_id": local_i}))
+                diag["env_id"] = base + local_i
+                diag["candidate_attempt"] = self._reinforce_ada_attempts
+                self._reinforce_ada_pool_results[stage_id].append(result)
+                self._reinforce_ada_pool_diags[stage_id].append(diag)
+
+        candidate_count = len(self._reinforce_ada_pool_results[0])
+        max_candidates = int(cfg.get("max_candidates", cfg.get("initial_candidates", candidate_count)))
+        train_group_size = int(cfg.get("train_group_size", self.cfg.algorithm.group_size))
+        min_successes = int(cfg.get("min_successes", 1))
+        min_failures = int(cfg.get("min_failures", train_group_size - min_successes))
+        pool_diag_by_env = self._grpo_diag_by_env(
+            0, self._reinforce_ada_pool_diags[0]
+        )
+        pool_candidates = [
+            self._candidate_record(i, result, pool_diag_by_env)
+            for i, result in enumerate(self._reinforce_ada_pool_results[0])
+        ]
+        success_count = sum(c["success"] for c in pool_candidates)
+        failure_count = len(pool_candidates) - success_count
+        first_success_attempt = next(
+            (
+                int(self._reinforce_ada_pool_diags[0][i].get("candidate_attempt", 0))
+                for i, candidate in enumerate(pool_candidates)
+                if candidate["success"]
+            ),
+            0,
+        )
+        self._record_candidate_metric(env_metrics, "grpo/candidate_attempts", self._reinforce_ada_attempts)
+        self._record_candidate_metric(env_metrics, "grpo/candidate_count", candidate_count)
+        self._record_candidate_metric(env_metrics, "grpo/first_success_attempt", first_success_attempt)
+
+        enough_signal = success_count >= min_successes and failure_count >= min_failures
+        mode = str(cfg.get("mode", "adaptive_pos"))
+        if enough_signal:
+            ready_results: list[list[EmbodiedRolloutResult]] = []
+            ready_diags: list[list[dict]] = []
+            for stage_id in range(self.stage_num):
+                selected_results, selected_diags, should_train = self._select_reinforce_ada_pos_group(
+                    env_metrics,
+                    stage_id,
+                    self._reinforce_ada_pool_results[stage_id],
+                    self._reinforce_ada_pool_diags[stage_id],
+                )
+                if not should_train:
+                    raise RuntimeError("Reinforce-Ada pool reported signal but pos selection failed")
+                ready_results.append(selected_results)
+                ready_diags.append(selected_diags)
+            self._reinforce_ada_ready_results = ready_results
+            self._reinforce_ada_ready_diags = ready_diags
+            return {
+                "status": "ready_train",
+                "candidate_attempts": self._reinforce_ada_attempts,
+                "candidate_count": candidate_count,
+                "success_count": success_count,
+                "first_success_attempt": first_success_attempt,
+            }
+
+        if mode == "static_pos" or candidate_count >= max_candidates:
+            self._record_candidate_metric(env_metrics, "grpo/all_failure_after_max_budget_rate", success_count == 0)
+            self._record_candidate_metric(env_metrics, "grpo/group_skipped_rate", 1.0)
+            self._record_candidate_metric(env_metrics, "grpo/hard_prompt_rate", 1.0)
+            self._record_candidate_metric(
+                env_metrics,
+                "grpo/hard_prompt_best_progress",
+                max((c["best_dtg_progress"] for c in pool_candidates), default=0.0),
+            )
+            self._record_candidate_metric(
+                env_metrics,
+                "grpo/hard_prompt_min_dtg",
+                min((c["min_dtg"] for c in pool_candidates), default=0.0),
+            )
+            print(
+                "[ReinforceAda][exhausted] "
+                f"attempts={self._reinforce_ada_attempts} candidates={candidate_count} "
+                f"successes={success_count} failures={failure_count}",
+                flush=True,
+            )
+            return {
+                "status": "exhausted",
+                "candidate_attempts": self._reinforce_ada_attempts,
+                "candidate_count": candidate_count,
+                "success_count": success_count,
+                "first_success_attempt": first_success_attempt,
+            }
+
+        print(
+            "[ReinforceAda][retry] "
+            f"attempt={self._reinforce_ada_attempts} candidates={candidate_count}/{max_candidates} "
+            f"successes={success_count} failures={failure_count}",
+            flush=True,
+        )
+        return {
+            "status": "retry",
+            "candidate_attempts": self._reinforce_ada_attempts,
+            "candidate_count": candidate_count,
+            "success_count": success_count,
+            "first_success_attempt": first_success_attempt,
+        }
+
+    def _merge_decision_rollout_results(
+        self, per_env_results: list[EmbodiedRolloutResult], max_dec: int
+    ) -> EmbodiedRolloutResult | None:
+        """Stack full per-env decision trajectories into the actor wire format."""
+        if not per_env_results or not any(result.actions for result in per_env_results):
+            return None
+        ref_result = next(result for result in per_env_results if result.actions)
+        n_steps = int(max_dec)
+        assert all(len(result.rewards) == n_steps for result in per_env_results)
+        assert all(len(result.actions) == n_steps for result in per_env_results)
+        assert all(len(result.forward_inputs) == n_steps for result in per_env_results)
+        if ref_result.prev_logprobs:
+            assert all(len(result.prev_logprobs) == n_steps for result in per_env_results)
+        if ref_result.versions:
+            assert all(len(result.versions) == n_steps for result in per_env_results)
+
+        merged = EmbodiedRolloutResult(max_episode_length=self.cfg.env.train.max_episode_steps)
+        for t in range(n_steps):
+            merged.rewards.append(torch.cat([r.rewards[t] for r in per_env_results], dim=0))
+            merged.dones.append(torch.cat([r.dones[t] for r in per_env_results], dim=0))
+            merged.terminations.append(torch.cat([r.terminations[t] for r in per_env_results], dim=0))
+            merged.truncations.append(torch.cat([r.truncations[t] for r in per_env_results], dim=0))
+            merged.actions.append(torch.cat([r.actions[t] for r in per_env_results], dim=0))
+            merged.intervene_flags.append(torch.cat([r.intervene_flags[t] for r in per_env_results], dim=0))
+            if ref_result.prev_logprobs:
+                merged.prev_logprobs.append(torch.cat([r.prev_logprobs[t] for r in per_env_results], dim=0))
+            if ref_result.prev_values:
+                merged.prev_values.append(torch.cat([r.prev_values[t] for r in per_env_results], dim=0))
+            if ref_result.versions:
+                merged.versions.append(torch.cat([r.versions[t] for r in per_env_results], dim=0))
+            if ref_result.forward_inputs:
+                keys = ref_result.forward_inputs[t].keys()
+                merged.forward_inputs.append({
+                    key: torch.cat([r.forward_inputs[t][key] for r in per_env_results], dim=0)
+                    for key in keys
+                })
+        merged.dones.append(torch.cat([r.dones[n_steps] for r in per_env_results], dim=0))
+        merged.terminations.append(torch.cat([r.terminations[n_steps] for r in per_env_results], dim=0))
+        merged.truncations.append(torch.cat([r.truncations[n_steps] for r in per_env_results], dim=0))
+        return merged
+
+    async def emit_reinforce_ada_trajectories(self, actor_channel: Channel) -> None:
+        if self._reinforce_ada_ready_results is None:
+            raise RuntimeError("Reinforce-Ada has no ready success-anchored group to emit")
+        max_dec = int(self.cfg.env.train.max_decisions_per_rollout_epoch)
+        for stage_id, selected_results in enumerate(self._reinforce_ada_ready_results):
+            merged = self._merge_decision_rollout_results(selected_results, max_dec)
+            if merged is None:
+                raise RuntimeError(f"Reinforce-Ada stage {stage_id} has no valid trajectories")
+            await self.send_rollout_trajectories(merged, actor_channel)
+        self._clear_reinforce_ada_pool()
+
+    def discard_reinforce_ada_pool(self) -> None:
+        self._clear_reinforce_ada_pool()
+
+    def reset_reinforce_ada_candidates(self) -> None:
+        """Restart the fixed overfit episode before an adaptive retry.
+
+        Auto-reset only resets slots that have already terminated. A candidate
+        that consumed its decision budget without a STOP can otherwise leak its
+        terminal state into the next attempt, invalidating the independent-draw
+        assumption behind candidate collection.
+        """
+        if self._reinforce_ada_cfg() is None:
+            raise RuntimeError("reset_reinforce_ada_candidates called while Reinforce-Ada is disabled")
+        for stage_id, env in enumerate(self.env_list):
+            env.is_start = True
+            extracted_obs, _ = env.reset()
+            self.last_obs_list[stage_id] = extracted_obs
+            self.last_intervened_info_list[stage_id] = (None, None)
 
     @staticmethod
     def _select_unique_candidate(
@@ -1232,12 +1928,19 @@ class EnvWorker(Worker):
             diag_coverage = diag_count / max(len(members), 1)
             full_diag = diag_count == len(members)
 
-            success_count = sum(float(d.get("success", 0.0)) > 0.5 for d in member_diag)
+            success_count = sum(
+                float(d.get("clean_stop_success", 0.0)) > 0.5
+                for d in member_diag
+            )
             wrong_stop_count = sum(
                 str(d.get("success_type", "")) == "wrong_stop" for d in member_diag
             )
             no_stop_count = sum(
                 str(d.get("success_type", "")) == "no_stop" for d in member_diag
+            )
+            proximity_count = sum(
+                str(d.get("success_type", "")) == "proximity"
+                for d in member_diag
             )
             best_progress = [
                 float(d.get("best_dtg_progress", 0.0)) for d in member_diag
@@ -1275,6 +1978,7 @@ class EnvWorker(Worker):
                 _metric("grpo/all_wrong_stop_group_rate", all_wrong_stop)
                 _metric("grpo/group_wrong_stop_count", wrong_stop_count)
                 _metric("grpo/group_no_stop_count", no_stop_count)
+                _metric("grpo/group_proximity_count", proximity_count)
             if diag_count > 0:
                 _metric("grpo/group_best_progress_mean", best_progress_mean)
                 _metric("grpo/group_best_progress_std", best_progress_std)
@@ -1290,7 +1994,8 @@ class EnvWorker(Worker):
             if full_diag:
                 msg += (
                     f" success_count={success_count} all_failure={int(all_failure)} "
-                    f"wrong_stop={wrong_stop_count} no_stop={no_stop_count}"
+                    f"wrong_stop={wrong_stop_count} no_stop={no_stop_count} "
+                    f"proximity={proximity_count}"
                 )
             if diag_count > 0:
                 msg += (
@@ -1324,7 +2029,8 @@ class EnvWorker(Worker):
         actor_channel: Channel | None,
         *,
         cooperative_yield: bool,
-    ) -> dict[str, torch.Tensor]:
+        candidate_collection: bool = False,
+    ) -> dict[str, torch.Tensor] | dict:
         # Determine whether to use decision-level rollout.
         max_dec = self.cfg.env.train.get(
             "max_decisions_per_rollout_epoch",
@@ -1376,6 +2082,28 @@ class EnvWorker(Worker):
             completed_episode_diag_by_stage: list[dict[int, dict]] = [
                 {} for _ in range(self.stage_num)
             ]
+            # Candidate collection and decision-level GRPO both train on one
+            # completed episode per slot. Stop before a group reset contributes
+            # a second episode to the same trajectory batch.
+            decision_adv_type = str(self.cfg.algorithm.get("adv_type", "")).lower()
+            stop_after_first_episode = candidate_collection or decision_adv_type in (
+                "decision_grpo",
+                "decision_maxrl",
+                "decision_rloo",
+                "decision_maxrl_aux_rloo",
+                "decision_rloo_aux_rloo",
+                "decision_terminal_grpo",
+            )
+            episode_completed = (
+                [
+                    torch.zeros(
+                        self.train_num_envs_per_stage, dtype=torch.bool, device=_cpu
+                    )
+                    for _ in range(self.stage_num)
+                ]
+                if stop_after_first_episode
+                else None
+            )
         else:
             self.rollout_results: list[EmbodiedRolloutResult] = [
                 EmbodiedRolloutResult(
@@ -1410,19 +2138,32 @@ class EnvWorker(Worker):
                 if isinstance(_snapshots, list) and env_i < len(_snapshots)
                 else None
             )
-            if hasattr(_env, "compute_decision_ndtw_reward"):
+            _reward_env = _target_env
+            for _ in range(8):
+                if hasattr(_reward_env, "compute_decision_ndtw_reward"):
+                    break
+                _next_env = getattr(_reward_env, "env", _reward_env)
+                if _next_env is _reward_env:
+                    break
+                _reward_env = _next_env
+            # Env wrappers expose the regular Gym API but not GenArk's
+            # decision-reward / one-shot completion methods.  The traversal
+            # above already resolved the concrete environment for terminal
+            # snapshots, so use that same object for reward attribution and
+            # completed-episode ownership.
+            if hasattr(_reward_env, "compute_decision_ndtw_reward"):
                 policy_diag = self._policy_diag_from_forward_inputs(
                     pdata.get("forward_inputs")
                 )
                 try:
-                    _ndtw_r = _env.compute_decision_ndtw_reward(
+                    _ndtw_r = _reward_env.compute_decision_ndtw_reward(
                         [env_i],
                         policy_diag_by_env={env_i: policy_diag},
                     )
                 except TypeError:
-                    _ndtw_r = _env.compute_decision_ndtw_reward([env_i])
-                if hasattr(_env, "pop_gsam_reward_diagnostics"):
-                    for _name, _value in _env.pop_gsam_reward_diagnostics().items():
+                    _ndtw_r = _reward_env.compute_decision_ndtw_reward([env_i])
+                if hasattr(_reward_env, "pop_gsam_reward_diagnostics"):
+                    for _name, _value in _reward_env.pop_gsam_reward_diagnostics().items():
                         env_metrics[_name].append(
                             torch.tensor([float(_value)], dtype=torch.float32)
                         )
@@ -1436,15 +2177,16 @@ class EnvWorker(Worker):
                         "[GRPO][reward-debug] "
                         f"stage={stage_id} env={env_i} "
                         f"success={float(_terminal_snapshot.get('success', 0.0)):.0f} "
+                        f"clean_stop={float(_terminal_snapshot.get('clean_stop_success', 0.0)):.0f} "
                         f"cause={_terminal_snapshot.get('termination_cause')} "
                         f"decision_reward={_decision_reward:.6f} "
                         f"acc_before={_acc_before_terminal:.6f} "
                         f"acc_after={float(acc_rewards[stage_id][env_i].item()):.6f}",
                         flush=True,
                     )
-                if hasattr(_env, "pop_completed_episode_diagnostic"):
+                if hasattr(_reward_env, "pop_completed_episode_diagnostic"):
                     try:
-                        _completed_diag = _env.pop_completed_episode_diagnostic(env_i)
+                        _completed_diag = _reward_env.pop_completed_episode_diagnostic(env_i)
                     except Exception as exc:
                         print(
                             f"[GRPO][group-diag] stage={stage_id} env={env_i} "
@@ -1454,6 +2196,11 @@ class EnvWorker(Worker):
                         _completed_diag = None
                     if isinstance(_completed_diag, dict):
                         completed_episode_diag_by_stage[stage_id][env_i] = _completed_diag
+                        _freeze_completed_episode_outcome(
+                            stage_id,
+                            env_i,
+                            completed_diag=_completed_diag,
+                        )
 
             # acc_rewards is reused and cleared immediately below. Clone the
             # one-env slice so EmbodiedRolloutResult owns an immutable reward
@@ -1484,6 +2231,98 @@ class EnvWorker(Worker):
             acc_truncations[stage_id][env_i] = False
             pending_decision_data[stage_id][env_i] = None
             return True
+
+        def _missed_stop_terminal_pending(stage_id: int, env_i: int) -> bool:
+            """Read GenArk's training-only terminal request through wrappers."""
+            target_env = self.env_list[stage_id]
+            for _ in range(8):
+                if hasattr(target_env, "missed_stop_terminal_pending"):
+                    return bool(target_env.missed_stop_terminal_pending(env_i))
+                next_env = getattr(target_env, "env", target_env)
+                if next_env is target_env:
+                    break
+                target_env = next_env
+            return False
+
+        def _termination_shadow_metadata(
+            stage_id: int, env_i: int
+        ) -> dict[str, float | int]:
+            """Read shadow-judge labels without exposing them to observations."""
+            target_env = self.env_list[stage_id]
+            for _ in range(8):
+                if hasattr(target_env, "termination_shadow_metadata"):
+                    return dict(target_env.termination_shadow_metadata(env_i))
+                next_env = getattr(target_env, "env", target_env)
+                if next_env is target_env:
+                    break
+                target_env = next_env
+            return {}
+
+        def _terminal_score_kwargs() -> dict[str, float]:
+            score_cfg = self.cfg.env.train.get("terminal_navigation_score", None)
+            success_distance = float(self.cfg.env.train.get("success_distance", 3.0))
+            if score_cfg is None:
+                return {
+                    "distance_floor_m": 2.0,
+                    "clean_stop_bonus": 0.0,
+                    "success_distance": success_distance,
+                }
+            return {
+                "distance_floor_m": float(score_cfg.get("distance_floor_m", 2.0)),
+                "clean_stop_bonus": float(score_cfg.get("clean_stop_bonus", 0.0)),
+                "success_distance": success_distance,
+            }
+
+        def _resolve_reward_env(stage_id: int):
+            reward_env = self.env_list[stage_id]
+            for _ in range(8):
+                if hasattr(reward_env, "pop_completed_episode_diagnostic"):
+                    return reward_env
+                next_env = getattr(reward_env, "env", reward_env)
+                if next_env is reward_env:
+                    break
+                reward_env = next_env
+            return reward_env
+
+        def _freeze_completed_episode_outcome(
+            stage_id: int,
+            env_i: int,
+            completed_diag: dict | None = None,
+        ) -> bool:
+            """Persist success and terminal score from one completed diagnostic.
+
+            Covers both freeze paths:
+
+            1. ``_flush_pending_decision`` already popped the diagnostic.
+            2. ``terminal_now`` fallback pops it here because no pending
+               decision owned the terminal env step.
+            """
+            result = rollout_results_per_env[stage_id][env_i]
+            has_success = result.episode_success is not None
+            has_score = result.episode_terminal_score is not None
+            if has_success and has_score:
+                return True
+            if has_success != has_score:
+                raise RuntimeError(
+                    "partially frozen episode outcome: "
+                    f"stage={stage_id} env={env_i} "
+                    f"episode_success={'set' if has_success else 'missing'} "
+                    f"episode_terminal_score={'set' if has_score else 'missing'}"
+                )
+
+            if completed_diag is None:
+                reward_env = _resolve_reward_env(stage_id)
+                if not hasattr(reward_env, "pop_completed_episode_diagnostic"):
+                    return False
+                completed_diag = reward_env.pop_completed_episode_diagnostic(env_i)
+            if not isinstance(completed_diag, dict):
+                return False
+            completed_episode_diag_by_stage[stage_id][env_i] = completed_diag
+            return freeze_completed_episode_outcome(
+                result,
+                completed_diag,
+                **_terminal_score_kwargs(),
+            )
 
         for epoch in range(self.rollout_epoch):
             env_outputs = self.bootstrap_step()
@@ -1516,8 +2355,21 @@ class EnvWorker(Worker):
 
             if use_decision_rollout:
                 # ── Decision-level rollout loop ──────────────────────────────
-                # Safety bound: max_dec decisions × up to 10 env steps each + pipeline priming
-                safety_steps = max_dec * 10 + self.stage_num + 1
+                # A LaViRA waypoint may consume 15 primitive steps, so the old
+                # max_dec * 10 bound could terminate collection before every
+                # slot emitted its authoritative terminal diagnostic. Bound the
+                # coordinator by the actual episode primitive budget instead.
+                configured_safety_steps = self.cfg.env.train.get(
+                    "decision_rollout_safety_steps", None
+                )
+                episode_step_budget = int(
+                    self.cfg.env.train.get("max_episode_steps", max_dec * 15)
+                )
+                safety_steps = (
+                    int(configured_safety_steps)
+                    if configured_safety_steps is not None
+                    else max(max_dec * 15, episode_step_budget + max_dec)
+                ) + self.stage_num + 1
                 step = 0
                 received_bootstrap = False
                 # Track last seen env dormant state per stage for termination check
@@ -1628,6 +2480,12 @@ class EnvWorker(Worker):
                                 continue
                             if pending_decision_data[stage_id][env_i] is not None:
                                 _flush_pending_decision(stage_id, env_i)
+                            # The preceding decision has already received its
+                            # missed-stop penalty. Do not train on or execute the
+                            # newly generated action; GenArk consumes the pending
+                            # request in env_interact_step() and ends the slot.
+                            if _missed_stop_terminal_pending(stage_id, env_i):
+                                continue
                             if env_dormant[env_i]:
                                 continue
                             if decision_counts[stage_id][env_i] >= max_dec:
@@ -1637,6 +2495,24 @@ class EnvWorker(Worker):
                                 k: v[env_i:env_i + 1]
                                 for k, v in rollout_result.forward_inputs.items()
                             } if rollout_result.forward_inputs else {}
+                            if "termination_shadow_valid" in env_fi:
+                                shadow_meta = _termination_shadow_metadata(
+                                    stage_id, env_i
+                                )
+                                for key, value in shadow_meta.items():
+                                    dtype = (
+                                        torch.float32
+                                        if isinstance(value, float)
+                                        else torch.long
+                                    )
+                                    env_fi[f"termination_shadow_{key}"] = torch.tensor(
+                                        [[value]], dtype=dtype
+                                    )
+                                env_fi["termination_shadow_decision_index"] = (
+                                    decision_counts[stage_id][env_i]
+                                    .reshape(1, 1)
+                                    .clone()
+                                )
                             pending_decision_data[stage_id][env_i] = {
                                 "forward_inputs": env_fi,
                                 "prev_logprobs": (
@@ -1717,12 +2593,19 @@ class EnvWorker(Worker):
                         for env_i in range(self.train_num_envs_per_stage):
                             if bool(terminal_now[env_i].item()):
                                 _flush_pending_decision(stage_id, env_i)
+                                _freeze_completed_episode_outcome(stage_id, env_i)
+                        if episode_completed is not None:
+                            episode_completed[stage_id] |= terminal_now.reshape(-1)
 
                         # Non-terminal decisions stay pending while cached low-level
                         # actions replay, accumulating rewards into acc_rewards. They
                         # are flushed at the next LLM decision boundary or bootstrap.
 
                         env_batch = env_output.to_dict()
+                        if episode_completed is not None:
+                            env_batch["obs"] = _mask_completed_episode_observations(
+                                env_batch["obs"], episode_completed[stage_id]
+                            )
                         next_task_descs = env_batch["obs"].get("task_descriptions", None)
                         if next_task_descs is not None:
                             last_env_dormant[stage_id] = torch.tensor(
@@ -1746,12 +2629,18 @@ class EnvWorker(Worker):
                         # another (heterogeneous multi-scene termination otherwise crashes
                         # RolloutResult.merge). Single-scene: global == local, behavior is
                         # byte-identical to before.
-                        should_terminate = all(
-                            not (
-                                (decision_counts[s] < max_dec) & (~last_env_dormant[s])
-                            ).any()
-                            for s in range(self.stage_num)
-                        )
+                        if episode_completed is not None:
+                            should_terminate = all(
+                                completed.all().item()
+                                for completed in episode_completed
+                            )
+                        else:
+                            should_terminate = all(
+                                not (
+                                    (decision_counts[s] < max_dec) & (~last_env_dormant[s])
+                                ).any()
+                                for s in range(self.stage_num)
+                            )
                         env_batch["obs"]["should_terminate"] = torch.full(
                             (self.train_num_envs_per_stage,),
                             bool(should_terminate),
@@ -2010,7 +2899,18 @@ class EnvWorker(Worker):
             self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()
 
-        if actor_channel is not None:
+        candidate_outcome = None
+        if candidate_collection:
+            if not use_decision_rollout:
+                raise ValueError("Reinforce-Ada requires decision-level rollout")
+            if actor_channel is not None:
+                raise ValueError("candidate_collection defers actor emission; actor_channel must be None")
+            candidate_outcome = self._collect_reinforce_ada_attempt(
+                env_metrics,
+                rollout_results_per_env,
+                completed_episode_diag_by_stage,
+            )
+        elif actor_channel is not None:
             if use_decision_rollout:
                 # Merge per-env trajectories into a single EmbodiedRolloutResult per stage,
                 # then send as normal.  Each env has max_dec decision steps + 1 bootstrap
@@ -2047,9 +2947,11 @@ class EnvWorker(Worker):
                             len(r.versions) == n_steps for r in per_env_results
                         ), "decision rollout padding incomplete: versions length mismatch"
 
-                    selected_diag_snapshot = list(
-                        completed_episode_diag_by_stage[stage_id].values()
-                    )
+                    selected_diag_snapshot = [
+                        completed_episode_diag_by_stage[stage_id][env_i]
+                        for env_i in range(n_envs)
+                        if env_i in completed_episode_diag_by_stage[stage_id]
+                    ]
                     per_env_results, selected_diag_snapshot = (
                         self._select_candidate_group(
                             env_metrics,
@@ -2168,6 +3070,84 @@ class EnvWorker(Worker):
                     merged.terminations.append(torch.cat(bootstrap_terms_t, dim=0))
                     merged.truncations.append(torch.cat(bootstrap_trunc_t, dim=0))
 
+                    if decision_adv_type in (
+                        "decision_maxrl",
+                        "decision_rloo",
+                        "decision_maxrl_aux_rloo",
+                        "decision_rloo_aux_rloo",
+                        "decision_terminal_grpo",
+                    ):
+                        incomplete_slots = [
+                            env_i
+                            for env_i, result in enumerate(per_env_results)
+                            if result.episode_success is None
+                            or (
+                                decision_adv_type == "decision_terminal_grpo"
+                                and result.episode_terminal_score is None
+                            )
+                        ]
+                        if incomplete_slots:
+                            raise RuntimeError(
+                                "Decision-RLOO reached the rollout boundary "
+                                "without a complete terminal group; refusing "
+                                "to train unfinished slots as Y=0. "
+                                f"stage={stage_id} incomplete={incomplete_slots} "
+                                f"safety_steps={safety_steps}"
+                            )
+                        merged_episode_success = torch.cat(
+                            [r.episode_success for r in per_env_results], dim=1
+                        )
+                        algo_group_size = int(
+                            self.cfg.algorithm.get("group_size", n_envs) or n_envs
+                        )
+                        if decision_adv_type == "decision_terminal_grpo":
+                            merged_episode_score = torch.cat(
+                                [r.episode_terminal_score for r in per_env_results],
+                                dim=1,
+                            )
+                            score_cfg = self.cfg.env.train.get(
+                                "terminal_navigation_score", {}
+                            ) or {}
+                            _validate_decision_terminal_grpo_group(
+                                merged_episode_success,
+                                merged_episode_score,
+                                selected_diag_snapshot,
+                                expected_size=n_envs,
+                                stage_id=stage_id,
+                                group_size=algo_group_size,
+                                distance_floor_m=float(
+                                    score_cfg.get("distance_floor_m", 2.0)
+                                ),
+                                clean_stop_bonus=float(
+                                    score_cfg.get("clean_stop_bonus", 0.0)
+                                ),
+                                success_distance=float(
+                                    self.cfg.env.train.get("success_distance", 3.0)
+                                ),
+                            )
+                            merged.episode_success = merged_episode_success
+                            merged.episode_terminal_score = merged_episode_score
+                        else:
+                            _validate_decision_rloo_terminal_group(
+                                merged_episode_success,
+                                selected_diag_snapshot,
+                                expected_size=n_envs,
+                                stage_id=stage_id,
+                                group_size=algo_group_size,
+                            )
+                            merged.episode_success = merged_episode_success
+                            if all(
+                                r.episode_terminal_score is not None
+                                for r in per_env_results
+                            ):
+                                merged.episode_terminal_score = torch.cat(
+                                    [
+                                        r.episode_terminal_score
+                                        for r in per_env_results
+                                    ],
+                                    dim=1,
+                                )
+
                     await self.send_rollout_trajectories(merged, actor_channel)
             else:
                 for stage_id in range(self.stage_num):
@@ -2178,6 +3158,11 @@ class EnvWorker(Worker):
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
 
+        if candidate_collection:
+            return {
+                "metrics": env_metrics,
+                "candidate_outcome": candidate_outcome,
+            }
         return env_metrics
 
     @Worker.timer("interact")
@@ -2187,6 +3172,7 @@ class EnvWorker(Worker):
         rollout_channel: Channel,
         reward_channel: Channel | None,
         actor_channel: Channel | None = None,
+        candidate_collection: bool = False,
     ):
         env_metrics = await self._run_interact_once(
             input_channel,
@@ -2194,6 +3180,7 @@ class EnvWorker(Worker):
             reward_channel,
             actor_channel,
             cooperative_yield=False,
+            candidate_collection=candidate_collection,
         )
 
         for env in self.env_list:
@@ -2204,6 +3191,10 @@ class EnvWorker(Worker):
 
     def evaluate(self, input_channel: Channel, rollout_channel: Channel):
         eval_metrics = defaultdict(list)
+        dynamic_scene_queue = bool(
+            self.cfg.env.eval.get("dynamic_scene_queue", {}).get("enabled", False)
+        )
+        stage_all_dormant = [False] * self.stage_num
 
         for eval_rollout_epoch in range(self.cfg.algorithm.eval_rollout_epoch):
             if not self.cfg.env.eval.auto_reset or eval_rollout_epoch == 0:
@@ -2213,6 +3204,9 @@ class EnvWorker(Worker):
                         self.eval_num_envs_per_stage, dtype=torch.bool
                     )
                     extracted_obs, infos = self.eval_env_list[stage_id].reset()
+                    stage_all_dormant[stage_id] = (
+                        _all_episode_slots_inactive(extracted_obs)
+                    )
                     env_output = EnvOutput(
                         obs=extracted_obs,
                         final_obs=(
@@ -2232,12 +3226,29 @@ class EnvWorker(Worker):
                     )
 
             for eval_step in range(self.n_eval_chunk_steps):
+                dormant_sentinels = [False] * self.stage_num
                 for stage_id in range(self.stage_num):
                     raw_chunk_actions = self.recv_chunk_actions(
                         input_channel, mode="eval"
                     )
+                    if (
+                        dynamic_scene_queue
+                        and stage_all_dormant[stage_id]
+                        and bool(
+                            torch.as_tensor(raw_chunk_actions).eq(8).all().item()
+                        )
+                    ):
+                        dormant_sentinels[stage_id] = True
+                        continue
                     env_output, env_info = self.env_evaluate_step(
-                        raw_chunk_actions, stage_id
+                        raw_chunk_actions,
+                        stage_id,
+                        force_eval_timeout=(
+                            eval_step == self.n_eval_chunk_steps - 1
+                        ),
+                    )
+                    stage_all_dormant[stage_id] = (
+                        _all_episode_slots_inactive(env_output.obs)
                     )
 
                     for key, value in env_info.items():
@@ -2262,8 +3273,77 @@ class EnvWorker(Worker):
                         },
                         mode="eval",
                     )
+                if dynamic_scene_queue and all(dormant_sentinels):
+                    break
 
+            # env_evaluate_step finalizes adapters with a force_eval_timeout
+            # hook at every epoch boundary. This matters for persistent
+            # episode shards: NOOP does not advance Habitat primitive steps,
+            # but the current episode still must emit a terminal row before
+            # the next reset selects another episode.
             self.finish_rollout(mode="eval")
+        # Read the adapter's authoritative records only after every shard
+        # epoch has completed; sparse per-step infos are not a complete metric
+        # source for independently terminating simulator slots.
+        adapter_records = []
+        adapter_expected_records = 0
+        for stage_id in range(self.stage_num):
+            eval_env = self.eval_env_list[stage_id]
+            target_env = eval_env
+            while hasattr(target_env, "env") and not hasattr(
+                target_env, "get_episode_metrics"
+            ):
+                target_env = target_env.env
+            if hasattr(target_env, "get_episode_metrics"):
+                adapter_records.extend(target_env.get_episode_metrics())
+                # Most adapters evaluate one terminal row per local slot.  A
+                # shared-rollout Habitat adapter advances through a persistent
+                # episode shard across eval epochs, so its expected total is
+                # larger than the final epoch's local batch size.
+                adapter_expected_records += int(
+                    getattr(
+                        target_env,
+                        "expected_episode_metrics_count",
+                        self.eval_num_envs_per_stage,
+                    )
+                )
+
+        if adapter_expected_records:
+            expected_records = adapter_expected_records
+            if len(adapter_records) != expected_records:
+                raise RuntimeError(
+                    "Evaluation adapter returned an incomplete batch: "
+                    f"got={len(adapter_records)} expected={expected_records}"
+                )
+            trial_keys = [
+                (str(row.get("episode_id")), str(row.get("trial_id", "")))
+                for row in adapter_records
+            ]
+            if len(trial_keys) != len(set(trial_keys)):
+                raise RuntimeError(
+                    "Evaluation adapter returned duplicate trial metrics: "
+                    f"{trial_keys}"
+                )
+            eval_metrics = defaultdict(list)
+            numeric_keys = (
+                "success",
+                "habitat_success",
+                "distance_success",
+                "oracle_success",
+                "spl",
+                "ndtw",
+                "sdtw",
+                "distance_to_goal",
+                "path_length",
+                "steps_taken",
+            )
+            for row in adapter_records:
+                for key in numeric_keys:
+                    if key in row and row[key] is not None:
+                        eval_metrics[key].append(
+                            torch.tensor([float(row[key])], dtype=torch.float32)
+                        )
+
         for stage_id in range(self.stage_num):
             if self.cfg.env.eval.get("enable_offload", False) and hasattr(
                 self.eval_env_list[stage_id], "offload"

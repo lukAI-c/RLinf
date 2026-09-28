@@ -121,6 +121,303 @@ def compute_grpo_advantages(
     return advantages, None
 
 
+@register_advantage("decision_grpo")
+def compute_decision_grpo_advantages(
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    loss_mask: torch.Tensor,
+    group_size: int,
+    gamma: float = 1.0,
+    **kwargs,
+):
+    """Compute group-relative advantages independently for each decision.
+
+    ``rewards`` is [T, B], where each entry is the reward accumulated by one
+    LLM decision.  Unlike trajectory GRPO, this keeps T intact and uses the
+    discounted reward-to-go at each decision before normalising within its
+    GRPO group.
+    """
+    returns = torch.zeros_like(rewards)
+    future_return = torch.zeros_like(rewards[0])
+    for step in reversed(range(rewards.shape[0])):
+        future_return = rewards[step] + gamma * future_return * (~dones[step + 1])
+        returns[step] = future_return
+
+    num_groups = rewards.shape[1] // group_size
+    grouped_returns = returns.reshape(-1, num_groups, group_size)
+    valid = loss_mask.bool().reshape(-1, num_groups, group_size)
+    valid_count = valid.sum(dim=-1, keepdim=True)
+    valid_returns = torch.where(valid, grouped_returns, torch.zeros_like(grouped_returns))
+    mean = valid_returns.sum(dim=-1, keepdim=True) / valid_count.clamp_min(1)
+    centered = torch.where(valid, grouped_returns - mean, torch.zeros_like(grouped_returns))
+    # Match the existing GRPO convention: sample standard deviation within each
+    # group. Decisions with fewer than two live trajectories have no baseline.
+    variance = centered.square().sum(dim=-1, keepdim=True) / (valid_count - 1).clamp_min(1)
+    advantages = centered / (variance.sqrt() + 1e-6)
+    advantages = torch.where(valid_count >= 2, advantages, torch.zeros_like(advantages))
+    advantages = torch.where(valid, advantages, torch.zeros_like(advantages))
+
+    return advantages.reshape_as(rewards), None
+
+
+def compute_decision_aux_rloo_advantages(
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    loss_mask: torch.Tensor,
+    group_size: int,
+    gamma: float = 1.0,
+) -> torch.Tensor:
+    """Leave-one-out advantages for decision-level auxiliary returns.
+
+    Unlike decision GRPO, this estimator neither includes the current sample in
+    its baseline nor divides by a random group standard deviation. It therefore
+    preserves the scale chosen by the bounded auxiliary reward.
+    """
+    returns = torch.zeros_like(rewards)
+    future_return = torch.zeros_like(rewards[0])
+    for step in reversed(range(rewards.shape[0])):
+        future_return = rewards[step] + gamma * future_return * (~dones[step + 1])
+        returns[step] = future_return
+
+    num_groups = rewards.shape[1] // group_size
+    grouped_returns = returns.reshape(-1, num_groups, group_size)
+    valid = loss_mask.bool().reshape(-1, num_groups, group_size)
+    valid_returns = torch.where(valid, grouped_returns, torch.zeros_like(grouped_returns))
+    valid_count = valid.sum(dim=-1, keepdim=True)
+    other_count = valid_count - valid.to(dtype=valid_count.dtype)
+    other_sum = valid_returns.sum(dim=-1, keepdim=True) - valid_returns
+    other_mean = other_sum / other_count.clamp_min(1)
+    advantages = grouped_returns - other_mean
+    advantages = torch.where(valid & (other_count > 0), advantages, torch.zeros_like(advantages))
+    return advantages.reshape_as(rewards)
+
+
+def compute_decision_maxrl_outcome_advantages(
+    episode_success: torch.Tensor,
+    group_size: int,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    """Return the binary-success MaxRL control-variate advantage per trajectory.
+
+    For a fixed-N group with K successful trajectories, the estimator is
+    ``(Y - K / N) / (K / N)`` when K > 0.  A fully failed group has no MaxRL
+    outcome signal, so it returns zero and can still learn from process reward.
+    """
+    success = episode_success.reshape(-1).to(dtype=torch.float32)
+    if success.numel() % group_size != 0:
+        raise ValueError(
+            f"Decision-MaxRL requires batch={success.numel()} divisible by "
+            f"group_size={group_size}"
+        )
+    grouped = success.reshape(-1, group_size)
+    p_hat = grouped.mean(dim=-1, keepdim=True)
+    outcome = torch.where(
+        p_hat > 0,
+        (grouped - p_hat) / (p_hat + epsilon),
+        torch.zeros_like(grouped),
+    )
+    return outcome.reshape_as(success)
+
+
+def compute_decision_rloo_outcome_advantages(
+    episode_success: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    """Return a leave-one-out binary-outcome advantage per trajectory.
+
+    Each trajectory uses the other ``N - 1`` outcomes as its baseline:
+    ``A_i = Y_i - mean(Y_{-i})``. The baseline is independent of trajectory
+    ``i``'s sampled action, and binary outcomes keep this estimator in [-1, 1].
+    """
+    if group_size < 2:
+        raise ValueError("Decision-RLOO requires group_size >= 2")
+    success = episode_success.reshape(-1).to(dtype=torch.float32)
+    if success.numel() % group_size != 0:
+        raise ValueError(
+            f"Decision-RLOO requires batch={success.numel()} divisible by "
+            f"group_size={group_size}"
+        )
+    grouped = success.reshape(-1, group_size)
+    leave_one_out_mean = (
+        grouped.sum(dim=-1, keepdim=True) - grouped
+    ) / float(group_size - 1)
+    return (grouped - leave_one_out_mean).reshape_as(success)
+
+
+@register_advantage("decision_maxrl")
+def compute_decision_maxrl_advantages(
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    loss_mask: torch.Tensor,
+    episode_success: torch.Tensor,
+    group_size: int,
+    gamma: float = 1.0,
+    maxrl_process_coef: float = 1.0,
+    maxrl_epsilon: float = 1e-6,
+    **kwargs,
+):
+    """Combine binary-outcome MaxRL with decision-level process advantages.
+
+    Outcome credit is trajectory-wide and comes only from the terminal success
+    verifier.
+    """
+    if episode_success is None:
+        raise ValueError("decision_maxrl requires explicit episode_success labels")
+
+    process_advantages, _ = compute_decision_grpo_advantages(
+        rewards=rewards,
+        dones=dones,
+        loss_mask=loss_mask,
+        group_size=group_size,
+        gamma=gamma,
+    )
+    outcome = compute_decision_maxrl_outcome_advantages(
+        episode_success=episode_success,
+        group_size=group_size,
+        epsilon=maxrl_epsilon,
+    ).to(device=rewards.device, dtype=rewards.dtype)
+    total = outcome.unsqueeze(0) + float(maxrl_process_coef) * process_advantages
+    return total * loss_mask.to(dtype=total.dtype), None
+
+
+@register_advantage("decision_rloo")
+def compute_decision_rloo_advantages(
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    loss_mask: torch.Tensor,
+    episode_success: torch.Tensor,
+    group_size: int,
+    gamma: float = 1.0,
+    rloo_process_coef: float = 1.0,
+    **kwargs,
+):
+    """Combine bounded RLOO outcome credit with decision process advantages."""
+    if episode_success is None:
+        raise ValueError("decision_rloo requires explicit episode_success labels")
+
+    process_advantages, _ = compute_decision_grpo_advantages(
+        rewards=rewards,
+        dones=dones,
+        loss_mask=loss_mask,
+        group_size=group_size,
+        gamma=gamma,
+    )
+    outcome = compute_decision_rloo_outcome_advantages(
+        episode_success=episode_success,
+        group_size=group_size,
+    ).to(device=rewards.device, dtype=rewards.dtype)
+    total = outcome.unsqueeze(0) + float(rloo_process_coef) * process_advantages
+    return total * loss_mask.to(dtype=total.dtype), None
+
+
+@register_advantage("decision_maxrl_aux_rloo")
+def compute_decision_maxrl_aux_rloo_advantages(
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    loss_mask: torch.Tensor,
+    episode_success: torch.Tensor,
+    group_size: int,
+    gamma: float = 1.0,
+    maxrl_aux_coef: float = 0.25,
+    maxrl_epsilon: float = 1e-6,
+    **kwargs,
+):
+    """Optimize clean-STOP MaxRL plus a bounded auxiliary RLOO objective.
+
+    ``episode_success`` is the sole outcome channel. ``rewards`` must contain
+    auxiliary rewards only, so clean STOP is not counted a second time.
+    """
+    if episode_success is None:
+        raise ValueError(
+            "decision_maxrl_aux_rloo requires explicit episode_success labels"
+        )
+
+    auxiliary = compute_decision_aux_rloo_advantages(
+        rewards=rewards,
+        dones=dones,
+        loss_mask=loss_mask,
+        group_size=group_size,
+        gamma=gamma,
+    )
+    outcome = compute_decision_maxrl_outcome_advantages(
+        episode_success=episode_success,
+        group_size=group_size,
+        epsilon=maxrl_epsilon,
+    ).to(device=rewards.device, dtype=rewards.dtype)
+    total = outcome.unsqueeze(0) + float(maxrl_aux_coef) * auxiliary
+    return total * loss_mask.to(dtype=total.dtype), None
+
+
+@register_advantage("decision_rloo_aux_rloo")
+def compute_decision_rloo_aux_rloo_advantages(
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    loss_mask: torch.Tensor,
+    episode_success: torch.Tensor,
+    group_size: int,
+    gamma: float = 1.0,
+    rloo_aux_coef: float = 0.25,
+    **kwargs,
+):
+    """Optimize bounded clean-STOP RLOO plus auxiliary-return RLOO.
+
+    ``episode_success`` is the sole binary outcome channel. ``rewards`` contains
+    only decision-level shaping rewards, so clean STOP is not counted twice.
+    Both baselines exclude the trajectory whose advantage is being estimated.
+    """
+    if episode_success is None:
+        raise ValueError(
+            "decision_rloo_aux_rloo requires explicit episode_success labels"
+        )
+
+    auxiliary = compute_decision_aux_rloo_advantages(
+        rewards=rewards,
+        dones=dones,
+        loss_mask=loss_mask,
+        group_size=group_size,
+        gamma=gamma,
+    )
+    outcome = compute_decision_rloo_outcome_advantages(
+        episode_success=episode_success,
+        group_size=group_size,
+    ).to(device=rewards.device, dtype=rewards.dtype)
+    total = outcome.unsqueeze(0) + float(rloo_aux_coef) * auxiliary
+    return total * loss_mask.to(dtype=total.dtype), None
+
+
+@register_advantage("decision_terminal_grpo")
+def compute_decision_terminal_grpo_advantages(
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    loss_mask: torch.Tensor,
+    episode_terminal_score: torch.Tensor,
+    group_size: int,
+    episode_ids=None,
+    scene_ids=None,
+    **kwargs,
+):
+    """Broadcast one Euclidean terminal-score GRPO advantage per trajectory.
+
+    ``rewards`` is ignored. The estimator uses only ``episode_terminal_score``.
+    """
+    if episode_terminal_score is None:
+        raise ValueError(
+            "decision_terminal_grpo requires explicit episode_terminal_score labels"
+        )
+    from rlinf.envs.genark.terminal_navigation_score import (
+        compute_terminal_grpo_outcome_advantages,
+    )
+
+    outcome = compute_terminal_grpo_outcome_advantages(
+        episode_terminal_score=episode_terminal_score,
+        group_size=group_size,
+        episode_ids=episode_ids,
+        scene_ids=scene_ids,
+    ).to(device=rewards.device, dtype=rewards.dtype)
+    total = outcome.unsqueeze(0).expand_as(rewards)
+    return total * loss_mask.to(dtype=total.dtype), None
+
+
 @register_advantage("grpo_dynamic")
 def compute_grpo_dynamic_advantages(
     rewards: torch.Tensor,

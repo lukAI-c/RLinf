@@ -66,6 +66,22 @@ algorithm:
   # Separate engineering diagnostic: weak but nonzero reward variance.
   low_reward_std_threshold: 0.05
 
+  # Reinforce-Ada-pos is disabled by default. v1 is intentionally scoped to
+  # single-worker episode-overfit validation before it is generalized to the
+  # multi-scene training pool.
+  reinforce_ada:
+    enabled: false
+    mode: adaptive_pos             # static_pos | adaptive_pos
+    initial_candidates: 4
+    retry_batch_size: 4
+    max_candidates: 16
+    train_group_size: 4
+    min_successes: 1
+    min_failures: 3
+    only_episode_overfit: true
+    skip_on_exhaustion: true
+    max_exhausted_groups: 10
+
   # Decision-rollout path caps each env at max_decisions_per_rollout_epoch within
   # ONE epoch (decision_counts/rollout_results_per_env persist across the epoch
   # loop), so epochs 2..N are no-ops and the env sends a single max_dec-length
@@ -213,6 +229,23 @@ env:
     conditional_wrong_stop_ratio_min: 0.5
     conditional_wrong_stop_ratio_max: 2.0
     success_distance: 3.0
+    # Robostral-inspired Euclidean terminal score. Opt-in; default off so the
+    # existing curriculum RLOO launcher stays a regression baseline.
+    terminal_navigation_score:
+      enabled: false
+      distance_floor_m: 2.0
+      # Training default is endpoint-only. Clean STOP is logged, not rewarded.
+      clean_stop_bonus: 0.0
+    episode_assignment:
+      enabled: false
+      file: null
+    episode_blocklist: []
+    hard_pool:
+      enabled: false
+      manifest_file: null
+      mixed_support_weight: 0.6
+      navigation_hard_weight: 0.4
+      seed: 6091200
 
     scene_offset: 0
 
@@ -288,6 +321,8 @@ rollout:
     trust_remote_code: ${actor.model.trust_remote_code}
     attn_implementation: ${actor.model.attn_implementation}
     image_size: ${actor.model.image_size}
+    prompt_style: ${actor.model.prompt_style}
+    lavira_runtime: ${actor.model.lavira_runtime}
     grounded_sam: ${actor.model.grounded_sam}
     is_lora: ${actor.model.is_lora}
     lora_rank: ${actor.model.lora_rank}
@@ -307,6 +342,10 @@ actor:
   enable_offload: False
 
   model:
+    # Frozen LaViRA SFT initialization used to build the episode-difficulty
+    # manifest and to start RFT. Do not substitute an episode-609 RFT resume
+    # checkpoint when measuring the baseline curriculum distribution.
+    model_path: /home/lhx/workspace/test_model/output/qwen3.5_v2_unfreeze_vit_nav_target/v0-20260709-081633/checkpoint-1200
     collect_forward_inputs: true
     # flash_attn not installed in genesis-vllm (vLLM backend replaces generation
     # anyway). Use sdpa for HF forward/logprob path; vLLM uses its own kernel.

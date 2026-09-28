@@ -36,6 +36,47 @@ if typing.TYPE_CHECKING:
 COLOR_END = "\033[0m"
 
 
+def derive_rollout_sampling_seed(
+    *,
+    base_seed: int,
+    global_step: int,
+    worker_rank: int,
+    request_index: int,
+    collection_offset: int = 0,
+) -> int:
+    """Derive a reproducible, rank-distinct seed for one rollout request.
+
+    Embodied rollout workers own independent request counters.  A request index
+    alone therefore gives identical seeds to workers processing identical GRPO
+    slots.  Mix every part of the request identity explicitly so repeated runs
+    remain deterministic without collapsing samples across ranks or updates.
+    """
+    mask = (1 << 64) - 1
+    value = int(base_seed) & mask
+    for component in (
+        global_step,
+        worker_rank,
+        request_index,
+        collection_offset,
+    ):
+        value = (
+            value
+            ^ (
+                (int(component) & mask)
+                + 0x9E3779B97F4A7C15
+                + ((value << 6) & mask)
+                + (value >> 2)
+            )
+        ) & mask
+        value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9 & mask
+        value = (value ^ (value >> 27)) * 0x94D049BB133111EB & mask
+        value ^= value >> 31
+
+    # vLLM accepts non-negative integer seeds. Keep the value within signed
+    # 31-bit range for compatibility across vLLM/PyTorch generator versions.
+    return int(value % ((1 << 31) - 1))
+
+
 def green(text: str):
     return f"\033[32m{text}\033[0m"
 

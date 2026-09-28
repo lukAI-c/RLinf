@@ -42,9 +42,11 @@ def main(cfg) -> None:
     )
     component_placement = HybridComponentPlacement(cfg, cluster)
 
-    # Create actor worker group (skipped in eval-only mode)
+    # Create actor worker group. Eval-only skips it unless a resume_dir must
+    # be loaded and synced into the rollout engine (Gate A.5 / frozen ckpt).
     only_eval = cfg.runner.get("only_eval", False)
-    if only_eval:
+    resume_dir = cfg.runner.get("resume_dir", None)
+    if only_eval and not resume_dir:
         actor_group = None
     else:
         actor_placement = component_placement.get_strategy("actor")

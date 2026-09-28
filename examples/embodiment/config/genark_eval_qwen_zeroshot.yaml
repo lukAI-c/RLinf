@@ -79,9 +79,9 @@ algorithm:
     max_length: null
     min_length: 1
   sampling_params:
-    do_sample: true
-    temperature_train: 1.0
-    temperature_eval: 0.5
+    do_sample: false
+    temperature_train: 0.0
+    temperature_eval: 0.0
     top_k: 50
     top_p: 1.0
     repetition_penalty: 1.0
@@ -109,7 +109,7 @@ env:
     eval_roll_through_episode_pool: true
     eval_repeats_per_episode: 5
     group_size: 1
-    max_episode_steps: 40
+    max_episode_steps: 300
     max_steps_per_rollout_epoch: 5000
     reward_mode: "geo_progress"
     enable_4dir_render: true
@@ -131,6 +131,12 @@ rollout:
   vllm_sleep_offload: false
   max_model_len: 8192
   max_num_seqs: 8
+  mm_processor_kwargs:
+    min_pixels: 4096
+    max_pixels: 122500
+  limit_mm_per_prompt:
+    image: 100
+  mm_encoder_tp_mode: data
   enforce_eager: true
   enable_sleep_mode: false
   model:
@@ -149,8 +155,10 @@ rollout:
     trust_remote_code: ${actor.model.trust_remote_code}
     attn_implementation: ${actor.model.attn_implementation}
     image_size: ${actor.model.image_size}
+    min_pixels: ${actor.model.min_pixels}
+    max_pixels: ${actor.model.max_pixels}
     prompt_style: ${actor.model.prompt_style}
-    lavira_controller: ${actor.model.lavira_controller}
+    lavira_runtime: ${actor.model.lavira_runtime}
     grounded_sam: ${actor.model.grounded_sam}
     is_lora: false
 
@@ -163,7 +171,25 @@ actor:
   enable_offload: True
   model:
     prompt_style: "lavira_waypoint"
-    lavira_controller: true
+    min_pixels: 4096
+    max_pixels: 122500
+    temperature: 0.0
+    do_sample: false
+    lavira_runtime:
+      enabled: false
+      initial_scan_turns: 12
+      map_resolution_cm: 5
+      map_size_cm: 2400
+      map_frame_width: 160
+      map_frame_height: 120
+      fmm_goal_threshold_m: 0.75
+      max_steps_to_target: 15
+      hfov_deg: 79.0
+      camera_height: 0.88
+      layered_history: true
+      history_wp_max: 8
+      layered_backtrack_radius_m: 6.0
+      backtrack_second_chance: true
     attn_implementation: "sdpa"
     history_max_frames: 2
     max_new_tokens: 256
@@ -172,8 +198,7 @@ actor:
       enabled: false
       dino_config_path: ""
       dino_checkpoint_path: ""
-      sam_checkpoint_path: ""
-      sam_encoder_version: "vit_h"
+      repvit_sam_checkpoint_path: ""
       device: "cuda"
       box_threshold: 0.25
       text_threshold: 0.25

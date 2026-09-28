@@ -299,6 +299,22 @@ class Cluster:
                     namespace=Cluster.NAMESPACE,
                 )
 
+        # Ray's state API falls back to auto-discovery when no explicit
+        # address is available.  That is ambiguous on hosts running more
+        # than one local Ray cluster, even though this driver has already
+        # connected to a specific instance.  Pin subsequent state queries
+        # (notably the failure signal handler) to the instance we just joined.
+        try:
+            gcs_address = ray._private.worker.global_worker.node.address_info.get(
+                "gcs_address"
+            )
+            if gcs_address:
+                os.environ["RAY_ADDRESS"] = str(gcs_address)
+        except Exception:
+            # This is only a cleanup-path convenience; cluster startup should
+            # retain the original behavior if Ray changes its internals.
+            pass
+
         # Ray log collector
         if distributed_log_dir is not None:
             self._distributed_log_collector = DistributedRayLogCollector(

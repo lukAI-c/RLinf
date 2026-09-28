@@ -396,9 +396,20 @@ class MultiStepRolloutWorker(Worker):
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
         self.update_dagger_beta()
         max_dec = self.max_decisions_per_rollout_epoch
-        # Safety upper bound: each decision may expand to at most 10 low-level env steps
-        # (e.g. "navigate to behind" → 7 steps).  Add pipeline_stages to cover priming.
-        safety_steps = max_dec * 10 + self.num_pipeline_stages
+        # Match the environment coordinator's primitive-budget bound. LaViRA
+        # waypoints may consume 15 steps, so max_dec * 10 can cut off an
+        # unfinished GRPO group and mislabel it as failure.
+        configured_safety_steps = self.cfg.env.train.get(
+            "decision_rollout_safety_steps", None
+        )
+        episode_step_budget = int(
+            self.cfg.env.train.get("max_episode_steps", max_dec * 15)
+        )
+        safety_steps = (
+            int(configured_safety_steps)
+            if configured_safety_steps is not None
+            else max(max_dec * 15, episode_step_budget + max_dec)
+        ) + self.num_pipeline_stages
 
         # Per-stage, per-env decision counters: incremented each time is_decision[i]=True.
         # List index = pipeline stage; each entry is a [train_batch_size] int64 tensor.
@@ -544,14 +555,41 @@ class MultiStepRolloutWorker(Worker):
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:
             self.reload_model()
+        dynamic_scene_queue = bool(
+            self.cfg.env.eval.get("dynamic_scene_queue", {}).get("enabled", False)
+        )
         for _ in tqdm(
             range(self.cfg.algorithm.eval_rollout_epoch),
             desc="Evaluating Rollout Epochs",
             disable=(self._rank != 0),
         ):
             for _ in range(self.n_eval_chunk_steps):
+                stage_outputs = []
                 for _ in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
+                    stage_outputs.append(env_output)
+                all_inactive = dynamic_scene_queue and all(
+                    output["obs"].get("episode_active") is not None
+                    and not bool(
+                        torch.as_tensor(output["obs"]["episode_active"])
+                        .bool().any().item()
+                    )
+                    for output in stage_outputs
+                )
+                if all_inactive:
+                    # Eval-only control message. Every EnvWorker receives the
+                    # same sentinel, so the fixed many-to-one channel closes
+                    # without waiting through the conservative horizon.
+                    for env_output in stage_outputs:
+                        batch_size = len(env_output["obs"]["episode_active"])
+                        actions = torch.full(
+                            (batch_size, self.cfg.actor.model.num_action_chunks),
+                            8,
+                            dtype=torch.long,
+                        )
+                        self.send_chunk_actions(output_channel, actions, mode="eval")
+                    break
+                for env_output in stage_outputs:
                     actions, _ = self.predict(env_output["obs"], mode="eval")
                     self.send_chunk_actions(output_channel, actions, mode="eval")
 
@@ -777,3 +815,7 @@ class MultiStepRolloutWorker(Worker):
             )
         if hasattr(self.hf_model, "set_global_step"):
             self.hf_model.set_global_step(global_step)
+
+    def set_sampling_seed_offset(self, seed_offset: int) -> None:
+        """Set a collection-local seed offset used by adaptive sampling."""
+        self._sampling_seed_offset = int(seed_offset)

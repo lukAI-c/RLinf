@@ -38,6 +38,7 @@ import gzip
 import json
 import math
 import os
+import time
 from pathlib import Path
 from typing import Optional, Union
 
@@ -47,6 +48,9 @@ import torch
 from fastdtw import fastdtw
 from scipy.spatial.distance import euclidean
 
+from rlinf.envs.genark.terminal_navigation_score import (
+    compute_terminal_navigation_score,
+)
 from rlinf.envs.genark.genesis_backend import (
     GenesisSimBackend,
     GenesisLocalBackend,
@@ -59,6 +63,37 @@ from rlinf.envs.genark.genesis_backend import (
 # ---------------------------------------------------------------------------
 # Episode / scene loader
 # ---------------------------------------------------------------------------
+
+def is_clean_stop_success(
+    termination_cause: str,
+    distance_to_goal: float,
+    success_distance: float,
+) -> bool:
+    """Return the only binary outcome accepted by navigation MaxRL."""
+    return bool(
+        termination_cause == "stop"
+        and np.isfinite(distance_to_goal)
+        and distance_to_goal < success_distance
+    )
+
+
+def resolve_train_episodes_file(cfg) -> str:
+    """Prefer the train-level episodes_file override over init_params.
+
+    Hydra launches often set ``env.train.episodes_file`` while leaving
+    ``env.train.init_params.episodes_file`` at the OpenNav-100 default.
+    Reading only init_params silently collapses a densified Z6 pool to
+    the five unblocked OpenNav-100 IDs.
+    """
+    top = getattr(cfg, "episodes_file", None)
+    if top:
+        return str(top)
+    init_p = getattr(cfg, "init_params", None)
+    nested = getattr(init_p, "episodes_file", None) if init_p is not None else None
+    if nested:
+        return str(nested)
+    raise ValueError("no episodes_file on cfg or cfg.init_params")
+
 
 def _load_episodes(episodes_file: str) -> list[dict]:
     """Load R2R-CE-style episode JSON (plain or gzipped)."""
@@ -83,6 +118,99 @@ def _group_by_scene(episodes: list[dict]) -> dict[str, list[dict]]:
     return groups
 
 
+def _reference_path_potential(
+    position: np.ndarray,
+    reference_path: np.ndarray,
+    lateral_penalty: float = 1.0,
+) -> tuple[float, float, float]:
+    """Return (potential, along_track, lateral_distance) in Habitat XZ."""
+    point = np.asarray(position, dtype=np.float64).reshape(-1)
+    path = np.asarray(reference_path, dtype=np.float64)
+    if point.size < 3 or path.ndim != 2 or path.shape[0] == 0 or path.shape[1] < 3:
+        return 0.0, 0.0, 0.0
+
+    point_xz = point[[0, 2]]
+    path_xz = path[:, [0, 2]]
+    if len(path_xz) == 1:
+        lateral = float(np.linalg.norm(point_xz - path_xz[0]))
+        return -float(lateral_penalty) * lateral, 0.0, lateral
+
+    segments = path_xz[1:] - path_xz[:-1]
+    lengths = np.linalg.norm(segments, axis=1)
+    cumulative = np.concatenate(([0.0], np.cumsum(lengths)))
+    best_lateral = math.inf
+    best_along = 0.0
+    for index, (start, segment, length) in enumerate(
+        zip(path_xz[:-1], segments, lengths)
+    ):
+        if length <= 1e-8:
+            fraction = 0.0
+            projected = start
+        else:
+            fraction = float(
+                np.clip(np.dot(point_xz - start, segment) / (length * length), 0.0, 1.0)
+            )
+            projected = start + fraction * segment
+        lateral = float(np.linalg.norm(point_xz - projected))
+        along = float(cumulative[index] + fraction * length)
+        if lateral < best_lateral:
+            best_lateral = lateral
+            best_along = along
+
+    potential = best_along - float(lateral_penalty) * best_lateral
+    return float(potential), best_along, best_lateral
+
+
+def _normalized_reference_path_potential(
+    position: np.ndarray,
+    reference_path: np.ndarray,
+    lateral_penalty: float = 1.0,
+    *,
+    origin_potential: float = 0.0,
+    normalization_length: float | None = None,
+) -> tuple[float, float, float]:
+    """Return an origin-relative route potential clipped to [-1, 1].
+
+    Curriculum starts use the remaining route length rather than the complete
+    episode path length. Subtracting the start potential keeps the scale local
+    even when the curriculum anchor is near the end of a long reference path.
+    """
+    potential, along, lateral = _reference_path_potential(
+        position, reference_path, lateral_penalty
+    )
+    path = np.asarray(reference_path, dtype=np.float64)
+    if path.ndim != 2 or path.shape[0] < 2 or path.shape[1] < 3:
+        return 0.0, along, lateral
+    length = (
+        float(normalization_length)
+        if normalization_length is not None
+        else float(np.linalg.norm(np.diff(path[:, [0, 2]], axis=0), axis=1).sum())
+    )
+    if length <= 1e-8:
+        return 0.0, along, lateral
+    normalized = (potential - float(origin_potential)) / length
+    return float(np.clip(normalized, -1.0, 1.0)), along, lateral
+
+
+def _missed_stop_aux_reward(
+    *,
+    decision_start_dtg: float,
+    success_distance: float,
+    is_stop: bool,
+    penalty: float,
+    eligible_episode: bool = True,
+) -> float:
+    """Penalize a non-STOP decision that starts inside the success radius."""
+    if (
+        not eligible_episode
+        or is_stop
+        or not np.isfinite(decision_start_dtg)
+        or decision_start_dtg >= success_distance
+    ):
+        return 0.0
+    return -abs(float(penalty))
+
+
 def _filter_overfit_episode(episodes: list[dict], cfg) -> list[dict]:
     """Optionally restrict the pool to one fixed episode for RL sanity checks."""
     overfit_cfg = getattr(cfg, "episode_overfit", None)
@@ -91,19 +219,24 @@ def _filter_overfit_episode(episodes: list[dict], cfg) -> list[dict]:
 
     target_scene = getattr(overfit_cfg, "scene_id", None)
     target_ep = getattr(overfit_cfg, "episode_id", None)
-    if target_scene is None or target_ep is None:
+    target_eps = getattr(overfit_cfg, "episode_ids", None)
+    if target_eps is None and target_ep is not None:
+        target_eps = [target_ep]
+    if target_scene is None or target_eps is None:
         raise ValueError(
             "episode_overfit.enabled=true requires episode_overfit.scene_id and "
-            "episode_overfit.episode_id."
+            "episode_overfit.episode_id or episode_overfit.episode_ids."
         )
 
     target_scene = str(target_scene)
-    target_ep = str(target_ep)
-    filtered = [
-        ep for ep in episodes
+    wanted = [str(ep_id) for ep_id in list(target_eps)]
+    by_id = {
+        str(ep.get("episode_id", "")): ep
+        for ep in episodes
         if str(ep.get("scene_id", "")) == target_scene
-        and str(ep.get("episode_id", "")) == target_ep
-    ]
+    }
+    filtered = [by_id[ep_id] for ep_id in wanted if ep_id in by_id]
+    target_ep = wanted[0] if wanted else ""
     if not filtered:
         sample = [
             (str(ep.get("scene_id", "")), str(ep.get("episode_id", "")))
@@ -114,18 +247,15 @@ def _filter_overfit_episode(episodes: list[dict], cfg) -> list[dict]:
             f"scene_id={target_scene!r}, episode_id={target_ep!r}. "
             f"First available examples: {sample}"
         )
-    if len(filtered) > 1:
-        print(
-            f"[GenArk][episode-overfit] WARNING: found {len(filtered)} matching "
-            f"records for scene={target_scene} ep={target_ep}; using all matches.",
-            flush=True,
+    missing = [ep_id for ep_id in wanted if ep_id not in by_id]
+    if missing:
+        raise ValueError(
+            "episode_overfit: requested episode_ids not found: "
+            f"scene_id={target_scene!r}, missing={missing}"
         )
-    ep = filtered[0]
-    instr = (ep.get("instruction") or {}).get("instruction_text", "")
     print(
         f"[GenArk][episode-overfit] enabled: scene={target_scene} "
-        f"episode_id={target_ep} matches={len(filtered)} "
-        f"instruction={instr!r}",
+        f"episode_ids={wanted} matches={len(filtered)}",
         flush=True,
     )
     group_size = int(getattr(cfg, "group_size", 1) or 1)
@@ -156,8 +286,10 @@ class EpisodeBalancer:
 
     def __init__(self, episodes: list[dict], rng, ema_alpha: float = 0.3,
                  curriculum_dtg_start: float | None = None,
-                 curriculum_dtg_step: float = 5.0):
-        self._eps   = {e.get("episode_id", i): e for i, e in enumerate(episodes)}
+                 curriculum_dtg_step: float = 5.0,
+                 curriculum_tiers: dict[str, str] | None = None,
+                 curriculum_stages: list[dict] | None = None):
+        self._eps   = {str(e.get("episode_id", i)): e for i, e in enumerate(episodes)}
         self._seen  = {k: 0   for k in self._eps}
         self._sr    = {k: 0.0 for k in self._eps}
         self._rng   = rng
@@ -174,6 +306,78 @@ class EpisodeBalancer:
 
         self._curriculum_dtg_start = curriculum_dtg_start  # None = disabled
         self._curriculum_dtg_step  = float(curriculum_dtg_step)
+        self._curriculum_tiers = {
+            str(k): str(v) for k, v in (curriculum_tiers or {}).items()
+        }
+        self._curriculum_stages = list(curriculum_stages or [])
+        self._global_step = 0
+        self._last_stage_name: str | None = None
+
+        if self._curriculum_stages:
+            missing = [str(k) for k in self._eps if str(k) not in self._curriculum_tiers]
+            if missing:
+                raise ValueError(
+                    "Episode curriculum manifest is missing episode IDs: "
+                    + ", ".join(missing[:8])
+                )
+            for stage in self._curriculum_stages:
+                weights = stage.get("weights", {})
+                if not weights or not any(float(v) > 0 for v in weights.values()):
+                    raise ValueError(
+                        f"Episode curriculum stage {stage.get('name')!r} has no positive weights"
+                    )
+
+    def set_global_step(self, step: int) -> None:
+        self._global_step = max(0, int(step))
+
+    def _current_episode_stage(self) -> dict | None:
+        if not self._curriculum_stages:
+            return None
+        for stage in self._curriculum_stages:
+            until_step = stage.get("until_step")
+            if until_step is None or self._global_step < int(until_step):
+                return stage
+        return self._curriculum_stages[-1]
+
+    def _curriculum_candidates(self, candidates: list) -> tuple[list, str | None]:
+        stage = self._current_episode_stage()
+        if stage is None:
+            return candidates, None
+
+        available_by_tier: dict[str, list] = {}
+        for key in candidates:
+            tier = self._curriculum_tiers[str(key)]
+            available_by_tier.setdefault(tier, []).append(key)
+
+        weighted_tiers = [
+            (str(tier), float(weight))
+            for tier, weight in stage.get("weights", {}).items()
+            if float(weight) > 0 and available_by_tier.get(str(tier))
+        ]
+        # A stage may contain a single eligible episode. In that case the
+        # generic no-immediate-repeat filter removed the only valid choice;
+        # allow the repeat instead of leaking into a harder tier.
+        if not weighted_tiers and self._last is not None:
+            available_by_tier = {}
+            for key in self._eps:
+                tier = self._curriculum_tiers[str(key)]
+                available_by_tier.setdefault(tier, []).append(key)
+            weighted_tiers = [
+                (str(tier), float(weight))
+                for tier, weight in stage.get("weights", {}).items()
+                if float(weight) > 0 and available_by_tier.get(str(tier))
+            ]
+        if not weighted_tiers:
+            raise ValueError(
+                f"Episode curriculum stage {stage.get('name')!r} has no eligible "
+                f"episodes at global_step={self._global_step}"
+            )
+
+        tiers = [tier for tier, _ in weighted_tiers]
+        probs = np.asarray([weight for _, weight in weighted_tiers], dtype=np.float64)
+        probs /= probs.sum()
+        chosen_tier = tiers[int(self._rng.choice(len(tiers), p=probs))]
+        return available_by_tier[chosen_tier], str(stage.get("name", ""))
 
     def _curriculum_max_dtg(self) -> float:
         if self._curriculum_dtg_start is None:
@@ -196,6 +400,15 @@ class EpisodeBalancer:
                 cands = easy
             # else: fallback to full pool (don't starve at scene startup)
 
+        cands, stage_name = self._curriculum_candidates(cands)
+        if stage_name != self._last_stage_name:
+            print(
+                f"[GenArk][episode-curriculum] stage={stage_name} "
+                f"global_step={self._global_step}",
+                flush=True,
+            )
+            self._last_stage_name = stage_name
+
         min_key = min((self._seen[k], self._sr[k]) for k in cands)
         tied = [k for k in cands if (self._seen[k], self._sr[k]) == min_key]
         k = tied[int(self._rng.integers(len(tied)))]
@@ -209,13 +422,15 @@ class EpisodeBalancer:
 
     def record(self, ep_id, success: bool) -> None:
         """Update EMA success rate for an episode after a trajectory completes."""
-        if ep_id in self._sr:
-            self._sr[ep_id] = (1 - self._alpha) * self._sr[ep_id] + self._alpha * float(success)
+        key = str(ep_id)
+        if key in self._sr:
+            self._sr[key] = (1 - self._alpha) * self._sr[key] + self._alpha * float(success)
 
     def mark_seen(self, ep_id) -> None:
         """Pre-credit an episode that was assigned during initial layout."""
-        if ep_id in self._seen:
-            self._seen[ep_id] += 1
+        key = str(ep_id)
+        if key in self._seen:
+            self._seen[key] += 1
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +486,20 @@ class GenarkVecEnv(gym.Env):
         self.num_envs            = num_envs
         self.seed_offset         = seed_offset
         self.total_num_processes = total_num_processes
+        profile_cfg = getattr(cfg, "rollout_profile", None)
+        self._rollout_profile_enabled = bool(
+            getattr(profile_cfg, "enabled", False)
+            if profile_cfg is not None else False
+        )
+        self._rollout_profile_flush_every = max(
+            1,
+            int(
+                getattr(profile_cfg, "flush_every", 25)
+                if profile_cfg is not None else 25
+            ),
+        )
+        self._rollout_profile_steps = 0
+        self._rollout_profile_stats: dict[str, dict[str, float | int]] = {}
 
         # --- simulator params ---
         self.camera_height   = float(getattr(cfg, "camera_height",   1.25))
@@ -282,6 +511,22 @@ class GenarkVecEnv(gym.Env):
         self.light_scale     = float(getattr(cfg, "light_scale",     4.0))
         self.success_distance = float(getattr(cfg, "success_distance", 3.0))
         self.success_bonus   = float(getattr(cfg, "success_bonus",   2.5))
+        terminal_score_cfg = getattr(cfg, "terminal_navigation_score", None)
+        self.terminal_navigation_score_enabled = bool(
+            getattr(terminal_score_cfg, "enabled", False)
+            if terminal_score_cfg is not None
+            else False
+        )
+        self.terminal_navigation_distance_floor_m = float(
+            getattr(terminal_score_cfg, "distance_floor_m", 2.0)
+            if terminal_score_cfg is not None
+            else 2.0
+        )
+        self.terminal_navigation_clean_stop_bonus = float(
+            getattr(terminal_score_cfg, "clean_stop_bonus", 0.0)
+            if terminal_score_cfg is not None
+            else 0.0
+        )
         self.use_rel_reward  = bool( getattr(cfg, "use_rel_reward",  True))
         # Reward mode: "geo_progress"  — dense d2g delta + success_bonus on stop
         #              "ndtw_sr_delta" — per-step nDTW delta + SR delta (RFT)
@@ -362,6 +607,9 @@ class GenarkVecEnv(gym.Env):
         self._last_reward_profile: str | None = None
         # B-infra: when True, render front depth and expose via extra_view_images.
         self._enable_depth_obs = bool(getattr(cfg, "enable_depth_obs", False))
+        # LaViRA runtime needs depth aligned to every panorama direction.  It is
+        # opt-in because it adds three depth renders in addition to front depth.
+        self._enable_4dir_depth_obs = bool(getattr(cfg, "enable_4dir_depth_obs", False))
         # --- Penalties to discourage premature / illegal terminations ---
         # parse_fail_penalty: applied when the model fails to produce valid JSON.
         # The action is clamped to MOVE_FORWARD (episode continues) but a negative
@@ -399,6 +647,57 @@ class GenarkVecEnv(gym.Env):
         # confidence is diagnostic only and never used directly as reward.
         self.gsam_reward_enabled = bool(getattr(cfg, "gsam_reward_enabled", False))
         self.gsam_detect_progress_bonus = float(getattr(cfg, "gsam_detect_progress_bonus", 0.05))
+        # RFT-only decision shaping. This does not alter LaViRA execution: it
+        # rewards motion along the reference route and penalizes lateral drift.
+        self.reference_path_reward_enabled = bool(
+            getattr(cfg, "reference_path_reward_enabled", False)
+        )
+        self.reference_path_progress_coef = float(
+            getattr(cfg, "reference_path_progress_coef", 0.0)
+        )
+        self.reference_path_lateral_penalty = float(
+            getattr(cfg, "reference_path_lateral_penalty", 1.0)
+        )
+        self.reference_path_delta_clip = float(
+            getattr(cfg, "reference_path_delta_clip", 2.5)
+        )
+        self.reference_path_normalized_potential = bool(
+            getattr(cfg, "reference_path_normalized_potential", False)
+        )
+        self.missed_stop_aux_reward_enabled = bool(
+            getattr(cfg, "missed_stop_aux_reward_enabled", False)
+        )
+        self.missed_stop_aux_penalty = float(
+            getattr(cfg, "missed_stop_aux_penalty", 0.25)
+        )
+        # Training-only terminal rule: once a decision that starts inside the
+        # success radius chooses a non-STOP action, keep that decision and its
+        # missed-stop reward, then end the episode before another action runs.
+        # This does not alter LaViRA policy/controller execution.
+        self.terminate_on_missed_stop = bool(
+            getattr(cfg, "terminate_on_missed_stop", False)
+        )
+        self.projection_aux_reward_enabled = bool(
+            getattr(cfg, "projection_aux_reward_enabled", False)
+        )
+        self.projection_depth_exhausted_penalty = float(
+            getattr(cfg, "projection_depth_exhausted_penalty", 0.1)
+        )
+        self.projection_backoff_penalty_coef = float(
+            getattr(cfg, "projection_backoff_penalty_coef", 0.01)
+        )
+        self.projection_backoff_penalty_cap = float(
+            getattr(cfg, "projection_backoff_penalty_cap", 0.1)
+        )
+        self.no_movement_reward_enabled = bool(
+            getattr(cfg, "no_movement_reward_enabled", False)
+        )
+        self.no_movement_threshold_m = float(
+            getattr(cfg, "no_movement_threshold_m", 0.05)
+        )
+        self.no_movement_penalty = float(
+            getattr(cfg, "no_movement_penalty", 0.1)
+        )
         # 4-direction rendering: when True, in addition to the front view stored
         # in `main_images`, also render left/right/behind and put them in
         # `extra_view_images` shape (num_envs, 3, H, W, 3) uint8.
@@ -426,9 +725,103 @@ class GenarkVecEnv(gym.Env):
         self.episode_balanced_sampling = bool(
             getattr(cfg, "episode_balanced_sampling", False)
         )
+        _block_raw = getattr(cfg, "episode_blocklist", None) or []
+        self._episode_blocklist = {str(item) for item in list(_block_raw)}
         _c = getattr(cfg, "curriculum_dtg_start", None)
         self._curriculum_dtg_start = float(_c) if _c is not None else None
         self._curriculum_dtg_step  = float(getattr(cfg, "curriculum_dtg_step", 5.0))
+        episode_curriculum_cfg = getattr(cfg, "episode_curriculum", None)
+        self.episode_curriculum_enabled = bool(
+            getattr(episode_curriculum_cfg, "enabled", False)
+            if episode_curriculum_cfg is not None
+            else False
+        )
+        self._episode_curriculum_stages: list[dict] = []
+        self._episode_curriculum_tiers_by_scene: dict[str, dict[str, str]] = {}
+        self._episode_curriculum_initial_global_step = 0
+        if self.episode_curriculum_enabled:
+            if not self.episode_balanced_sampling or not self.cyclic_episode_sampling:
+                raise ValueError(
+                    "episode_curriculum requires episode_balanced_sampling=true "
+                    "and cyclic_episode_sampling=true"
+                )
+            manifest_file = str(
+                getattr(episode_curriculum_cfg, "manifest_file", "") or ""
+            )
+            if not manifest_file:
+                raise ValueError("episode_curriculum.manifest_file is required")
+            self._episode_curriculum_initial_global_step = max(
+                0,
+                int(getattr(episode_curriculum_cfg, "initial_global_step", 0)),
+            )
+            with open(manifest_file, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            for entry in manifest.get("episodes", []):
+                scene_id = str(entry["scene_id"])
+                episode_id = str(entry["episode_id"])
+                self._episode_curriculum_tiers_by_scene.setdefault(scene_id, {})[
+                    episode_id
+                ] = str(entry["tier"])
+            for stage_cfg in getattr(episode_curriculum_cfg, "stages", []):
+                if isinstance(stage_cfg, dict):
+                    stage = stage_cfg
+                else:
+                    stage = dict(stage_cfg)
+                weights = {
+                    str(k): float(v) for k, v in dict(stage.get("weights", {})).items()
+                }
+                self._episode_curriculum_stages.append(
+                    {
+                        "name": str(stage["name"]),
+                        "until_step": (
+                            None
+                            if stage.get("until_step") is None
+                            else int(stage["until_step"])
+                        ),
+                        "weights": weights,
+                    }
+                )
+            if not self._episode_curriculum_stages:
+                raise ValueError("episode_curriculum.stages must not be empty")
+            print(
+                "[GenArk][episode-curriculum] enabled "
+                f"manifest={manifest_file} stages="
+                f"{[stage['name'] for stage in self._episode_curriculum_stages]}",
+                flush=True,
+            )
+
+        assignment_cfg = getattr(cfg, "episode_assignment", None)
+        self.episode_assignment_enabled = bool(
+            getattr(assignment_cfg, "enabled", False)
+            if assignment_cfg is not None
+            else False
+        )
+        self._episode_assignment_file = ""
+        if self.episode_assignment_enabled:
+            if self.episode_curriculum_enabled:
+                raise ValueError(
+                    "episode_assignment and episode_curriculum cannot both be enabled"
+                )
+            hard_pool_cfg = getattr(cfg, "hard_pool", None)
+            if bool(getattr(hard_pool_cfg, "enabled", False) if hard_pool_cfg else False):
+                raise ValueError(
+                    "episode_assignment and hard_pool cannot both be enabled"
+                )
+            self._episode_assignment_file = str(
+                getattr(assignment_cfg, "file", "") or ""
+            )
+            if not self._episode_assignment_file:
+                raise ValueError("episode_assignment.file is required")
+            self._episode_curriculum_initial_global_step = max(
+                0,
+                int(getattr(assignment_cfg, "initial_global_step", 0) or 0),
+            )
+            print(
+                "[GenArk][episode-assignment] enabled "
+                f"file={self._episode_assignment_file} "
+                f"initial_global_step={self._episode_curriculum_initial_global_step}",
+                flush=True,
+            )
 
         # --- observation params ---
         cam_res              = tuple(getattr(cfg, "cam_res", (640, 480)))
@@ -438,7 +831,7 @@ class GenarkVecEnv(gym.Env):
 
         # --- data ---
         init_p             = cfg.init_params
-        self.episodes_file = str(init_p.episodes_file)
+        self.episodes_file = resolve_train_episodes_file(cfg)
         self.scene_datasets = str(init_p.scene_datasets)
 
         # --- spaces ---
@@ -471,7 +864,9 @@ class GenarkVecEnv(gym.Env):
         self._prev_geo_dist   = None     # (num_envs,) float32 on backend device
         self._elapsed_steps   = np.zeros(num_envs, dtype=np.int32)
         self._instructions    = [""] * num_envs
+        self._rft_group_generation_by_group: dict[int, int] = {}
         self._episodes        = [None] * num_envs
+        self._trial_indices   = np.zeros(num_envs, dtype=np.int32)
         self._pred_path_lists = [[] for _ in range(num_envs)]
         self._distances_lists = [[] for _ in range(num_envs)]
         # ndtw_sr_delta reward mode: track per-env previous-step nDTW and SR
@@ -482,6 +877,11 @@ class GenarkVecEnv(gym.Env):
         self._stop_called     = [False] * num_envs
         self._current_rgb     = None     # cached last RGB (CPU numpy)
         self._current_depth   = None     # cached last depth (CPU numpy, float32) when enable_depth_obs
+        self._current_depth_extras = None  # (N,3,H,W), legacy order [left,right,behind]
+        self._current_scan_images = None
+        self._current_scan_depth = None
+        self._current_scan_states = None
+        self._current_scan_valid = np.zeros(num_envs, dtype=bool)
 
         # --- Episode-end diagnostic trackers ---
         # Raw action history per env (includes PARSE_FAIL=4 sentinel, NOT clamped).
@@ -511,6 +911,8 @@ class GenarkVecEnv(gym.Env):
         self._pending_decision_reward_snapshot_by_env: list[dict | None] = [
             None
         ] * num_envs
+        self._missed_stop_terminal_pending = np.zeros(num_envs, dtype=bool)
+        self._forced_termination_cause = [""] * num_envs
         self._gsam_reward_diag_counts = self._empty_gsam_reward_diag_counts()
         self._exhausted = False
         self._dummy_obs_cache = None
@@ -577,8 +979,21 @@ class GenarkVecEnv(gym.Env):
             self._scene_layout = layout
 
             for scene_id in layout.scenes:
-                eps = pool_by_scene[scene_id]
+                eps = [
+                    ep
+                    for ep in pool_by_scene[scene_id]
+                    if str(ep.get("episode_id")) not in self._episode_blocklist
+                ]
+                if not eps:
+                    raise ValueError(
+                        f"episode_blocklist removed every episode for scene={scene_id}"
+                    )
                 self._pool_by_scene[scene_id]   = eps
+                print(
+                    f"[GenArk][episode-pool] scene={scene_id} n={len(eps)} "
+                    f"sample={[str(ep.get('episode_id')) for ep in eps[:12]]}",
+                    flush=True,
+                )
                 # Per-scene RNG (independent of other scenes for reproducibility)
                 self._rng_by_scene[scene_id]    = np.random.default_rng(
                     seed=42 + seed_offset + _stable_scene_hash(scene_id)
@@ -588,12 +1003,44 @@ class GenarkVecEnv(gym.Env):
                 self._next_ep_idx_by_scene[scene_id]   = n_initial_groups_s
                 self._episode_cycle_by_scene[scene_id] = 0
                 self._balancer_by_scene[scene_id]      = None
-                if self.episode_balanced_sampling and self.cyclic_episode_sampling:
-                    bal = EpisodeBalancer(eps, self._rng_by_scene[scene_id],
-                                         curriculum_dtg_start=self._curriculum_dtg_start,
-                                         curriculum_dtg_step=self._curriculum_dtg_step)
-                    for g in range(min(n_initial_groups_s, len(eps))):
-                        bal.mark_seen(eps[g].get("episode_id", g))
+                if self.episode_assignment_enabled:
+                    from rlinf.envs.genark.episode_assignment import (
+                        FixedEpisodeAssignment,
+                    )
+
+                    bal = FixedEpisodeAssignment.from_file(
+                        self._episode_assignment_file, eps
+                    )
+                    bal.set_global_step(self._episode_curriculum_initial_global_step)
+                    initial = [
+                        bal.next_episode()[0] for _ in range(n_initial_groups_s)
+                    ]
+                    initial_ids = {id(ep) for ep in initial}
+                    eps[:] = initial + [ep for ep in eps if id(ep) not in initial_ids]
+                    self._balancer_by_scene[scene_id] = bal
+                elif self.episode_balanced_sampling and self.cyclic_episode_sampling:
+                    bal = EpisodeBalancer(
+                        eps,
+                        self._rng_by_scene[scene_id],
+                        curriculum_dtg_start=self._curriculum_dtg_start,
+                        curriculum_dtg_step=self._curriculum_dtg_step,
+                        curriculum_tiers=self._episode_curriculum_tiers_by_scene.get(
+                            scene_id
+                        ),
+                        curriculum_stages=self._episode_curriculum_stages,
+                    )
+                    if self.episode_curriculum_enabled:
+                        bal.set_global_step(
+                            self._episode_curriculum_initial_global_step
+                        )
+                        initial = [
+                            bal.next_episode()[0] for _ in range(n_initial_groups_s)
+                        ]
+                        initial_ids = {id(ep) for ep in initial}
+                        eps[:] = initial + [ep for ep in eps if id(ep) not in initial_ids]
+                    else:
+                        for g in range(min(n_initial_groups_s, len(eps))):
+                            bal.mark_seen(eps[g].get("episode_id", g))
                     self._balancer_by_scene[scene_id] = bal
 
             # Mark all slots active (fully-active invariant: K_s <= len(eps_s))
@@ -634,12 +1081,40 @@ class GenarkVecEnv(gym.Env):
             self._next_ep_idx_by_scene[pinned_scene]   = n_initial_groups
             self._episode_cycle_by_scene[pinned_scene] = 0
             self._balancer_by_scene[pinned_scene]      = None
-            if self.episode_balanced_sampling and self.cyclic_episode_sampling:
-                bal = EpisodeBalancer(scene_eps, rng,
-                                     curriculum_dtg_start=self._curriculum_dtg_start,
-                                     curriculum_dtg_step=self._curriculum_dtg_step)
-                for g in range(min(n_initial_groups, len(scene_eps))):
-                    bal.mark_seen(scene_eps[g].get("episode_id", g))
+            if self.episode_assignment_enabled:
+                from rlinf.envs.genark.episode_assignment import FixedEpisodeAssignment
+
+                bal = FixedEpisodeAssignment.from_file(
+                    self._episode_assignment_file, scene_eps
+                )
+                bal.set_global_step(self._episode_curriculum_initial_global_step)
+                initial = [bal.next_episode()[0] for _ in range(n_initial_groups)]
+                initial_ids = {id(ep) for ep in initial}
+                scene_eps[:] = initial + [
+                    ep for ep in scene_eps if id(ep) not in initial_ids
+                ]
+                self._balancer_by_scene[pinned_scene] = bal
+            elif self.episode_balanced_sampling and self.cyclic_episode_sampling:
+                bal = EpisodeBalancer(
+                    scene_eps,
+                    rng,
+                    curriculum_dtg_start=self._curriculum_dtg_start,
+                    curriculum_dtg_step=self._curriculum_dtg_step,
+                    curriculum_tiers=self._episode_curriculum_tiers_by_scene.get(
+                        pinned_scene
+                    ),
+                    curriculum_stages=self._episode_curriculum_stages,
+                )
+                if self.episode_curriculum_enabled:
+                    bal.set_global_step(self._episode_curriculum_initial_global_step)
+                    initial = [bal.next_episode()[0] for _ in range(n_initial_groups)]
+                    initial_ids = {id(ep) for ep in initial}
+                    scene_eps[:] = initial + [
+                        ep for ep in scene_eps if id(ep) not in initial_ids
+                    ]
+                else:
+                    for g in range(min(n_initial_groups, len(scene_eps))):
+                        bal.mark_seen(scene_eps[g].get("episode_id", g))
                 self._balancer_by_scene[pinned_scene] = bal
 
             print(f"[GenArk] Worker {seed_offset}/{total_num_processes}: "
@@ -748,6 +1223,9 @@ class GenarkVecEnv(gym.Env):
 
     def set_global_step(self, step: int) -> None:
         self._global_step = int(step)
+        for balancer in self._balancer_by_scene.values():
+            if balancer is not None:
+                balancer.set_global_step(self._global_step)
 
     def _reward_coeffs(self) -> dict[str, float]:
         """Effective reward coefficients for the selected reward profile."""
@@ -809,6 +1287,21 @@ class GenarkVecEnv(gym.Env):
             if not self._slot_active[i]:
                 continue  # ghost slot — no episode assigned
 
+            # Group reset already selected the next curriculum episode. The
+            # outer rollout bootstrap calls reset() again; preserve that
+            # selection instead of routing the slot back to pool[local_group].
+            if (
+                (
+                    self.episode_curriculum_enabled
+                    or getattr(self, "episode_assignment_enabled", False)
+                )
+                and self._episodes[i] is not None
+            ):
+                self._instructions[i] = self._episodes[i]["instruction"][
+                    "instruction_text"
+                ]
+                continue
+
             if layout is not None:
                 # Multi-scene: index into the slot's own scene pool
                 scene_id    = layout.scene_id_of(i)
@@ -846,6 +1339,8 @@ class GenarkVecEnv(gym.Env):
                     f"[P0] group {gid} straddles scenes {scene_ids_in_group}. "
                     f"SceneLayout invariant violated — check group_size alignment."
                 )
+
+        self._assign_current_trial_indices(sorted(assigned))
 
     # ------------------------------------------------------------------
     # gym.Env interface
@@ -898,12 +1393,26 @@ class GenarkVecEnv(gym.Env):
         self._current_rgb            = None
         self._current_rgb_extras     = None
         self._current_depth          = None
+        self._current_depth_extras   = None
+        self._current_scan_images    = None
+        self._current_scan_depth     = None
+        self._current_scan_states    = None
+        self._current_scan_valid[:]  = False
         # If actor was rebuilt externally, allow reset to clear crash flag.
         if self._scene_crashed and self._sim.is_scene_healthy():
             self._scene_crashed = False
 
         obs  = self._build_obs()
         return obs, {}
+
+    def update_reset_state_ids(self):
+        """Compatibility hook for non-auto-reset evaluation finalization.
+
+        Genark owns episode assignment directly and has no deferred reset-state
+        queue to advance here.  In particular, resetting in this hook would
+        mutate the terminal state after a collection rollout has completed.
+        """
+        return None
 
     def _init_agent_poses(self, env_idx: list[int]):
         device = self._sim.device
@@ -923,6 +1432,21 @@ class GenarkVecEnv(gym.Env):
             self._dtg_decision_start   = torch.zeros(N,    dtype=torch.float32, device=device)
             self._min_dtg_t            = torch.zeros(N,    dtype=torch.float32, device=device)
             self._process_progress_paid = torch.zeros(N,   dtype=torch.float32, device=device)
+            self._missed_stop_aux_paid = torch.zeros(
+                N, dtype=torch.bool, device=device
+            )
+            self._reference_path_potential_start = torch.zeros(
+                N, dtype=torch.float32, device=device
+            )
+            self._reference_path_potential_origin = torch.zeros(
+                N, dtype=torch.float32, device=device
+            )
+            self._reference_path_normalization_length = torch.ones(
+                N, dtype=torch.float32, device=device
+            )
+            self._decision_position_start = torch.zeros(
+                N, 3, dtype=torch.float32, device=device
+            )
             # Cumulative format reward already paid this episode, used to cap
             # dense schema shaping during LaViRA waypoint overfit.
             self._format_reward_given  = torch.zeros(N,    dtype=torch.float32, device=device)
@@ -936,6 +1460,9 @@ class GenarkVecEnv(gym.Env):
 
         for i in valid_idx:
             self._reward_component_totals[i] = {}
+            self._pending_decision_reward_snapshot_by_env[i] = None
+            self._missed_stop_terminal_pending[i] = False
+            self._forced_termination_cause[i] = ""
 
         positions = torch.zeros(len(valid_idx), 3, dtype=torch.float32)
         yaws      = torch.zeros(len(valid_idx),    dtype=torch.float32)
@@ -950,11 +1477,12 @@ class GenarkVecEnv(gym.Env):
                     f"'{ep['scene_id']}' but belongs to scene block '{expected_scene}'. "
                     f"Episode pool routing bug in _assign_episodes_to_envs."
                 )
-            sp  = ep["start_position"]
+            sp = np.asarray(ep["start_position"], dtype=np.float64)
+            rotation = torch.tensor(ep["start_rotation"], dtype=torch.float32)
+            yaw = float(_calculate_initial_yaw(rotation.unsqueeze(0))[0].item())
             gx, gy, gz = _hab_to_genesis(sp)
             positions[j] = torch.tensor([gx, gy, gz + self.camera_height])
-            rot          = torch.tensor(ep["start_rotation"], dtype=torch.float32)
-            yaws[j]      = _calculate_initial_yaw(rot.unsqueeze(0))[0]
+            yaws[j] = yaw
 
             goal_p = ep["goals"][0]["position"]
             self._goal_pos_t[i] = torch.tensor(goal_p, dtype=torch.float32, device=device)
@@ -977,11 +1505,67 @@ class GenarkVecEnv(gym.Env):
             self._dtg_decision_start[i] = d
             self._min_dtg_t[i] = d
             self._process_progress_paid[i] = 0.0
+            self._missed_stop_aux_paid[i] = False
+            ep = self._episodes[i]
+            raw_initial_potential, _, _ = _reference_path_potential(
+                init_hab[i].detach().cpu().numpy(),
+                np.asarray(ep.get("reference_path", []), dtype=float),
+                self.reference_path_lateral_penalty,
+            )
+            reference_path = np.asarray(ep.get("reference_path", []), dtype=float)
+            full_path_length = float(
+                np.linalg.norm(
+                    np.diff(reference_path[:, [0, 2]], axis=0), axis=1
+                ).sum()
+            )
+            self._reference_path_potential_origin[i] = raw_initial_potential
+            self._reference_path_normalization_length[i] = max(
+                full_path_length, 1e-6
+            )
+            # The origin-relative normalized potential is exactly zero at reset.
+            self._reference_path_potential_start[i] = 0.0
+            self._decision_position_start[i] = init_hab[i]
             self._prev_ndtw[i] = 1.0
             self._prev_sr[i]   = 0.0
             self._format_reward_given[i] = 0.0
             self._bbox_reward_given[i] = 0.0
             self._structured_reward_given[i] = 0.0
+
+    def _profile_add(self, stage: str, elapsed_s: float, items: int = 0) -> None:
+        if not self._rollout_profile_enabled:
+            return
+        stats = self._rollout_profile_stats.setdefault(
+            stage, {"seconds": 0.0, "calls": 0, "items": 0}
+        )
+        stats["seconds"] = float(stats["seconds"]) + float(elapsed_s)
+        stats["calls"] = int(stats["calls"]) + 1
+        stats["items"] = int(stats["items"]) + int(items)
+
+    def _profile_flush_if_due(self) -> None:
+        if not self._rollout_profile_enabled:
+            return
+        self._rollout_profile_steps += 1
+        if self._rollout_profile_steps % self._rollout_profile_flush_every:
+            return
+        stages = {}
+        for name, values in sorted(self._rollout_profile_stats.items()):
+            calls = max(int(values["calls"]), 1)
+            stages[name] = {
+                "seconds": round(float(values["seconds"]), 6),
+                "calls": int(values["calls"]),
+                "items": int(values["items"]),
+                "mean_ms": round(
+                    1000.0 * float(values["seconds"]) / calls, 3
+                ),
+            }
+        print(
+            "[RolloutProfile][env] "
+            + json.dumps(
+                {"steps": self._rollout_profile_steps, "stages": stages},
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
     def step(
         self,
@@ -1007,6 +1591,7 @@ class GenarkVecEnv(gym.Env):
         if self._scene_crashed:
             return self._dormant_step_crash_recovery()
 
+        profile_started = time.perf_counter()
         device = self._sim.device
         if not isinstance(actions, torch.Tensor):
             actions = torch.tensor(actions, dtype=torch.long, device=device)
@@ -1019,11 +1604,16 @@ class GenarkVecEnv(gym.Env):
         #   4    : ACTION_PARSE_FAIL, parse_ok=False, has_bbox=False
         #   5    : schema_ok but geometry/action invalid; parse_ok=True,
         #          has_bbox=False, execute as parse-fail fallback
+        #   6    : LaViRA adapter no-op; parse_ok=True, no physics/elapsed/reward
+        #   7    : atomic LaViRA panorama; 12 rendered left-turn frames,
+        #          no pose mutation, but consumes 12 primitive steps
         #   10-13: ACTION_PARSE_OK_HAS_BBOX_BASE + true_action, parse_ok=True, has_bbox=True
         #   20+  : structured parse-fail bitmask; fallback action but partial
         #          RL-Struct rewards (JSON/fields/format/geometry/length) apply.
         _HAS_BBOX_BASE = 10
         _SCHEMA_OK_PARSE_FAIL = 5
+        _LAVIRA_NOOP = 6
+        _LAVIRA_PANORAMA = 7
         _STRUCTURED_FAIL_BASE = 20
         _R_JSON = 1 << 0
         _R_STRUCT = 1 << 1
@@ -1031,12 +1621,24 @@ class GenarkVecEnv(gym.Env):
         _R_GEOM = 1 << 3
         _R_LENGTH = 1 << 4
         actions = actions.clone()
+        forced_missed_stop_np = (
+            self._missed_stop_terminal_pending
+            & self._slot_active
+            & ~self._slot_done
+        )
+        self._missed_stop_terminal_pending[forced_missed_stop_np] = False
+        forced_missed_stop_mask = torch.as_tensor(
+            forced_missed_stop_np, dtype=torch.bool, device=device
+        )
         structured_mask = actions >= _STRUCTURED_FAIL_BASE
         structured_bits = torch.zeros_like(actions)
         structured_bits[structured_mask] = actions[structured_mask] - _STRUCTURED_FAIL_BASE
         has_bbox_mask = (actions >= _HAS_BBOX_BASE) & (actions < _HAS_BBOX_BASE + 4)
         schema_ok_parse_fail_mask = actions == _SCHEMA_OK_PARSE_FAIL
-        normal_ok_mask = (actions < 4) | has_bbox_mask
+        noop_mask = actions == _LAVIRA_NOOP
+        panorama_mask = actions == _LAVIRA_PANORAMA
+        passive_mask = noop_mask | panorama_mask | forced_missed_stop_mask
+        normal_ok_mask = (actions < 4) | has_bbox_mask | passive_mask
         parse_ok_mask = (
             normal_ok_mask
             | schema_ok_parse_fail_mask
@@ -1051,26 +1653,40 @@ class GenarkVecEnv(gym.Env):
         actions[has_bbox_mask] = actions[has_bbox_mask] - _HAS_BBOX_BASE
         actions[schema_ok_parse_fail_mask] = 4
         actions[structured_mask] = 4
+        actions[panorama_mask] = self.STOP
         # Store for compute_decision_ndtw_reward() to use as format/bbox bonus gate.
-        self._last_parse_ok = parse_ok_mask.to(dtype=torch.bool, device=self._last_parse_ok.device)
-        self._last_has_bbox = has_bbox_mask.to(dtype=torch.bool, device=self._last_has_bbox.device)
-        self._last_json_valid = json_valid_mask.to(dtype=torch.bool, device=self._last_json_valid.device)
-        self._last_struct_ok = struct_ok_mask.to(dtype=torch.bool, device=self._last_struct_ok.device)
-        self._last_field_format_ok = field_format_ok_mask.to(dtype=torch.bool, device=self._last_field_format_ok.device)
-        self._last_length_ok = length_ok_mask.to(dtype=torch.bool, device=self._last_length_ok.device)
+        # EnvWorker discards the newly generated action when a prior decision
+        # requests missed-stop termination. Preserve the prior decision's
+        # diagnostics as well; the discarded action must not affect rewards or
+        # the terminal audit record.
+        keep_last_mask = forced_missed_stop_mask.to(self._last_parse_ok.device)
+
+        def _update_last(previous: torch.Tensor, current: torch.Tensor) -> torch.Tensor:
+            current = current.to(dtype=torch.bool, device=previous.device)
+            return torch.where(keep_last_mask, previous, current)
+
+        self._last_parse_ok = _update_last(self._last_parse_ok, parse_ok_mask)
+        self._last_has_bbox = _update_last(self._last_has_bbox, has_bbox_mask)
+        self._last_json_valid = _update_last(self._last_json_valid, json_valid_mask)
+        self._last_struct_ok = _update_last(self._last_struct_ok, struct_ok_mask)
+        self._last_field_format_ok = _update_last(
+            self._last_field_format_ok, field_format_ok_mask
+        )
+        self._last_length_ok = _update_last(self._last_length_ok, length_ok_mask)
 
         # Record raw action (incl. parse-fail sentinel) into per-env history for
         # episode-end diagnostics and zero-shot difficulty metrics.
         raw_acts_cpu = actions.detach().cpu().tolist()
         active_undone_pre = self._slot_active & ~self._slot_done
         for _i, _a in enumerate(raw_acts_cpu):
-            if active_undone_pre[_i]:
+            if active_undone_pre[_i] and not bool(passive_mask[_i].item()):
                 self._action_history[_i].append(int(_a))
 
         # Parse-fail policy (Lavira-style): keep navigating, do NOT terminate.
-        # Any remaining sentinel value >= 4 is clamped to MOVE_FORWARD so the
-        # episode continues. Done/ghost slots still go to STOP.
-        actions[actions >= 4] = self.MOVE_FORWARD  # parse-fail → default forward
+        # Parse failures use the source evaluator's forward fallback. The
+        # runtime no-op is kept separate and cannot become a physical FORWARD.
+        actions[(actions >= 4) & ~passive_mask] = self.MOVE_FORWARD
+        actions[passive_mask] = self.STOP  # inactive backend placeholder only
         done_or_ghost = torch.tensor(
             self._slot_done | ~self._slot_active, dtype=torch.bool, device=device
         )
@@ -1078,33 +1694,66 @@ class GenarkVecEnv(gym.Env):
 
         # Only increment elapsed_steps for active+undone slots
         active_undone_np = self._slot_active & ~self._slot_done
-        self._elapsed_steps[active_undone_np] += 1
+        noop_np = noop_mask.detach().cpu().numpy().astype(bool)
+        panorama_np = panorama_mask.detach().cpu().numpy().astype(bool)
+        forced_missed_stop_np = (
+            forced_missed_stop_mask.detach().cpu().numpy().astype(bool)
+        )
+        normal_step_np = (
+            active_undone_np
+            & ~noop_np
+            & ~panorama_np
+            & ~forced_missed_stop_np
+        )
+        self._elapsed_steps[normal_step_np] += 1
+        self._elapsed_steps[active_undone_np & panorama_np] += 12
 
         # --- Mark newly stopped agents ---
-        newly_stopped = (actions == self.STOP) & self._active_mask
+        newly_stopped = (actions == self.STOP) & self._active_mask & ~passive_mask
         self._active_mask[newly_stopped] = False
         for i in newly_stopped.nonzero(as_tuple=True)[0].tolist():
             if self._slot_active[i] and not self._slot_done[i]:
                 self._stop_called[i] = True
+        newly_missed_stop = forced_missed_stop_mask & self._active_mask
+        self._active_mask[newly_missed_stop] = False
+        for i in newly_missed_stop.nonzero(as_tuple=True)[0].tolist():
+            self._forced_termination_cause[i] = "missed_stop"
 
         # --- Physics + Render (wrapped for Phase 4 crash isolation) ---
+        physics_started = time.perf_counter()
         try:
-            self._sim.step_physics(actions, self._active_mask, self._active_slot_count)
+            physics_active_mask = self._active_mask & ~passive_mask
+            self._sim.step_physics(actions, physics_active_mask, self._active_slot_count)
         except self._SceneCrashError as e:
             print(f"[GenArk][crash] scene actor crashed during step_physics: {e}", flush=True)
             self._scene_crashed = True
             self._crash_recovery_cooldown = 50
             self._pending_rgb_ref = self._pending_rgb_extras_ref = None
             return self._dormant_step_crash_recovery()
+        self._profile_add(
+            "physics",
+            time.perf_counter() - physics_started,
+            items=int(normal_step_np.sum()),
+        )
 
         # --- Render via backend ---
+        render_started = time.perf_counter()
         try:
+            self._current_scan_images = None
+            self._current_scan_depth = None
+            self._current_scan_states = None
+            self._current_scan_valid[:] = False
             if self._enable_depth_obs:
                 # Depth obs path: synchronous render_main_with_depth + 4-dir RGB.
                 self._current_rgb, self._current_depth = self._sim.render_main_with_depth(
                     self._active_slot_count
                 )
-                self._current_rgb_extras = self._sim.render_4dir(self._active_slot_count)
+                if self._enable_4dir_depth_obs:
+                    self._current_rgb_extras, self._current_depth_extras = self._sim.render_4dir_with_depth(
+                        self._active_slot_count
+                    )
+                else:
+                    self._current_rgb_extras = self._sim.render_4dir(self._active_slot_count)
             elif self._use_async_render:
                 # Phase 3 async pipeline:
                 # 1. Fetch the render submitted at the *previous* step (LLM generate has
@@ -1120,12 +1769,46 @@ class GenarkVecEnv(gym.Env):
             else:
                 self._current_rgb        = self._sim.render_main(self._active_slot_count)
                 self._current_rgb_extras = self._sim.render_4dir(self._active_slot_count)
+
+            if bool(panorama_mask[:self._active_slot_count].any().item()):
+                scan_rgb, scan_depth, scan_yaw = self._sim.render_panorama_with_depth(
+                    self._active_slot_count
+                )
+                self._current_scan_images = scan_rgb
+                self._current_scan_depth = scan_depth[..., None]
+                cam_hab = self._sim.cam_pos_hab(self.camera_height).cpu().numpy()
+                scan_states = np.zeros((self.num_envs, 12, 3), dtype=np.float32)
+                scan_states[:, :, 0] = cam_hab[:, None, 0]
+                scan_states[:, :, 1] = cam_hab[:, None, 2]
+                scan_states[:, :, 2] = scan_yaw
+                self._current_scan_states = scan_states
+                self._current_scan_valid = panorama_np.copy()
+
+                # LHX rotates frames [30,...,360] and selects
+                # front/left/behind/right = [360,90,180,270].
+                selected = panorama_np & active_undone_np
+                self._current_rgb[selected] = scan_rgb[selected, 11]
+                if self._current_rgb_extras is not None:
+                    self._current_rgb_extras[selected] = scan_rgb[
+                        selected
+                    ][:, [2, 8, 5]]  # legacy [left,right,behind]
+                if self._current_depth is not None:
+                    self._current_depth[selected] = scan_depth[selected, 11]
+                if self._current_depth_extras is not None:
+                    self._current_depth_extras[selected] = scan_depth[
+                        selected
+                    ][:, [2, 8, 5]]
         except self._SceneCrashError as e:
             print(f"[GenArk][crash] scene actor crashed during render: {e}", flush=True)
             self._scene_crashed = True
             self._crash_recovery_cooldown = 50
             self._pending_rgb_ref = self._pending_rgb_extras_ref = None
             return self._dormant_step_crash_recovery()
+        self._profile_add(
+            "render",
+            time.perf_counter() - render_started,
+            items=self._active_slot_count,
+        )
 
         # --- Metrics ---
         N_act = self._active_slot_count
@@ -1144,7 +1827,7 @@ class GenarkVecEnv(gym.Env):
             curr_dist = curr_dist_act
 
         for i in range(N_act):
-            if self._active_mask[i]:
+            if self._active_mask[i] and not bool(passive_mask[i].item()):
                 self._pred_path_lists[i].append(curr_hab_act[i].cpu().numpy())
                 self._distances_lists[i].append(curr_dist_act[i].item())
                 if hasattr(self, "_min_dtg_t") and self._min_dtg_t is not None:
@@ -1192,6 +1875,9 @@ class GenarkVecEnv(gym.Env):
             reward = self._prev_geo_dist.to(curr_dist.device) - curr_dist
             just_succeeded = newly_stopped & (curr_dist < self.success_distance)
             reward[just_succeeded] += self.success_bonus
+        # Source LaViRA's empty-action branch does not advance the simulator or
+        # receive navigation reward. Keep the adapter sentinel equally inert.
+        reward[passive_mask.to(reward.device)] = 0.0
         self._prev_geo_dist = curr_dist.clone()
 
         if self.reward_mode == "decision_nav":
@@ -1221,7 +1907,7 @@ class GenarkVecEnv(gym.Env):
             dtype=torch.bool, device="cpu",
         )
         terminated = newly_stopped.cpu() & torch.tensor(active_undone_np, device="cpu")
-        truncated  = newly_timed_out
+        truncated = newly_timed_out | newly_missed_stop.cpu()
 
         if self.reward_mode == "decision_nav":
             # Terminal action rewards must be emitted by step() itself so they
@@ -1318,6 +2004,15 @@ class GenarkVecEnv(gym.Env):
                   f"all {int(self._slot_active.sum())} episodes done. "
                   "Entering dormant mode.", flush=True)
 
+        self._profile_add(
+            "env_step_total",
+            time.perf_counter() - profile_started,
+            items=int(active_undone_np.sum()),
+        )
+        self._profile_add("panorama", 0.0, items=int(panorama_np.sum()))
+        self._profile_add("normal_step", 0.0, items=int(normal_step_np.sum()))
+        self._profile_add("noop", 0.0, items=int((active_undone_np & noop_np).sum()))
+        self._profile_flush_if_due()
         return (
             obs,
             reward.cpu(),
@@ -1333,11 +2028,16 @@ class GenarkVecEnv(gym.Env):
         # RGB (+ optional depth) from last render (or first render after reset)
         if self._current_rgb is None:
             if self._enable_depth_obs:
-                # Depth obs: render RGB + depth together; 4-dir still RGB-only.
+                # Depth obs: request aligned panorama depth only when runtime asks.
                 self._current_rgb, self._current_depth = self._sim.render_main_with_depth(
                     self._active_slot_count
                 )
-                self._current_rgb_extras = self._sim.render_4dir(self._active_slot_count)
+                if self._enable_4dir_depth_obs:
+                    self._current_rgb_extras, self._current_depth_extras = self._sim.render_4dir_with_depth(
+                        self._active_slot_count
+                    )
+                else:
+                    self._current_rgb_extras = self._sim.render_4dir(self._active_slot_count)
             elif self._use_async_render:
                 # First frame after reset: submit and immediately fetch (no pipelining yet).
                 ref  = self._sim.render_main_async(self._active_slot_count)
@@ -1363,14 +2063,6 @@ class GenarkVecEnv(gym.Env):
         ids_t  = torch.tensor(np.stack(ids_list),  dtype=torch.int64,  device=device)
         mask_t = torch.tensor(np.stack(mask_list), dtype=torch.bool,   device=device)
 
-        # RLinf's EnvOutput.prepare_observations() only keeps these 5 keys:
-        #   main_images, wrist_images, extra_view_images, states, task_descriptions
-        # Everything else is discarded before reaching the rollout worker.
-        # Map our data into these slots:
-        #   rgb (N,3,H,W) CHW → main_images (N,H,W,3) HWC  (RLinf standard)
-        #   elapsed_steps      → states  (used by UniNaVidPolicy for cache reset)
-        #   instruction text   → task_descriptions
-
         # CHW → HWC
         rgb_hwc = rgb_t.permute(0, 2, 3, 1).contiguous()
 
@@ -1389,19 +2081,34 @@ class GenarkVecEnv(gym.Env):
         ], axis=1)  # (N, 4)
         states_t = torch.from_numpy(states_np).to(device)
 
-        # extra_view_images: either depth obs (B-infra) or 4-dir RGB, never both.
-        if self._enable_depth_obs and self._current_depth is not None:
-            # Depth: shape (N, 1, H, W, 1) float32 — borrowed channel for B-infra.
-            # Policy identifies it as depth by dtype=float32 and shape[1]==1.
-            depth_np = self._current_depth  # (N, H, W) float32
-            extra_t = torch.from_numpy(
-                depth_np[:, None, :, :, None].astype(np.float32)
+        # ``extra_view_images`` keeps panorama RGB. ``wrist_images`` carries
+        # depth; the full LaViRA-RFT runtime projects targets after physical turns.
+        wrist_t = None
+        if self._enable_4dir_depth_obs and self._current_depth is not None and self._current_depth_extras is not None:
+            # Backend extras are [left,right,behind]; canonical adapter order is
+            # [front,left,behind,right].
+            all_depth = np.stack([
+                self._current_depth,
+                self._current_depth_extras[:, 0],
+                self._current_depth_extras[:, 2],
+                self._current_depth_extras[:, 1],
+            ], axis=1)
+            wrist_t = torch.from_numpy(all_depth[:, :, :, :, None].astype(np.float32)).to(device)
+        elif self._enable_depth_obs and self._current_depth is not None:
+            wrist_t = torch.from_numpy(
+                self._current_depth[:, None, :, :, None].astype(np.float32)
             ).to(device)
-        elif self._current_rgb_extras is not None:
+
+        # Keep four RGB prompt views and front depth simultaneously.
+        if self._current_rgb_extras is not None:
             # 4-dir extras: (N, 3, H, W, 3) uint8 → put into extra_view_images
             # Order: [left, right, behind] (front is in main_images)
             extra_t = torch.from_numpy(
                 np.ascontiguousarray(self._current_rgb_extras)
+            ).to(device)
+        elif self._enable_depth_obs and self._current_depth is not None:
+            extra_t = torch.from_numpy(
+                self._current_depth[:, None, :, :, None].astype(np.float32)
             ).to(device)
         else:
             extra_t = None
@@ -1413,13 +2120,58 @@ class GenarkVecEnv(gym.Env):
             for i in range(self.num_envs)
         ]
 
+        # Keep a stable batch schema on every tick. The scan payload is valid
+        # only on ACTION_PANORAMA; zero tensors plus scan_valid=False prevent
+        # stale panorama frames from leaking into a later policy decision.
+        if self._current_scan_images is None:
+            scan_images = np.zeros(
+                (self.num_envs, 12, self.cam_h, self.cam_w, 3), dtype=np.uint8
+            )
+            scan_depth = np.zeros(
+                (self.num_envs, 12, self.cam_h, self.cam_w, 1), dtype=np.float32
+            )
+            scan_states = np.zeros((self.num_envs, 12, 3), dtype=np.float32)
+        else:
+            scan_images = np.ascontiguousarray(self._current_scan_images)
+            scan_depth = np.ascontiguousarray(self._current_scan_depth)
+            scan_states = np.ascontiguousarray(self._current_scan_states)
+
+        episode_active = self._slot_active & ~self._slot_done
+        episode_ids = [
+            str(self._episodes[i].get("episode_id", ""))
+            if episode_active[i] and self._episodes[i] is not None
+            else ""
+            for i in range(self.num_envs)
+        ]
+        trial_ids = [
+            int(self._trial_indices[i]) if episode_active[i] else 0
+            for i in range(self.num_envs)
+        ]
+        scene_ids = [
+            str(self._episodes[i].get("scene_id", ""))
+            if episode_active[i] and self._episodes[i] is not None
+            else ""
+            for i in range(self.num_envs)
+        ]
+
         return {
             "main_images":     rgb_hwc,           # (N, H, W, 3) uint8 — front view
             "states":          states_t,           # (N, 4) float — [elapsed, hab_x, hab_z, yaw]
             "task_descriptions": task_descriptions,  # empty string marks dormant slots
             # Kept for any direct callers that bypass prepare_observations
-            "wrist_images":    None,
-            "extra_view_images": extra_t,         # depth (N,1,H,W,1) float32 or 4-dir (N,3,H,W,3) uint8
+            "wrist_images":    wrist_t,
+            "extra_view_images": extra_t,         # panorama RGB or depth fallback
+            "scan_images": torch.from_numpy(scan_images),
+            "scan_depth_images": torch.from_numpy(scan_depth),
+            "scan_states": torch.from_numpy(scan_states),
+            "scan_valid": torch.from_numpy(self._current_scan_valid.copy()),
+            "episode_active": torch.from_numpy(episode_active.copy()),
+            "episode_ids": episode_ids,
+            "trial_ids": trial_ids,
+            "scene_ids": scene_ids,
+            # Diagnostics/data-generation metadata only. QwenNav does not add
+            # this tensor to the prompt or forward inputs.
+            "simulator_positions": self._sim.cam_pos.detach().clone(),
         }
 
     def _handle_slot_done(
@@ -1445,10 +2197,17 @@ class GenarkVecEnv(gym.Env):
             acts = self._action_history[i]
             parse_fail_count = sum(1 for a in acts if a >= 4)
             last_action = acts[-1] if acts else None
-            termination_cause = "stop" if last_action == self.STOP else "timeout"
-            success_val = int(m.get("success", 0))
+            termination_cause = self._forced_termination_cause[i] or (
+                "stop" if last_action == self.STOP else "timeout"
+            )
             start_dtg = float(self._start_dtg[i])
             final_dtg = float(m.get("distance_to_goal", 0.0))
+            proximity_success = bool(m.get("success", 0))
+            clean_stop_success = is_clean_stop_success(
+                termination_cause=termination_cause,
+                distance_to_goal=final_dtg,
+                success_distance=self.success_distance,
+            )
             dists = self._distances_lists[i]
             min_dtg = float(min(dists)) if dists else final_dtg
             best_dtg_progress = start_dtg - min_dtg
@@ -1460,14 +2219,24 @@ class GenarkVecEnv(gym.Env):
                 and stop_step <= 5
                 and final_dtg > self.success_distance
             )
-            trial_index = self._completed_trial_count(slot_scene_id, ep_id) + 1
-            if success_val:
+            trial_index = int(self._trial_indices[i])
+            terminal_score = compute_terminal_navigation_score(
+                final_dtg,
+                bool(clean_stop_success),
+                distance_floor_m=self.terminal_navigation_distance_floor_m,
+                clean_stop_bonus=self.terminal_navigation_clean_stop_bonus,
+            )
+            if clean_stop_success:
                 if start_dtg < self.success_distance:
                     success_type = "lucky_start"
                 elif parse_fail_count > 0:
                     success_type = "recovered"
                 else:
                     success_type = "clean"
+            elif termination_cause == "missed_stop":
+                success_type = "missed_stop"
+            elif proximity_success:
+                success_type = "proximity"
             else:
                 success_type = "wrong_stop" if termination_cause == "stop" else "no_stop"
             ep_record = {
@@ -1475,8 +2244,17 @@ class GenarkVecEnv(gym.Env):
                 "episode_id": ep_id,
                 "scene_id":   slot_scene_id,
                 "trial_index": int(trial_index),
+                "rft_group_id": int(i // max(self.group_size, 1)),
+                "rft_group_generation": int(
+                    self._rft_group_generation_by_group.get(
+                        i // max(self.group_size, 1), 0
+                    )
+                ),
                 "parse_fail_count": int(parse_fail_count),
                 "success_type": success_type,
+                "clean_stop_success": float(clean_stop_success),
+                "proximity_success": float(proximity_success),
+                "terminal_navigation_score": float(terminal_score),
                 "termination_cause": termination_cause,
                 "start_distance_to_goal": start_dtg,
                 "dtg_progress": start_dtg - final_dtg,
@@ -1503,9 +2281,28 @@ class GenarkVecEnv(gym.Env):
                 "curr_dtg": final_dtg,
                 "termination_cause": termination_cause,
                 "success": float(m.get("success", 0.0)),
+                "clean_stop_success": float(clean_stop_success),
+                "proximity_success": float(proximity_success),
                 "min_dtg": min_dtg,
                 "start_dtg": start_dtg,
                 "process_paid": float(self._process_progress_paid[i].item()),
+                "missed_stop_aux_paid": bool(
+                    self._missed_stop_aux_paid[i].item()
+                ),
+                "reference_path_potential_before": float(
+                    self._reference_path_potential_start[i].item()
+                ),
+                "reference_path_potential_origin": float(
+                    self._reference_path_potential_origin[i].item()
+                ),
+                "reference_path_normalization_length": float(
+                    self._reference_path_normalization_length[i].item()
+                ),
+                "decision_position_before": self._decision_position_start[i]
+                .detach()
+                .cpu()
+                .numpy()
+                .tolist(),
                 "reward_components": dict(self._reward_component_totals[i]),
                 "last_parse_ok": bool(self._last_parse_ok[i]),
                 "last_json_valid": bool(self._last_json_valid[i]),
@@ -1516,6 +2313,7 @@ class GenarkVecEnv(gym.Env):
                 "structured_paid": float(self._structured_reward_given[i].item()),
                 "bbox_paid": float(self._bbox_reward_given[i].item()),
             }
+            self._forced_termination_cause[i] = ""
             balancer = self._balancer_by_scene.get(slot_scene_id)
             if balancer is not None:
                 balancer.record(ep_id, bool(m.get("success", 0)))
@@ -1582,6 +2380,27 @@ class GenarkVecEnv(gym.Env):
             and str(rec.get("episode_id", "")) == ep_key
         )
 
+    def _assign_current_trial_indices(self, env_indices: list[int]) -> None:
+        """Reserve stable trial indices before a batch of episodes starts."""
+        grouped: dict[tuple[str, str], list[int]] = {}
+        for env_i in env_indices:
+            episode = self._episodes[env_i]
+            if episode is None or not self._slot_active[env_i]:
+                self._trial_indices[env_i] = 0
+                continue
+            scene_id = (
+                self._scene_layout.scene_id_of(env_i)
+                if self._scene_layout is not None
+                else self._pinned_scene_id
+            )
+            key = (str(scene_id), str(episode.get("episode_id", "")))
+            grouped.setdefault(key, []).append(env_i)
+
+        for (scene_id, episode_id), members in grouped.items():
+            first_index = self._completed_trial_count(scene_id, episode_id) + 1
+            for offset, env_i in enumerate(sorted(members)):
+                self._trial_indices[env_i] = first_index + offset
+
     def _maybe_reset_complete_groups(self, newly_done_idx: list[int]) -> None:
         """Group-level reset: when all envs in a GRPO group finish their episode,
         reset the entire group to the next episode from the pool.
@@ -1615,6 +2434,9 @@ class GenarkVecEnv(gym.Env):
 
             # All active envs in the group are done
             del self._group_done_counts[group_id]
+            self._rft_group_generation_by_group[group_id] = (
+                self._rft_group_generation_by_group.get(group_id, 0) + 1
+            )
 
             # Resolve which scene this group belongs to.
             scene_id = (
@@ -1646,6 +2468,18 @@ class GenarkVecEnv(gym.Env):
                 # Balanced mode: EpisodeBalancer picks next episode by
                 # (seen_count, success_rate) lexicographic order.
                 next_ep, new_pass = balancer.next_episode()
+                skipped = 0
+                while (
+                    str(next_ep.get("episode_id")) in self._episode_blocklist
+                    and skipped <= len(pool)
+                ):
+                    next_ep, new_pass = balancer.next_episode()
+                    skipped += 1
+                if str(next_ep.get("episode_id")) in self._episode_blocklist:
+                    raise RuntimeError(
+                        "episode_blocklist left no unblocked episode for "
+                        f"scene={scene_id} group={group_id}"
+                    )
                 ep_id = next_ep.get("episode_id", "?")
                 if new_pass:
                     self._episode_cycle_by_scene[scene_id] += 1
@@ -1733,6 +2567,8 @@ class GenarkVecEnv(gym.Env):
                 self._action_history[j] = []
                 self._pred_path_lists[j] = []
                 self._distances_lists[j] = []
+
+            self._assign_current_trial_indices(group_envs)
 
             # P0 guard: all envs in this group must share the exact same episode object.
             assert len({id(self._episodes[j]) for j in group_envs}) == 1, (
@@ -1824,12 +2660,31 @@ class GenarkVecEnv(gym.Env):
                             dtype=torch.uint8, device=dev)
                 if self.enable_4dir_render else None
             )
+            dummy_runtime_depth = (
+                torch.zeros((N, 4, self.cam_h, self.cam_w, 1), dtype=torch.float32, device=dev)
+                if self._enable_4dir_depth_obs else None
+            )
             self._dummy_obs_cache = {
                 "main_images":       dummy_rgb,
                 "states":            dummy_states,
                 "task_descriptions": [""] * N,
-                "wrist_images":      None,
+                "wrist_images":      dummy_runtime_depth,
                 "extra_view_images": dummy_extra,
+                "scan_images": torch.zeros(
+                    (N, 12, self.cam_h, self.cam_w, 3), dtype=torch.uint8
+                ),
+                "scan_depth_images": torch.zeros(
+                    (N, 12, self.cam_h, self.cam_w, 1), dtype=torch.float32
+                ),
+                "scan_states": torch.zeros((N, 12, 3), dtype=torch.float32),
+                "scan_valid": torch.zeros(N, dtype=torch.bool),
+                "episode_active": torch.zeros(N, dtype=torch.bool),
+                "episode_ids": [""] * N,
+                "trial_ids": [0] * N,
+                "scene_ids": [""] * N,
+                "simulator_positions": torch.zeros(
+                    (N, 3), dtype=torch.float32, device=dev
+                ),
             }
         reward     = torch.zeros(N, dtype=torch.float32, device="cpu")
         # IMPORTANT: terminated=False, truncated=False — we do NOT signal
@@ -2243,6 +3098,22 @@ class GenarkVecEnv(gym.Env):
                 min_dtg = float(snapshot.get("min_dtg", curr_dtg))
                 start_dtg = float(snapshot.get("start_dtg", curr_dtg))
                 process_paid = float(snapshot.get("process_paid", 0.0))
+                missed_stop_aux_paid = bool(
+                    snapshot.get("missed_stop_aux_paid", False)
+                )
+                reference_path_potential_before = float(
+                    snapshot.get("reference_path_potential_before", 0.0)
+                )
+                reference_path_potential_origin = float(
+                    snapshot.get("reference_path_potential_origin", 0.0)
+                )
+                reference_path_normalization_length = float(
+                    snapshot.get("reference_path_normalization_length", 1.0)
+                )
+                decision_position_before = np.asarray(
+                    snapshot.get("decision_position_before", [0.0, 0.0, 0.0]),
+                    dtype=float,
+                )
                 last_json_valid = bool(snapshot.get("last_json_valid", False))
                 last_parse_ok = bool(snapshot.get("last_parse_ok", last_json_valid))
                 last_struct_ok = bool(snapshot.get("last_struct_ok", False))
@@ -2264,6 +3135,21 @@ class GenarkVecEnv(gym.Env):
                 min_dtg = float(self._min_dtg_t[i].item())
                 start_dtg = float(self._start_dtg[i])
                 process_paid = float(self._process_progress_paid[i].item())
+                missed_stop_aux_paid = bool(
+                    self._missed_stop_aux_paid[i].item()
+                )
+                reference_path_potential_before = float(
+                    self._reference_path_potential_start[i].item()
+                )
+                reference_path_potential_origin = float(
+                    self._reference_path_potential_origin[i].item()
+                )
+                reference_path_normalization_length = float(
+                    self._reference_path_normalization_length[i].item()
+                )
+                decision_position_before = (
+                    self._decision_position_start[i].detach().cpu().numpy()
+                )
                 last_json_valid = bool(self._last_json_valid[i])
                 last_parse_ok = bool(self._last_parse_ok[i])
                 last_struct_ok = bool(self._last_struct_ok[i])
@@ -2367,6 +3253,65 @@ class GenarkVecEnv(gym.Env):
                     if snapshot is None:
                         self._process_progress_paid[i] += new_progress
 
+            reference_path_r = 0.0
+            if (
+                self.reference_path_reward_enabled
+                and self.reference_path_progress_coef != 0.0
+                and ep is not None
+                and len(pred) > 0
+            ):
+                potential_fn = (
+                    _normalized_reference_path_potential
+                    if self.reference_path_normalized_potential
+                    else _reference_path_potential
+                )
+                current_potential, _, _ = potential_fn(
+                    np.asarray(pred[-1], dtype=float),
+                    np.asarray(ep.get("reference_path", []), dtype=float),
+                    self.reference_path_lateral_penalty,
+                    **(
+                        {
+                            "origin_potential": reference_path_potential_origin,
+                            "normalization_length": (
+                                reference_path_normalization_length
+                            ),
+                        }
+                        if self.reference_path_normalized_potential
+                        else {}
+                    ),
+                )
+                potential_delta = current_potential - reference_path_potential_before
+                if self.reference_path_delta_clip > 0.0:
+                    potential_delta = float(
+                        np.clip(
+                            potential_delta,
+                            -abs(self.reference_path_delta_clip),
+                            abs(self.reference_path_delta_clip),
+                        )
+                    )
+                reference_path_r = (
+                    self.reference_path_progress_coef * potential_delta
+                )
+                if snapshot is None:
+                    self._reference_path_potential_start[i] = current_potential
+
+            current_position = (
+                np.asarray(pred[-1], dtype=float)
+                if len(pred) > 0
+                else decision_position_before
+            )
+            decision_displacement = float(
+                np.linalg.norm(
+                    current_position[[0, 2]] - decision_position_before[[0, 2]]
+                )
+            )
+            if snapshot is None:
+                self._decision_position_start[i] = torch.as_tensor(
+                    current_position,
+                    dtype=torch.float32,
+                    device=self._decision_position_start.device,
+                )
+
             gsam_r = 0.0
             diag = policy_diag_by_env.get(i, {}) if policy_diag_by_env else {}
             if diag:
@@ -2393,10 +3338,50 @@ class GenarkVecEnv(gym.Env):
                     gsam_r += self.gsam_detect_progress_bonus
                     self._gsam_reward_diag_counts["bonus"] += 1.0
 
+            projection_r = 0.0
+            no_movement_r = 0.0
+            if self.projection_aux_reward_enabled and diag:
+                if bool(diag.get("projection_depth_exhausted", False)):
+                    projection_r -= abs(self.projection_depth_exhausted_penalty)
+                backoff_count = max(0, int(diag.get("projection_backoff_count", 0)))
+                projection_r -= min(
+                    abs(self.projection_backoff_penalty_cap),
+                    abs(self.projection_backoff_penalty_coef) * backoff_count,
+                )
+            if (
+                self.no_movement_reward_enabled
+                and diag
+                and not bool(diag.get("is_stop", False))
+                and self.no_movement_threshold_m > 0.0
+                and decision_displacement < self.no_movement_threshold_m
+            ):
+                fraction = 1.0 - decision_displacement / self.no_movement_threshold_m
+                no_movement_r = -abs(self.no_movement_penalty) * fraction
+
+            missed_stop_r = 0.0
+            if (
+                self.missed_stop_aux_reward_enabled
+                and diag
+                and "is_stop" in diag
+                and not missed_stop_aux_paid
+            ):
+                missed_stop_r = _missed_stop_aux_reward(
+                    decision_start_dtg=dtg_before,
+                    success_distance=self.success_distance,
+                    is_stop=bool(diag.get("is_stop", False)),
+                    penalty=self.missed_stop_aux_penalty,
+                    eligible_episode=start_dtg >= self.success_distance,
+                )
+                if missed_stop_r != 0.0 and snapshot is None:
+                    self._missed_stop_aux_paid[i] = True
+                    if self.terminate_on_missed_stop:
+                        self._missed_stop_terminal_pending[i] = True
+
             component_values = {
                 "ndtw": ndtw_r,
                 "parse": parse_r,
                 "process": process_r,
+                "reference_path": reference_path_r,
                 "struct": struct_r,
                 "bbox": bbox_r,
                 "path": terminal_path_r,
@@ -2405,6 +3390,9 @@ class GenarkVecEnv(gym.Env):
                 "wrong_stop": terminal_wrong_stop_r,
                 "no_stop": terminal_no_stop_r,
                 "gsam": gsam_r,
+                "projection": projection_r,
+                "no_movement": no_movement_r,
+                "missed_stop": missed_stop_r,
             }
             base_components = (
                 dict(snapshot.get("reward_components", {}))
@@ -2428,7 +3416,10 @@ class GenarkVecEnv(gym.Env):
                         f"env={i} success={float(snapshot.get('success', 0.0)):.0f} "
                         f"cause={termination_cause} "
                         f"components={component_values} "
-                        f"decision_reward={float(ndtw_r + sum(component_values.values())):.6f}",
+                        f"decision_reward="
+                        f"{float(ndtw_r + sum(component_values.values())):.6f} "
+                        f"reward_totals={base_components} "
+                        f"reward_sum={float(sum(base_components.values())):.6f}",
                         flush=True,
                     )
 
@@ -2439,9 +3430,48 @@ class GenarkVecEnv(gym.Env):
                 + struct_r
                 + bbox_r
                 + process_r
+                + reference_path_r
                 + gsam_r
+                + projection_r
+                + no_movement_r
+                + missed_stop_r
             )
         return torch.from_numpy(reward_np).float()
+
+    def missed_stop_terminal_pending(self, env_i: int) -> bool:
+        """Whether the next env step must end after a missed STOP decision."""
+        return bool(self._missed_stop_terminal_pending[int(env_i)])
+
+    def termination_shadow_metadata(self, env_i: int) -> dict[str, float | int]:
+        """Return oracle metadata for a read-only termination shadow sample.
+
+        This method is intentionally outside ``_build_obs`` so DTG labels never
+        enter the navigation policy's observation or prompt.
+        """
+        env_i = int(env_i)
+        distances = self._distances_lists[env_i]
+        current_dtg = float(distances[-1]) if distances else float("nan")
+        episode = self._episodes[env_i] or {}
+        episode_id = episode.get("episode_id", -1)
+        try:
+            episode_id = int(episode_id)
+        except (TypeError, ValueError):
+            episode_id = -1
+        return {
+            "dtg": current_dtg,
+            "start_dtg": float(self._start_dtg[env_i]),
+            "success_distance": float(self.success_distance),
+            "oracle_within_radius": int(
+                np.isfinite(current_dtg) and current_dtg < self.success_distance
+            ),
+            "eligible_clean_stop": int(
+                np.isfinite(current_dtg)
+                and current_dtg < self.success_distance
+                and float(self._start_dtg[env_i]) >= self.success_distance
+            ),
+            "episode_id": episode_id,
+            "trial_id": int(self._trial_indices[env_i]),
+        }
 
     def _compute_episode_metrics(self, env_idx: list[int]) -> dict:
         """Returns {env_idx: metrics_dict} for each done env."""
@@ -2452,8 +3482,18 @@ class GenarkVecEnv(gym.Env):
             pred  = np.array(self._pred_path_lists[i])
             gt    = np.array(ep.get("reference_path", [[0, 0, 0]]), dtype=float)
 
+            # Match LaViRA-RFT's evaluation definition exactly: an episode is
+            # successful when its final distance is within the success radius.
+            # This metric intentionally does not require an explicit STOP;
+            # STOP remains a separate action/reward signal below.
             ep_success = float(
-                self._stop_called[i] and dists and dists[-1] < self.success_distance
+                len(dists) > 0
+                and float(dists[-1]) <= self.success_distance
+            )
+            clean_stop_success = float(
+                bool(self._stop_called[i])
+                and len(dists) > 0
+                and float(dists[-1]) < self.success_distance
             )
             gt_length  = dists[0] if dists else 0.0
             if len(pred) > 1:
@@ -2475,6 +3515,8 @@ class GenarkVecEnv(gym.Env):
 
             metrics[i] = {
                 "success":          ep_success,
+                "proximity_success": ep_success,
+                "clean_stop_success": clean_stop_success,
                 "spl":              spl,
                 "ndtw":             ndtw,
                 "sdtw":             ndtw * ep_success,
@@ -2509,6 +3551,47 @@ class GenarkVecEnv(gym.Env):
     @property
     def info_logging_keys(self) -> list[str]:
         return ["success", "spl", "ndtw", "distance_to_goal"]
+
+    def force_eval_timeout(self):
+        """Finalize active eval slots at the rollout decision boundary.
+
+        LaViRA may intentionally emit ACTION_NOOP when no executable primitive
+        is available. Such a no-op does not advance GenArk's primitive-step
+        counter, while the Habitat frozen evaluator still counts the enclosing
+        decision. The eval worker calls this once after the final decision so
+        both simulators share the same no_stop boundary.
+        """
+        active_undone = self._slot_active & ~self._slot_done
+        done_idx = np.flatnonzero(active_undone).tolist()
+        if not done_idx:
+            return (
+                self._build_obs(),
+                {
+                    "distance_to_goal": np.zeros(self.num_envs, dtype=np.float32),
+                    "success": np.zeros(self.num_envs, dtype=np.float32),
+                    "elapsed_steps": self._elapsed_steps.copy(),
+                },
+                np.zeros(self.num_envs, dtype=bool),
+            )
+
+        n_act = self._active_slot_count
+        curr_hab = self._sim.cam_pos_hab(self.camera_height)[:n_act]
+        curr_dist_act = torch.norm(
+            curr_hab - self._goal_pos_t[:n_act].to(curr_hab.device), dim=1
+        )
+        curr_dist = curr_dist_act.detach().cpu().numpy().astype(np.float32)
+        if n_act < self.num_envs:
+            curr_dist = np.pad(curr_dist, (0, self.num_envs - n_act))
+        info = {
+            "distance_to_goal": curr_dist,
+            "success": np.zeros(self.num_envs, dtype=np.float32),
+            "elapsed_steps": self._elapsed_steps.copy(),
+        }
+        final_obs, info = self._handle_slot_done(done_idx, self._build_obs(), info)
+        if not np.any(self._slot_active & ~self._slot_done):
+            self._exhausted = True
+            self._dump_per_scene_metrics()
+        return final_obs, info, np.isin(np.arange(self.num_envs), done_idx)
 
     def chunk_step(
         self, chunk_actions: torch.Tensor

@@ -22,7 +22,7 @@ ENVS_PER_WORKER=${3:-20}   # must be >= max(ep_count per scene) = 20
 # ── Paths ──────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RLINF_ROOT="$(dirname "$SCRIPT_DIR")"
-CONDA_PYTHON="/home/clk/miniconda3/envs/genesis/bin/python"
+CONDA_PYTHON="/home/clk/miniconda3/envs/genesis-vllm/bin/python"
 EMBODIED_PATH="$RLINF_ROOT/examples/embodiment"
 RESULTS_DIR="/home/clk/workspace/results/genark_eval"
 EPISODES_FILE="/home/nvme03/lck/genark/data/datasets/OpenNav_R2R-CE_100_bertidx.json"

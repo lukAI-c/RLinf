@@ -80,6 +80,11 @@ class GenesisSceneActor:
     ) -> dict:
         """Set poses, snap to navmesh. Returns snapped state as CPU numpy."""
         dev = self._backend.device
+        # Ray can deserialize NumPy payloads as read-only zero-copy buffers.
+        # PyTorch permits wrapping them but writes during Genesis camera updates
+        # then have undefined behaviour; take an owned CPU copy at this boundary.
+        positions_np = np.array(positions_np, copy=True)
+        yaws_np = np.array(yaws_np, copy=True)
         self._backend.set_agent_poses(
             env_idx,
             torch.from_numpy(positions_np).to(dev),
@@ -99,6 +104,8 @@ class GenesisSceneActor:
             f"> actor num_envs={self._num_envs}. Pass per-scene local count, not global N_act."
         )
         dev = self._backend.device
+        actions_np = np.array(actions_np, copy=True)
+        active_mask_np = np.array(active_mask_np, copy=True)
         self._backend.step_physics(
             torch.from_numpy(actions_np).to(dev),
             torch.from_numpy(active_mask_np).to(dev),
@@ -134,6 +141,20 @@ class GenesisSceneActor:
         )
         rgb, depth = self._backend.render_main_with_depth(active_slot_count)
         return rgb.tobytes(), depth.tobytes()
+
+    def render_4dir_with_depth(self, active_slot_count: int) -> tuple:
+        """Returns aligned legacy-order extras: RGB=(N,3,H,W,3), depth=(N,3,H,W)."""
+        rgb, depth = self._backend.render_4dir_with_depth(active_slot_count)
+        if rgb is None or depth is None:
+            return None, None
+        return rgb.tobytes(), depth.tobytes()
+
+    def render_panorama_with_depth(self, active_slot_count: int) -> tuple:
+        """Return atomic 12-view panorama RGB, depth and per-frame yaw."""
+        rgb, depth, yaw = self._backend.render_panorama_with_depth(
+            active_slot_count
+        )
+        return rgb.tobytes(), depth.tobytes(), yaw.tobytes()
 
     def get_state(self) -> dict:
         """Return full agent state for initial sync."""
@@ -329,13 +350,18 @@ class GenesisRemoteBackend(GenesisSimBackend):
         self._num_envs  = num_envs
         self._device    = device
 
-        # Sync initial state from actor (180s for slow init when vLLM also loads in parallel).
+        # Sync initial state from actor. Busy shared GPUs can make the one-time
+        # Genesis kernel compilation substantially slower than normal.
         # During actor construction, a short health_check can time out and wrongly
         # trigger rebuild_actor(), causing two Genesis processes to build the same
         # scene on one GPU. Use the raw handle here and let get_state be the
         # readiness barrier.
         actor  = self._pool.actor_handle(scene_id)
-        state  = self._safe_get(actor.get_state.remote(), timeout=180.0)
+        startup_timeout = float(os.environ.get("GENESIS_STARTUP_TIMEOUT_S", "180"))
+        state  = self._safe_get(
+            actor.get_state.remote(),
+            timeout=startup_timeout,
+        )
         self._cam_h = state["cam_h"]
         self._cam_w = state["cam_w"]
         self._sync_state(state)
@@ -467,6 +493,15 @@ class GenesisRemoteBackend(GenesisSimBackend):
             .copy()
         )
 
+    def render_4dir_with_depth(self, active_slot_count: int) -> tuple:
+        """Synchronous aligned panorama RGB/depth render for single-scene users."""
+        ref = self.render_4dir_with_depth_async(active_slot_count)
+        return self.fetch_render_4dir_with_depth(ref)
+
+    def render_panorama_with_depth(self, active_slot_count: int) -> tuple:
+        ref = self.render_panorama_with_depth_async(active_slot_count)
+        return self.fetch_render_panorama_with_depth(ref)
+
     # --- Async rendering (Phase 3) -------------------------------------------
 
     def render_main_async(self, active_slot_count: int):
@@ -490,6 +525,14 @@ class GenesisRemoteBackend(GenesisSimBackend):
         """Submit RGB+depth render; return Ray ObjectRef (non-blocking)."""
         actor = self._pool.actor_handle(self._scene_id)
         return actor.render_main_with_depth.remote(active_slot_count)
+
+    def render_4dir_with_depth_async(self, active_slot_count: int):
+        actor = self._pool.actor_handle(self._scene_id)
+        return actor.render_4dir_with_depth.remote(active_slot_count)
+
+    def render_panorama_with_depth_async(self, active_slot_count: int):
+        actor = self._pool.actor_handle(self._scene_id)
+        return actor.render_panorama_with_depth.remote(active_slot_count)
 
     def fetch_render_main(self, ref, timeout: float = 30.0) -> np.ndarray:
         """Block until async render result is ready, then deserialise."""
@@ -529,6 +572,33 @@ class GenesisRemoteBackend(GenesisSimBackend):
             .copy()
         )
         return rgb, depth
+
+    def fetch_render_4dir_with_depth(self, ref, timeout: float = 30.0) -> tuple:
+        raw_rgb, raw_depth = self._safe_get(ref, timeout=timeout)
+        if raw_rgb is None or raw_depth is None:
+            return None, None
+        rgb = np.frombuffer(raw_rgb, dtype=np.uint8).reshape(
+            self._num_envs, 3, self._cam_h, self._cam_w, 3
+        ).copy()
+        depth = np.frombuffer(raw_depth, dtype=np.float32).reshape(
+            self._num_envs, 3, self._cam_h, self._cam_w
+        ).copy()
+        return rgb, depth
+
+    def fetch_render_panorama_with_depth(
+        self, ref, timeout: float = 120.0
+    ) -> tuple:
+        raw_rgb, raw_depth, raw_yaw = self._safe_get(ref, timeout=timeout)
+        rgb = np.frombuffer(raw_rgb, dtype=np.uint8).reshape(
+            self._num_envs, 12, self._cam_h, self._cam_w, 3
+        ).copy()
+        depth = np.frombuffer(raw_depth, dtype=np.float32).reshape(
+            self._num_envs, 12, self._cam_h, self._cam_w
+        ).copy()
+        yaw = np.frombuffer(raw_yaw, dtype=np.float32).reshape(
+            self._num_envs, 12
+        ).copy()
+        return rgb, depth, yaw
 
     # --- Internal helpers ----------------------------------------------------
 

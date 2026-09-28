@@ -148,6 +148,73 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
             "advantages_max": max_adv,
             "advantages_min": -min_adv,
         }
+
+        # Diagnose whether a few decisions dominate the policy gradient. Keep the
+        # legacy mean/max/min above unchanged, but compute these statistics only
+        # over valid, finite decisions when a matching loss mask is available.
+        loss_mask = data_buffer.get("loss_mask")
+        if isinstance(loss_mask, torch.Tensor) and loss_mask.shape == advantages.shape:
+            valid_mask = loss_mask.bool()
+        else:
+            valid_mask = torch.ones_like(advantages, dtype=torch.bool)
+        finite_mask = valid_mask & torch.isfinite(advantages)
+        valid_advantages = advantages[finite_mask].float()
+
+        stats_device = Worker.torch_platform.current_device()
+        if valid_advantages.numel():
+            local_stats = torch.stack(
+                (
+                    valid_advantages.sum(),
+                    valid_advantages.square().sum(),
+                    valid_advantages.abs().sum(),
+                    torch.tensor(
+                        float(valid_advantages.numel()),
+                        device=valid_advantages.device,
+                    ),
+                    (valid_advantages > 0).float().sum(),
+                    (valid_advantages < 0).float().sum(),
+                )
+            ).to(stats_device)
+            local_max_abs = valid_advantages.abs().max().to(stats_device)
+        else:
+            local_stats = torch.zeros(6, device=stats_device, dtype=torch.float32)
+            local_max_abs = torch.zeros((), device=stats_device, dtype=torch.float32)
+
+        total_valid = valid_mask.sum().to(stats_device, dtype=torch.float32)
+        total_nonfinite = (valid_mask & ~torch.isfinite(advantages)).sum().to(
+            stats_device, dtype=torch.float32
+        )
+        torch.distributed.all_reduce(local_stats, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(local_max_abs, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(total_valid, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(total_nonfinite, op=torch.distributed.ReduceOp.SUM)
+
+        adv_sum, adv_sq_sum, adv_abs_sum, adv_count, adv_pos, adv_neg = local_stats
+        count = adv_count.clamp_min(1.0)
+        valid_mean = adv_sum / count
+        valid_variance = (adv_sq_sum / count - valid_mean.square()).clamp_min(0.0)
+        abs_mean = adv_abs_sum / count
+        # 1.0 means evenly distributed magnitude; values near zero mean that a
+        # small subset carries nearly all squared advantage mass.
+        effective_sample_ratio = adv_abs_sum.square() / (
+            count * adv_sq_sum.clamp_min(1e-12)
+        )
+        advantages_metrics.update(
+            {
+                "advantages_valid_mean": valid_mean.item(),
+                "advantages_std": valid_variance.sqrt().item(),
+                "advantages_abs_mean": abs_mean.item(),
+                "advantages_max_abs_to_mean_abs": (
+                    local_max_abs / abs_mean.clamp_min(1e-12)
+                ).item(),
+                "advantages_effective_sample_ratio": effective_sample_ratio.item(),
+                "advantages_positive_fraction": (adv_pos / count).item(),
+                "advantages_negative_fraction": (adv_neg / count).item(),
+                "advantages_nonfinite_fraction": (
+                    total_nonfinite / total_valid.clamp_min(1.0)
+                ).item(),
+            }
+        )
         rollout_metrics.update(advantages_metrics)
 
     if data_buffer.get("returns", None) is not None:

@@ -21,3 +21,15 @@ rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/
 assets/grounded_sam/*.pth
+
+# Local navigation datasets, generated render assets, and agent tooling.
+/data/
+/.agents/
+/assets/ab_scene_original/
+/assets/ep609_curriculum_prefix/
+/assets/mp3d_render_configs/
+**/__pycache__/
+*.pyc
+
+# Engramory live memory store (plain text, machine-local)
+/.engramory-memory/

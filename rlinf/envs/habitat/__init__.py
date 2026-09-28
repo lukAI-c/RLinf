@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .habitat_env import HabitatEnv
-
 __all__ = ["HabitatEnv"]
+
+
+def __getattr__(name):
+    # The remote Qwen client runs in genesis-vllm and intentionally does not
+    # install Habitat.  Keep the native Habitat import available lazily for
+    # env_type=habitat without making the client import Habitat itself.
+    if name == "HabitatEnv":
+        from .habitat_env import HabitatEnv
+
+        return HabitatEnv
+    raise AttributeError(name)

@@ -33,6 +33,7 @@ class SupportedEnvType(Enum):
     ROBOVERSE = "roboverse"
     D4RL = "d4rl"
     GENARK = "genark"
+    HABITAT_QWEN_REMOTE = "habitat_qwen_remote"
 
 
 def get_env_cls(env_type: str, env_cfg=None):
@@ -105,6 +106,10 @@ def get_env_cls(env_type: str, env_cfg=None):
         from rlinf.envs.habitat.habitat_env import HabitatEnv
 
         return HabitatEnv
+    elif env_type == SupportedEnvType.HABITAT_QWEN_REMOTE:
+        from rlinf.envs.habitat.qwen_remote_env import HabitatQwenRemoteEnv
+
+        return HabitatQwenRemoteEnv
     elif env_type == SupportedEnvType.FRANKASIM:
         from rlinf.envs.frankasim.frankasim_env import FrankaSimEnv
 

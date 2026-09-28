@@ -25,6 +25,11 @@ algorithm:
   group_size: 4
   rollout_epoch: 1
   eval_rollout_epoch: 1
+  # Decision-MaxRL is enabled explicitly by the launch script.  These defaults
+  # keep the objective's outcome scale and avoid a second global normalization.
+  normalize_advantages: false
+  maxrl_process_coef: 1.0
+  maxrl_epsilon: 1.0e-6
   sampling_params:
     do_sample: True
     # Higher than eval, low enough to avoid pure noise.  The same episode is
@@ -54,7 +59,8 @@ env:
       episode_id: 824
 
     group_size: ${algorithm.group_size}
-    max_episode_steps: 80
+    # 80 navigation actions plus LaViRA-RFT's physical 12-turn initial scan.
+    max_episode_steps: 92
     max_decisions_per_rollout_epoch: 20
     max_steps_per_rollout_epoch: 200
     cyclic_episode_sampling: true
@@ -74,6 +80,20 @@ env:
     nav_path_coef: 1.0
     nav_endpoint_coef: 1.0
     nav_endpoint_decay: 0.2
+    # RFT-only decision reward. It is intentionally off by default so strict
+    # LaViRA execution/evaluation keeps its original reward semantics.
+    reference_path_reward_enabled: false
+    reference_path_progress_coef: 0.0
+    reference_path_lateral_penalty: 1.0
+    reference_path_delta_clip: 2.5
+    projection_aux_reward_enabled: false
+    projection_depth_exhausted_penalty: 0.1
+    projection_backoff_penalty_coef: 0.01
+    projection_backoff_penalty_cap: 0.1
+    no_movement_reward_enabled: false
+    no_movement_threshold_m: 0.05
+    no_movement_penalty: 0.1
+    ppo_loss_mask_mode: action
     # LaViRA waypoint schema shaping: dense but capped.  This overfit run first
     # needs to leave the parse-fail regime before navigation reward can dominate.
     format_reward_coef: 0.05

@@ -25,7 +25,7 @@ from pathlib import Path
 
 
 RLINF_ROOT   = Path(__file__).parent.parent.resolve()
-PYTHON       = "/home/clk/miniconda3/envs/genesis/bin/python"
+PYTHON       = "/home/clk/miniconda3/envs/genesis-vllm/bin/python"
 EMBODIED_CFG = str(RLINF_ROOT / "examples/embodiment")
 EPISODES_FILE = "/home/nvme03/lck/genark/data/datasets/OpenNav_R2R-CE_100_bertidx.json"
 RESULTS_DIR  = Path("/home/clk/workspace/results/genark_eval")

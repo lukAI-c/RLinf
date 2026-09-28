@@ -34,7 +34,7 @@ NUM_ENV_WORKERS=$(echo "$ENV_GPU_LIST" | tr ',' '\n' | wc -l)
 # ── Paths ──────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RLINF_ROOT="$(dirname "$SCRIPT_DIR")"
-CONDA_PYTHON="/home/clk/miniconda3/envs/genesis/bin/python"
+CONDA_PYTHON="/home/clk/miniconda3/envs/genesis-vllm/bin/python"
 EMBODIED_PATH="$RLINF_ROOT/examples/embodiment"
 LOG_FILE="/tmp/genark_eval_$(date +%Y%m%d_%H%M%S).log"
 

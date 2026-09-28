@@ -1,0 +1,45 @@
+env_type: habitat_qwen_remote
+
+seed: 0
+group_size: 1
+auto_reset: false
+ignore_terminations: false
+# Match LaViRA's Habitat R2R evaluator.  These count real primitive steps.
+max_steps_per_rollout_epoch: 300
+max_episode_steps: 300
+
+# Host-side client endpoint. The matching Habitat 0.1.7 server is started by
+# scripts/run_habitat_qwen_ab.sh inside the isolated lavira:v4 container.
+server_host: 127.0.0.1
+server_port: 18770
+server_timeout_s: 120.0
+
+# Optional GenArk-style shared rollout topology. When enabled, each EnvWorker
+# owns one Habitat RPC server and one episode shard, while all EnvWorkers send
+# observations to the same rollout rank/model through RLinf's CommMapper.
+# server_port_base + EnvWorker rank selects that worker's Habitat server.
+shared_rollout:
+  enabled: false
+  episode_shards_path: ""
+  server_port_base: 18770
+
+# GenArk-style dynamic scheduling. Every host EnvWorker keeps a fixed number
+# of communication slots, but claims the next same-scene episode chunk as soon
+# as its current chunk completes. Empty tail slots remain inactive padding.
+dynamic_scene_queue:
+  enabled: false
+  manifest_path: ""
+  state_path: ""
+
+num_envs: 8
+total_num_envs: 8
+episode_id: 259
+episode_ids: null
+
+video_cfg:
+  save_video: true
+  video_base_dir: ${runner.logger.log_path}/video/eval
+  info_on_video: true
+  fps: 30
+
+init_params: {}

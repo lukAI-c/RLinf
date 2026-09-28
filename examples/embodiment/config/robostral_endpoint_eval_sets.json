@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "scene_id": "mp3d/Z6MFQCViBuw/Z6MFQCViBuw.glb",
+  "notes": "Frozen-eval partitions for endpoint-only RFT. Train-overlap episodes may not be used as a generalization claim. 586 is the anti-forgetting anchor only.",
+  "anchor_anti_forget": ["586"],
+  "train_overlap": ["824", "1301", "1133", "576", "469"],
+  "held_out": ["207", "432", "550", "559", "705"]
+}

@@ -221,6 +221,20 @@ class GenesisZMQServer:
                 arr = self._backend.render_4dir(msg["active_slot_count"])
                 result = arr.tobytes() if arr is not None else None
 
+            elif method == "render_main_with_depth":
+                rgb, depth = self._backend.render_main_with_depth(msg["active_slot_count"])
+                result = (rgb.tobytes(), depth.tobytes())
+
+            elif method == "render_4dir_with_depth":
+                rgb, depth = self._backend.render_4dir_with_depth(msg["active_slot_count"])
+                result = (None, None) if rgb is None or depth is None else (rgb.tobytes(), depth.tobytes())
+
+            elif method == "render_panorama_with_depth":
+                rgb, depth, yaw = self._backend.render_panorama_with_depth(
+                    msg["active_slot_count"]
+                )
+                result = (rgb.tobytes(), depth.tobytes(), yaw.tobytes())
+
             else:
                 return {
                     "req_id": req_id, "status": "error",
@@ -357,6 +371,40 @@ class GenesisZMQBackend(GenesisSimBackend):
             np.frombuffer(raw, dtype=np.uint8)
             .reshape(self._num_envs, 3, self._cam_h, self._cam_w, 3)
             .copy()
+        )
+
+    def render_main_with_depth(self, active_slot_count: int):
+        raw_rgb, raw_depth = self._call("render_main_with_depth", active_slot_count=active_slot_count)["result"]
+        return (
+            np.frombuffer(raw_rgb, dtype=np.uint8).reshape(self._num_envs, self._cam_h, self._cam_w, 3).copy(),
+            np.frombuffer(raw_depth, dtype=np.float32).reshape(self._num_envs, self._cam_h, self._cam_w).copy(),
+        )
+
+    def render_4dir_with_depth(self, active_slot_count: int):
+        raw_rgb, raw_depth = self._call("render_4dir_with_depth", active_slot_count=active_slot_count)["result"]
+        if raw_rgb is None or raw_depth is None:
+            return None, None
+        return (
+            np.frombuffer(raw_rgb, dtype=np.uint8).reshape(self._num_envs, 3, self._cam_h, self._cam_w, 3).copy(),
+            np.frombuffer(raw_depth, dtype=np.float32).reshape(self._num_envs, 3, self._cam_h, self._cam_w).copy(),
+        )
+
+    def render_panorama_with_depth(self, active_slot_count: int):
+        raw_rgb, raw_depth, raw_yaw = self._call(
+            "render_panorama_with_depth",
+            active_slot_count=active_slot_count,
+            timeout_ms=120_000,
+        )["result"]
+        return (
+            np.frombuffer(raw_rgb, dtype=np.uint8).reshape(
+                self._num_envs, 12, self._cam_h, self._cam_w, 3
+            ).copy(),
+            np.frombuffer(raw_depth, dtype=np.float32).reshape(
+                self._num_envs, 12, self._cam_h, self._cam_w
+            ).copy(),
+            np.frombuffer(raw_yaw, dtype=np.float32).reshape(
+                self._num_envs, 12
+            ).copy(),
         )
 
     # --- Async rendering (Phase 3) -------------------------------------------

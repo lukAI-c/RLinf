@@ -35,6 +35,10 @@ Usage:
 """
 
 import asyncio
+import json
+import os
+import shutil
+import tempfile
 import threading
 from typing import Optional
 
@@ -49,6 +53,7 @@ from vllm.v1.engine.async_llm import AsyncLLM as AsyncLLMEngine
 
 from rlinf.config import torch_dtype_from_precision
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
+from rlinf.workers.rollout.utils import derive_rollout_sampling_seed
 
 
 class VLLMMultiStepEmbodiedWorker(MultiStepRolloutWorker):
@@ -64,6 +69,10 @@ class VLLMMultiStepEmbodiedWorker(MultiStepRolloutWorker):
     def init_worker(self):
         # Step 1: Load HF model + set up rank/channel infra (parent handles this).
         super().init_worker()
+        self._sampling_base_seed = int(
+            self.cfg.rollout.get("seed", self.cfg.actor.get("seed", 0))
+        )
+        self._sampling_seed_offset = 0
 
         # Step 2: Start dedicated event loop thread for vLLM async engine.
         self._vllm_loop = asyncio.new_event_loop()
@@ -212,6 +221,17 @@ class VLLMMultiStepEmbodiedWorker(MultiStepRolloutWorker):
             trust_remote_code=bool(self.cfg.actor.model.get("trust_remote_code", True)),
             max_model_len=int(rollout_cfg.get("max_model_len", 4096)),
             max_num_seqs=int(rollout_cfg.get("max_num_seqs", 32)),
+            mm_processor_kwargs=(
+                dict(rollout_cfg.mm_processor_kwargs)
+                if rollout_cfg.get("mm_processor_kwargs", None) is not None
+                else None
+            ),
+            limit_mm_per_prompt=dict(
+                rollout_cfg.get("limit_mm_per_prompt", {})
+            ),
+            mm_encoder_tp_mode=str(
+                rollout_cfg.get("mm_encoder_tp_mode", "weights")
+            ),
             enable_sleep_mode=bool(rollout_cfg.get("enable_sleep_mode", True)),
         )
         self._async_engine = AsyncLLMEngine.from_engine_args(
@@ -232,16 +252,26 @@ class VLLMMultiStepEmbodiedWorker(MultiStepRolloutWorker):
             prompts: list[str],
             image_lists: list[list[Image.Image]],
         ):
-            sampling_params = SamplingParams(
-                temperature=policy.temperature if policy.do_sample else 0.0,
-                max_tokens=policy.max_new_tokens,
-            )
-
             tasks = []
             request_ids = []
             for prompt, images in zip(prompts, image_lists):
-                request_id = str(next(self._request_counter))
+                request_index = int(next(self._request_counter))
+                request_id = str(request_index)
                 request_ids.append(request_id)
+                # Candidate retry must explore fresh stochastic continuations
+                # while retaining the same policy weights. The offset is changed
+                # by EmbodiedRunner for every retry attempt.
+                sampling_params = SamplingParams(
+                    temperature=policy.temperature if policy.do_sample else 0.0,
+                    max_tokens=policy.max_new_tokens,
+                    seed=derive_rollout_sampling_seed(
+                        base_seed=self._sampling_base_seed,
+                        global_step=self.version,
+                        worker_rank=self._rank,
+                        request_index=request_index,
+                        collection_offset=self._sampling_seed_offset,
+                    ),
+                )
                 inp = TextPrompt(
                     prompt=prompt,
                     multi_modal_data={"image": images} if images else None,
@@ -317,63 +347,67 @@ class VLLMMultiStepEmbodiedWorker(MultiStepRolloutWorker):
         # tensor kwargs) on purpose: collective_rpc decodes kwargs *untyped*, so a
         # torch.Tensor passed in kwargs arrives at the spawned EngineCore as a plain
         # Python list (AttributeError: 'list' object has no attribute 'size').
-        # weights_path is a str — it round-trips cleanly, and vLLM's own loader
+        # weights_path is a str -- it round-trips cleanly, and vLLM's own loader
         # reconstructs tensors + applies hf_to_vllm_mapper correctly.
         weights = self._extract_merged_hf_weights()
         n_w = len(weights)
         path = self._write_weights_to_disk(weights)
         del weights
-        fut = asyncio.run_coroutine_threadsafe(
-            self._reload_vllm_weights(path), self._vllm_loop
-        )
-        fut.result(timeout=900)
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._reload_vllm_weights(path), self._vllm_loop
+            )
+            fut.result(timeout=900)
+        finally:
+            # reload_weights() consumes the checkpoint synchronously. Keeping a
+            # per-PID 9 GB copy after that point only leaks disk across runs.
+            shutil.rmtree(path, ignore_errors=True)
         self.log_info(
             f"[VLLMEmbodied] V3 weight sync done: {n_w} tensors merged + "
-            f"reloaded into vLLM from {path}."
+            "reloaded into vLLM; temporary checkpoint removed."
         )
 
     def _write_weights_to_disk(self, weights):
-        """Write [(hf_name, tensor)] to a per-process safetensors dir on NVMe.
-
-        Produces model.safetensors + model.safetensors.index.json so vLLM's
-        DefaultModelLoader.get_all_weights can read it (architecture/config come
-        from the already-loaded model_config, so no config.json is needed here).
-        Overwrites the same dir each sync to avoid filling disk.
-        """
-        import json
-        import os
-
+        """Write merged weights to a disposable per-rank safetensors directory."""
         from safetensors.torch import save_file
 
-        out_dir = f"/home/nvme03/lck/tmp/vllm_wsync_pid{os.getpid()}"
-        os.makedirs(out_dir, exist_ok=True)
-        tensors = {name: t.contiguous() for name, t in weights}
+        tensors = {name: tensor.contiguous() for name, tensor in weights}
+        total_bytes = sum(
+            tensor.numel() * tensor.element_size() for tensor in tensors.values()
+        )
+        root = os.environ.get("RLINF_VLLM_WSYNC_ROOT") or None
+        if root is not None:
+            os.makedirs(root, exist_ok=True)
+        out_dir = tempfile.mkdtemp(
+            prefix=f"rank{self._rank}_pid{os.getpid()}_",
+            dir=root,
+        )
         st_path = os.path.join(out_dir, "model.safetensors")
-        save_file(tensors, st_path)
-
-        total_bytes = sum(t.numel() * t.element_size() for t in tensors.values())
-        index = {
-            "metadata": {"total_size": int(total_bytes)},
-            "weight_map": {name: "model.safetensors" for name in tensors},
-        }
-        with open(os.path.join(out_dir, "model.safetensors.index.json"), "w") as f:
-            json.dump(index, f)
+        tmp_st_path = f"{st_path}.tmp"
+        try:
+            save_file(tensors, tmp_st_path)
+            os.replace(tmp_st_path, st_path)
+            index = {
+                "metadata": {"total_size": int(total_bytes)},
+                "weight_map": {name: "model.safetensors" for name in tensors},
+            }
+            with open(
+                os.path.join(out_dir, "model.safetensors.index.json"), "w"
+            ) as file:
+                json.dump(index, file)
+        except Exception:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            raise
         return out_dir
 
     def _extract_merged_hf_weights(self):
-        """Merge LoRA into base and return [(hf_checkpoint_name, cpu_tensor), ...].
-
-        Operates on the rollout's PeftModel (plain, single-GPU — not FSDP). Uses
-        merge_adapter()/unmerge_adapter() so the in-memory adapter structure is
-        preserved for any later use; the merged value lives in base_layer.weight
-        only between the two calls.
-        """
+        """Merge LoRA into base and return checkpoint-named CPU tensors."""
         peft = self.hf_model
         is_lora = hasattr(peft, "merge_adapter")
 
         def _collect(inner_hf):
             out = []
-            for name, p in inner_hf.named_parameters():
+            for name, parameter in inner_hf.named_parameters():
                 if (
                     ".lora_A" in name
                     or ".lora_B" in name
@@ -382,7 +416,7 @@ class VLLMMultiStepEmbodiedWorker(MultiStepRolloutWorker):
                 ):
                     continue
                 clean = name.replace(".base_layer.", ".")
-                out.append((clean, p.detach().to("cpu")))
+                out.append((clean, parameter.detach().to("cpu")))
             return out
 
         if not is_lora:
@@ -396,13 +430,7 @@ class VLLMMultiStepEmbodiedWorker(MultiStepRolloutWorker):
         return weights
 
     async def _reload_vllm_weights(self, path):
-        """Reload vLLM engine weights from a local safetensors dir.
-
-        reload_weights(weights_path=..., is_checkpoint_format=True) routes through
-        the model's load_weights + hf_to_vllm_mapper, which handles all
-        fused-kernel / prefix remapping internally. Runs inside the dedicated vLLM
-        event loop thread.
-        """
+        """Reload checkpoint-format weights inside the vLLM event loop."""
         await self._async_engine.collective_rpc(
             "reload_weights",
             timeout=600,
@@ -410,7 +438,7 @@ class VLLMMultiStepEmbodiedWorker(MultiStepRolloutWorker):
         )
 
     def shutdown(self):
-        """Clean up vLLM engine thread on exit."""
+        """Clean up the vLLM engine thread on exit."""
         if hasattr(self, "_vllm_loop") and self._vllm_loop.is_running():
             self._vllm_loop.call_soon_threadsafe(self._vllm_loop.stop)
         super().shutdown() if hasattr(super(), "shutdown") else None

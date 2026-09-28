@@ -26,7 +26,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EMBODIED_PATH="$(dirname "$SCRIPT_DIR")/examples/embodiment"
-PYTHON=/home/clk/miniconda3/envs/genesis/bin/python
+PYTHON=/home/clk/miniconda3/envs/genesis-vllm/bin/python
 
 GPUS=${GPUS:-2,3,4,5}    # 默认 4 卡
 MODE=${1:-full}

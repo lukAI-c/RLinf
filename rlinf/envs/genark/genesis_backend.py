@@ -12,6 +12,7 @@ Two implementations:
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from abc import ABC, abstractmethod
@@ -24,6 +25,71 @@ import torch
 # ---------------------------------------------------------------------------
 # NavMesh physics helpers  (moved from genark_env.py)
 # ---------------------------------------------------------------------------
+
+
+def _horizontal_to_vertical_fov_deg(
+    horizontal_fov_deg: float,
+    width: int,
+    height: int,
+) -> float:
+    """Convert a Habitat-style horizontal FOV to Genesis' vertical FOV."""
+    if width <= 0 or height <= 0:
+        raise ValueError("camera width and height must be positive")
+    if not 0.0 < horizontal_fov_deg < 180.0:
+        raise ValueError("horizontal camera FOV must be between 0 and 180 degrees")
+    aspect_ratio = float(width) / float(height)
+    horizontal_half_angle = math.radians(horizontal_fov_deg) / 2.0
+    vertical_half_angle = math.atan(math.tan(horizontal_half_angle) / aspect_ratio)
+    return math.degrees(2.0 * vertical_half_angle)
+
+
+def _linear_rgb_to_srgb(rgb: torch.Tensor) -> torch.Tensor:
+    """Encode normalized linear RGB with the standard sRGB transfer curve."""
+    return torch.where(
+        rgb <= 0.0031308,
+        rgb * 12.92,
+        1.055 * torch.pow(rgb.clamp_min(0.0), 1.0 / 2.4) - 0.055,
+    )
+
+
+def _rgb_color_transform(cfg) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read a linear-domain RGB affine transform with conservative defaults."""
+    matrix = torch.as_tensor(
+        getattr(cfg, "rgb_color_matrix", ((1.0, 0.0, 0.0),
+                                           (0.0, 1.0, 0.0),
+                                           (0.0, 0.0, 1.0))),
+        dtype=torch.float32,
+    )
+    bias = torch.as_tensor(
+        getattr(cfg, "rgb_color_bias", (0.0, 0.0, 0.0)), dtype=torch.float32
+    )
+    if matrix.shape != (3, 3):
+        raise ValueError(
+            "rgb_color_matrix must have shape [3, 3], got %s" % (tuple(matrix.shape),)
+        )
+    if bias.shape != (3,):
+        raise ValueError(
+            "rgb_color_bias must have shape [3], got %s" % (tuple(bias.shape),)
+        )
+    if not bool(torch.isfinite(matrix).all()) or not bool(torch.isfinite(bias).all()):
+        raise ValueError("rgb color transform must be finite")
+    return matrix, bias
+
+
+def _load_mesh_rgb_calibration(path: str) -> tuple[float, torch.Tensor, torch.Tensor]:
+    """Load the linear RGB calibration paired with a converted MP3D GLB."""
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    exposure = float(data["light_scale"])
+    if not math.isfinite(exposure) or exposure <= 0.0:
+        raise ValueError(f"invalid light_scale in {path}: {exposure}")
+    cfg = type("MeshRgbCalibration", (), {
+        "rgb_color_matrix": data["rgb_color_matrix"],
+        "rgb_color_bias": data["rgb_color_bias"],
+    })()
+    matrix, bias = _rgb_color_transform(cfg)
+    return exposure, matrix, bias
+
 
 def _batch_cross_2d(a, b):
     return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
@@ -267,6 +333,26 @@ class GenesisSimBackend(ABC):
         enable_4dir_render is False."""
         ...
 
+    def render_4dir_with_depth(self, active_slot_count: int) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Render aligned left/right/behind RGB and depth.
+
+        The RGB order is the legacy simulator order ``[left, right, behind]``.
+        The observation adapter performs the one explicit conversion to LaViRA's
+        canonical ``[front, left, behind, right]`` order.
+        """
+        return self.render_4dir(active_slot_count), None
+
+    def render_panorama_with_depth(
+        self, active_slot_count: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Render the atomic LaViRA 12-turn panorama.
+
+        Returns RGB ``(N,12,H,W,3)``, metric depth ``(N,12,H,W)`` and yaw
+        ``(N,12)``. Frames follow LHX's physical TURN_LEFT order: +30 degrees
+        through +360 degrees. The simulator pose is unchanged on return.
+        """
+        raise NotImplementedError
+
     # --- Health / crash isolation --------------------------------------------
 
     def is_scene_healthy(self) -> bool:
@@ -317,8 +403,24 @@ class GenesisLocalBackend(GenesisSimBackend):
         self._num_envs     = num_envs
         self._cam_w        = int(tuple(getattr(cfg, "cam_res", (640, 480)))[0])
         self._cam_h        = int(tuple(getattr(cfg, "cam_res", (640, 480)))[1])
-        self._fov          = int(getattr(cfg, "fov", 105))
+        # GenArk configs follow Habitat and express horizontal FOV. Genesis'
+        # Camera.fov is vertical, so passing this value through directly gives
+        # the renderer and depth mapper different intrinsics on non-square
+        # images (79 HFOV became 95.4 HFOV at 640x480).
+        self._hfov         = float(getattr(cfg, "fov", 105.0))
+        self._vfov         = _horizontal_to_vertical_fov_deg(
+            self._hfov, self._cam_w, self._cam_h
+        )
         self._light_scale  = float(getattr(cfg, "light_scale", 4.0))
+        self._ambient_light = tuple(float(value) for value in getattr(
+            cfg, "ambient_light", (1.0, 1.0, 1.0)
+        ))
+        if len(self._ambient_light) != 3:
+            raise ValueError("ambient_light must contain exactly three RGB values")
+        self._rgb_color_matrix, self._rgb_color_bias = _rgb_color_transform(cfg)
+        self._rgb_linear_to_srgb = bool(
+            getattr(cfg, "rgb_linear_to_srgb", False)
+        )
         self._enable_4dir  = bool(getattr(cfg, "enable_4dir_render", False))
         self._step_move    = float(getattr(cfg, "step_move", 0.25))
         self._step_turn    = float(getattr(cfg, "step_turn", math.radians(30.0)))
@@ -326,9 +428,18 @@ class GenesisLocalBackend(GenesisSimBackend):
         self._max_step_height = float(getattr(cfg, "max_step_height", 0.5))
         self._agent_radius = float(getattr(cfg, "agent_radius", 0.18))
         self._camera_height = float(getattr(cfg, "camera_height", 1.25))
+        self._depth_min = float(getattr(cfg, "depth_min", 0.0))
+        self._depth_max = float(getattr(cfg, "depth_max", float("inf")))
         self._scene_datasets = str(cfg.init_params.scene_datasets)
         self._glb_cache_dir  = getattr(cfg.init_params, "glb_cache_dir",
                                        "/home/clk/workspace/genark/glb_cache")
+        mp3d_glb_cache_dir = getattr(cfg.init_params, "mp3d_glb_cache_dir", None)
+        self._mp3d_glb_cache_dir = (
+            str(mp3d_glb_cache_dir) if mp3d_glb_cache_dir else None
+        )
+        atlas_dir = getattr(cfg.init_params, "glb_atlas_dir", None)
+        self._glb_atlas_dir = str(atlas_dir) if atlas_dir else None
+        self._glb_atlas_scans = set(getattr(cfg.init_params, "glb_atlas_scans", []))
 
         # Genesis objects — created here, scene built in load_scene()
         try:
@@ -347,13 +458,15 @@ class GenesisLocalBackend(GenesisSimBackend):
             renderer=self._renderer,
             show_viewer=False,
             vis_options=gs.options.VisOptions(
-                ambient_light=(1.0, 1.0, 1.0),
+                ambient_light=self._ambient_light,
                 plane_reflection=False,
             ),
         )
+        # BatchRenderer must register the camera before the GLB entity. Creating
+        # it after the mesh makes the visualizer exit during scene.build().
         self._cam = self._gs_scene.add_camera(
             res=(self._cam_w, self._cam_h),
-            fov=self._fov,
+            fov=self._vfov,
             GUI=False,
         )
         self._gs_ready = False
@@ -396,9 +509,33 @@ class GenesisLocalBackend(GenesisSimBackend):
 
         scan_name = os.path.basename(os.path.dirname(scene_id))
 
-        # Resolve mesh path: GLB cache first, OBJ fallback
+        # Resolve mesh path: converted original MP3D, explicitly opted-in atlas,
+        # normal GLB cache, then OBJ. Keep primitive geometry intact; Genesis
+        # deduplicates shared embedded textures by content.
         glb_path = os.path.join(self._glb_cache_dir, f"{scan_name}.glb")
-        if os.path.exists(glb_path):
+        mp3d_glb_path = (
+            os.path.join(self._mp3d_glb_cache_dir, f"{scan_name}.glb")
+            if self._mp3d_glb_cache_dir else None
+        )
+        atlas_path = (
+            os.path.join(self._glb_atlas_dir, f"{scan_name}.glb")
+            if self._glb_atlas_dir and scan_name in self._glb_atlas_scans
+            else None
+        )
+        use_mp3d_glb = bool(mp3d_glb_path and os.path.exists(mp3d_glb_path))
+        use_atlas = bool(atlas_path and os.path.exists(atlas_path))
+        if use_mp3d_glb:
+            mesh_path = mp3d_glb_path
+            calibration_path = os.path.splitext(mesh_path)[0] + ".render.json"
+            if os.path.exists(calibration_path):
+                (
+                    self._light_scale,
+                    self._rgb_color_matrix,
+                    self._rgb_color_bias,
+                ) = _load_mesh_rgb_calibration(calibration_path)
+        elif use_atlas:
+            mesh_path = atlas_path
+        elif os.path.exists(glb_path):
             mesh_path = glb_path
         else:
             obj_dir   = os.path.join(self._scene_datasets, scan_name, "matterport_mesh")
@@ -410,11 +547,12 @@ class GenesisLocalBackend(GenesisSimBackend):
                 )
             mesh_path = os.path.join(obj_dir, obj_files[0])
 
+        self._mesh_path = mesh_path
         self._gs_scene.add_entity(morph=self._gs.morphs.Mesh(
             file=mesh_path, fixed=True, collision=False,
             file_meshes_are_zup=True,
+            group_by_material=False,
         ))
-
         # Load navmesh and convert to Genesis coordinate system
         navmesh_path = os.path.join(self._scene_datasets, scan_name, "navmesh.npz")
         nm     = np.load(navmesh_path)
@@ -563,7 +701,7 @@ class GenesisLocalBackend(GenesisSimBackend):
     # --- Rendering -----------------------------------------------------------
 
     def _render_and_scale(self, active_slot_count: int) -> torch.Tensor:
-        """Render front view for active slots, apply light scale. Returns GPU tensor."""
+        """Render policy RGB, apply exposure and optional linear-to-sRGB encoding."""
         rgb_raw, _, _, _ = self._cam.render(
             rgb=True, depth=False, segmentation=False, force_render=True
         )
@@ -571,7 +709,14 @@ class GenesisLocalBackend(GenesisSimBackend):
             rgb_float = rgb_raw.float() / 255.0
         else:
             rgb_float = rgb_raw
-        return torch.clamp(rgb_float * self._light_scale * 255.0, 0, 255).byte()
+        rgb_float = rgb_float * self._light_scale
+        rgb_float = torch.einsum(
+            "...c,dc->...d", rgb_float, self._rgb_color_matrix.to(rgb_float.device)
+        ) + self._rgb_color_bias.to(rgb_float.device)
+        rgb_float = torch.clamp(rgb_float, 0.0, 1.0)
+        if self._rgb_linear_to_srgb:
+            rgb_float = _linear_rgb_to_srgb(rgb_float)
+        return torch.round(rgb_float * 255.0).byte()
 
     def _pad_ghost_slots(self, rgb_active: torch.Tensor, active_slot_count: int) -> torch.Tensor:
         """Pad ghost slots with zeros so output shape is always (num_envs, ...)."""
@@ -630,18 +775,17 @@ class GenesisLocalBackend(GenesisSimBackend):
             self._cam_pos_t[:active_slot_count],
             self._cam_yaw_t[:active_slot_count],
         )
-        rgb_raw, depth_raw, _, _ = self._cam.render(
-            rgb=True, depth=True, segmentation=False, force_render=True
+        # Keep policy RGB on the known-stable RGB-only rendering path. Request
+        # depth separately so enabling GroundedSAM projection cannot alter RGB.
+        rgb_active = self._render_and_scale(active_slot_count)
+        _, depth_raw, _, _ = self._cam.render(
+            rgb=False, depth=True, segmentation=False, force_render=False
         )
-        # Apply the same light-scale normalisation as _render_and_scale()
-        if rgb_raw.dtype == torch.uint8:
-            rgb_float = rgb_raw.float() / 255.0
-        else:
-            rgb_float = rgb_raw
-        rgb_active = torch.clamp(rgb_float * self._light_scale * 255.0, 0, 255).byte()
 
         rgb_batch   = self._pad_ghost_slots(rgb_active, active_slot_count).cpu().numpy()
-        depth_active = depth_raw[:active_slot_count].float()
+        depth_active = self._clip_depth_observation(
+            depth_raw[:active_slot_count].float()
+        )
         if active_slot_count < self._num_envs:
             pad_n = self._num_envs - active_slot_count
             pad = torch.zeros(
@@ -652,3 +796,79 @@ class GenesisLocalBackend(GenesisSimBackend):
         else:
             depth_batch = depth_active.cpu().numpy()
         return rgb_batch, depth_batch
+
+    def render_4dir_with_depth(self, active_slot_count: int):
+        """Render extra RGB/depth pairs with matching camera pose for each view."""
+        if not self._enable_4dir or active_slot_count == 0:
+            return None, None
+
+        deltas = [math.radians(90.0), math.radians(-90.0), math.radians(180.0)]
+        front_yaw = self._cam_yaw_t[:active_slot_count]
+        rgb_views, depth_views = [], []
+        for d_yaw in deltas:
+            _update_camera(self._cam, self._cam_pos_t[:active_slot_count], front_yaw + d_yaw)
+            rgb_active = self._render_and_scale(active_slot_count)
+            rgb_views.append(self._pad_ghost_slots(rgb_active, active_slot_count).cpu().numpy())
+            _, depth_raw, _, _ = self._cam.render(
+                rgb=False, depth=True, segmentation=False, force_render=False
+            )
+            depth_active = self._clip_depth_observation(
+                depth_raw[:active_slot_count].float()
+            )
+            if active_slot_count < self._num_envs:
+                pad = torch.zeros(
+                    (self._num_envs - active_slot_count, self._cam_h, self._cam_w),
+                    dtype=torch.float32, device=depth_active.device,
+                )
+                depth_active = torch.cat([depth_active, pad], dim=0)
+            depth_views.append(depth_active.cpu().numpy())
+
+        _update_camera(self._cam, self._cam_pos_t[:active_slot_count], front_yaw)
+        return np.stack(rgb_views, axis=1), np.stack(depth_views, axis=1)
+
+    def render_panorama_with_depth(self, active_slot_count: int):
+        """Render all 12 LHX scan headings without mutating agent state."""
+        rgb_out = np.zeros(
+            (self._num_envs, 12, self._cam_h, self._cam_w, 3), dtype=np.uint8
+        )
+        depth_out = np.zeros(
+            (self._num_envs, 12, self._cam_h, self._cam_w), dtype=np.float32
+        )
+        yaw_out = np.zeros((self._num_envs, 12), dtype=np.float32)
+        if active_slot_count == 0:
+            return rgb_out, depth_out, yaw_out
+
+        front_yaw = self._cam_yaw_t[:active_slot_count].clone()
+        for scan_index in range(12):
+            scan_yaw = front_yaw + self._step_turn * float(scan_index + 1)
+            _update_camera(
+                self._cam,
+                self._cam_pos_t[:active_slot_count],
+                scan_yaw,
+            )
+            rgb_active = self._render_and_scale(active_slot_count)
+            _, depth_raw, _, _ = self._cam.render(
+                rgb=False, depth=True, segmentation=False, force_render=False
+            )
+            rgb_out[:active_slot_count, scan_index] = rgb_active.cpu().numpy()
+            depth_out[:active_slot_count, scan_index] = (
+                self._clip_depth_observation(
+                    depth_raw[:active_slot_count].float()
+                ).cpu().numpy()
+            )
+            yaw_out[:active_slot_count, scan_index] = (
+                scan_yaw.detach().cpu().numpy().astype(np.float32)
+            )
+
+        _update_camera(
+            self._cam,
+            self._cam_pos_t[:active_slot_count],
+            front_yaw,
+        )
+        return rgb_out, depth_out, yaw_out
+
+    def _clip_depth_observation(self, depth: torch.Tensor) -> torch.Tensor:
+        """Apply the configured sensor range without changing legacy defaults."""
+        if self._depth_min > 0.0 or math.isfinite(self._depth_max):
+            return depth.clamp(min=self._depth_min, max=self._depth_max)
+        return depth

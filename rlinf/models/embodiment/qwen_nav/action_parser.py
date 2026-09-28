@@ -26,6 +26,8 @@ import json
 import re
 from typing import Optional
 
+from .canonical_targets import TARGET_REGIONS, normalize_target
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -39,6 +41,12 @@ ACTION_PARSE_FAIL = 4
 # GenArk treats this as format/schema OK for curriculum reward, then falls back
 # to the same MOVE_FORWARD behavior as ACTION_PARSE_FAIL.
 ACTION_SCHEMA_OK_PARSE_FAIL = 5
+# RLinf adapter sentinel for LaViRA's "no action this loop" branch.  It is
+# consumed by GenarkVecEnv without physics, elapsed-step, path, or nav reward.
+ACTION_NOOP = 6
+# Habitat-eval-only sentinel: execute LaViRA's physical 12x TURN_LEFT
+# panorama acquisition, then return the collected F/L/B/R views.
+ACTION_PANORAMA_SCAN = 7
 # Sentinel base for parse_ok + has_valid_bbox_2d: sent = 10 + true_action.
 # 10=stop+bbox, 11=fwd+bbox, 12=left+bbox, 13=right+bbox
 # Env decodes: action >= 10 → has_bbox=True, true_action = action - 10.
@@ -115,7 +123,7 @@ class ParsedAction:
         "action_type", "waypoint_id", "bbox_2d",
         "target", "planning", "reasoning_action", "reasoning_bbox",
         "point_2d", "reasoning_plan_action", "reasoning_bbox_point",
-        "backtrack_valid",
+        "backtrack_valid", "raw_target", "target_region",
     )
 
     def __init__(
@@ -144,6 +152,8 @@ class ParsedAction:
         reasoning_plan_action: str = "",
         reasoning_bbox_point: str = "",
         backtrack_valid: bool = False,
+        raw_target: Optional[str] = None,
+        target_region: str = "any",
     ):
         self.actions = actions
         self.bbox = bbox
@@ -175,6 +185,8 @@ class ParsedAction:
         self.reasoning_plan_action = reasoning_plan_action
         self.reasoning_bbox_point = reasoning_bbox_point
         self.backtrack_valid = backtrack_valid
+        self.raw_target = raw_target if raw_target is not None else target
+        self.target_region = str(target_region or "any")
 
 
 def parse_lavira_json(text: str) -> ParsedAction:
@@ -356,22 +368,8 @@ _WAYPOINT_NAV_DIRECTIONS = {
     "navigate to forward",
     "navigate to left",
     "navigate to right",
+    "navigate to behind",
 }
-
-
-def _normalize_waypoint_action(raw_action: str) -> str:
-    """Accept terse schema action plus harmless natural-language suffixes.
-
-    Qwen occasionally emits strings like
-    "navigate to forward - continue straight ahead".  The prompt still asks for
-    the exact action, but treating the recognized prefix as the action makes the
-    parser robust without broadening the actual action space.
-    """
-    action = raw_action.strip()
-    for allowed in sorted(_WAYPOINT_NAV_DIRECTIONS, key=len, reverse=True):
-        if action == allowed or action.startswith(allowed + " "):
-            return allowed
-    return action
 
 
 def parse_lavira_waypoint_json(text: str) -> ParsedAction:
@@ -381,15 +379,16 @@ def parse_lavira_waypoint_json(text: str) -> ParsedAction:
     Expected schema (7 fields):
       progress_analysis, reasoning_plan_action, planning, action, stop, stair,
       target
-
-    The policy may use target as GroundingDINO/SAM input to produce bbox_2d and
-    point_2d internally. The model is not required to emit geometry.
     """
     if not text:
         return _fallback_waypoint("empty_text")
 
-    json_str = _extract_json_string(text)
-    if json_str is None:
+    # The waypoint template is intentionally a strict contract: one bare JSON
+    # object, no markdown fence or commentary.  Do not reuse the permissive
+    # extractor used by legacy prompt styles here, otherwise non-template
+    # completions silently enter the controller and training batch.
+    json_str = text.strip()
+    if not (json_str.startswith("{") and json_str.endswith("}")):
         return _fallback_waypoint("no_json_found")
 
     try:
@@ -410,17 +409,58 @@ def parse_lavira_waypoint_json(text: str) -> ParsedAction:
             "missing_fields:" + ",".join(missing),
             reward_bits=REWARD_JSON_VALID,
         )
+    actual_fields = tuple(obj.keys())
+    if set(actual_fields) != set(required):
+        unexpected = [k for k in actual_fields if k not in required]
+        return _fallback_waypoint(
+            "unexpected_fields:" + ",".join(unexpected),
+            reward_bits=REWARD_JSON_VALID | REWARD_REQUIRED_FIELDS,
+        )
+    if actual_fields != required:
+        return _fallback_waypoint(
+            "field_order",
+            reward_bits=REWARD_JSON_VALID | REWARD_REQUIRED_FIELDS,
+        )
 
-    raw_action = obj.get("action")
-    stop = bool(obj.get("stop", False))
-    progress = str(obj.get("progress_analysis", ""))[:512]
-    reasoning_plan_action = str(obj.get("reasoning_plan_action", ""))[:512]
-    planning = str(obj.get("planning", ""))[:512]
-    reasoning_bbox_point = str(obj.get("reasoning_bbox_point", ""))[:256]
-    target = str(obj.get("target", ""))[:256]
-    stair = _clean_stair(obj.get("stair", False))
-    bbox_2d = _clean_bbox(obj.get("bbox_2d"))
-    point_2d = _clean_point(obj.get("point_2d"))
+    # Keep the runtime schema as strict as the prompt.  Coercing e.g.
+    # target=false into the string "False" makes malformed outputs look valid
+    # and sends unusable phrases into GroundingDINO/SAM.
+    text_fields = (
+        "progress_analysis",
+        "reasoning_plan_action",
+        "planning",
+        "action",
+        "target",
+    )
+    for field_name in text_fields:
+        if not isinstance(obj[field_name], str):
+            return _fallback_waypoint(
+                f"invalid_type:{field_name}",
+                reward_bits=REWARD_JSON_VALID | REWARD_REQUIRED_FIELDS,
+            )
+    if not isinstance(obj["stop"], bool):
+        return _fallback_waypoint(
+            "invalid_type:stop",
+            reward_bits=REWARD_JSON_VALID | REWARD_REQUIRED_FIELDS,
+        )
+    if obj["stair"] is not False and obj["stair"] not in ("up", "down"):
+        return _fallback_waypoint(
+            "invalid_type:stair",
+            reward_bits=REWARD_JSON_VALID | REWARD_REQUIRED_FIELDS,
+        )
+
+    raw_action = obj["action"]
+    stop = obj["stop"]
+    progress = obj["progress_analysis"][:512]
+    reasoning_plan_action = obj["reasoning_plan_action"][:512]
+    planning = obj["planning"][:512]
+    reasoning_bbox_point = ""
+    target = obj["target"][:256]
+    stair = obj["stair"]
+    # Geometry is produced by GroundedSAM from ``target`` downstream.  The
+    # language model contract deliberately contains no bbox/point fields.
+    bbox_2d = None
+    point_2d = None
 
     if stop:
         return ParsedAction(
@@ -457,6 +497,8 @@ def parse_lavira_waypoint_json(text: str) -> ParsedAction:
     raw_action = raw_action.strip()
     bm = _BACKTRACK_RE.match(raw_action)
     if bm:
+        # Backtracking is fully specified by the waypoint id; no visual
+        # geometry belongs in the model output contract.
         waypoint_id = int(bm.group(1))
         return ParsedAction(
             actions=[],
@@ -483,49 +525,18 @@ def parse_lavira_waypoint_json(text: str) -> ParsedAction:
             reasoning_bbox_point=reasoning_bbox_point,
         )
 
-    raw_action = _normalize_waypoint_action(raw_action)
+    raw_action = raw_action.strip()
     if raw_action not in _WAYPOINT_NAV_DIRECTIONS:
         return _fallback_waypoint(
             f"unknown_direction:{raw_action}",
             schema_ok=True,
             reward_bits=REWARD_JSON_VALID | REWARD_REQUIRED_FIELDS,
         )
-    geometry_ok = False
-    reward_bits = REWARD_SCHEMA_BITS
-    if bbox_2d is not None or point_2d is not None:
-        if bbox_2d is None:
-            return _fallback_waypoint(
-                "invalid_bbox",
-                schema_ok=True,
-                reward_bits=REWARD_JSON_VALID | REWARD_REQUIRED_FIELDS,
-            )
-        if point_2d is None:
-            return _fallback_waypoint(
-                "invalid_point",
-                schema_ok=True,
-                reward_bits=REWARD_JSON_VALID | REWARD_REQUIRED_FIELDS,
-            )
-        if not _bbox_in_range(bbox_2d):
-            return _fallback_waypoint(
-                "bbox_out_of_range",
-                schema_ok=True,
-                reward_bits=REWARD_SCHEMA_BITS,
-            )
-        if not _point_in_range(point_2d):
-            return _fallback_waypoint(
-                "point_out_of_range",
-                schema_ok=True,
-                reward_bits=REWARD_SCHEMA_BITS,
-            )
-        if not _point_inside_bbox(point_2d, bbox_2d):
-            return _fallback_waypoint(
-                "point_outside_bbox",
-                schema_ok=True,
-                reward_bits=REWARD_SCHEMA_BITS,
-            )
-        geometry_ok = True
-        reward_bits |= REWARD_GEOMETRY_VALID
-
+    if not target.strip():
+        return _fallback_waypoint(
+            "empty_navigate_target",
+            reward_bits=REWARD_SCHEMA_BITS,
+        )
     return ParsedAction(
         actions=list(DIRECTION_TO_ACTIONS[raw_action]),
         bbox=None,
@@ -537,8 +548,8 @@ def parse_lavira_waypoint_json(text: str) -> ParsedAction:
         ok=True,
         err=None,
         schema_ok=True,
-        geometry_ok=geometry_ok,
-        reward_bits=reward_bits,
+        geometry_ok=False,
+        reward_bits=REWARD_SCHEMA_BITS,
         action_type="NAVIGATE",
         waypoint_id=None,
         bbox_2d=bbox_2d,
@@ -549,6 +560,122 @@ def parse_lavira_waypoint_json(text: str) -> ParsedAction:
         reasoning_bbox=reasoning_bbox_point,
         reasoning_plan_action=reasoning_plan_action,
         reasoning_bbox_point=reasoning_bbox_point,
+    )
+
+
+def parse_lavira_canonical_waypoint_json(text: str) -> ParsedAction:
+    """Parse the compact canonical target contract used by ``canonical_v1``.
+
+    The navigation/reasoning fields intentionally remain identical to the
+    source waypoint contract.  Only the free-form target is replaced by a
+    canonical class and an image-third selector.
+    """
+    required = (
+        "progress_analysis", "reasoning_plan_action", "planning", "action",
+        "stop", "stair", "target_class", "target_region",
+    )
+    if not text:
+        return _fallback_waypoint("empty_text")
+    raw = text.strip()
+    if not (raw.startswith("{") and raw.endswith("}")):
+        return _fallback_waypoint("no_json_found")
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return _fallback_waypoint(f"json_invalid:{exc.msg}")
+    if not isinstance(obj, dict):
+        return _fallback_waypoint("not_object", reward_bits=REWARD_JSON_VALID)
+    missing = [key for key in required if key not in obj]
+    if missing:
+        return _fallback_waypoint(
+            "missing_fields:" + ",".join(missing), reward_bits=REWARD_JSON_VALID
+        )
+    if tuple(obj.keys()) != required:
+        return _fallback_waypoint(
+            "field_order" if set(obj) == set(required)
+            else "unexpected_fields:" + ",".join(k for k in obj if k not in required),
+            reward_bits=REWARD_JSON_VALID | REWARD_REQUIRED_FIELDS,
+        )
+    for key in ("progress_analysis", "reasoning_plan_action", "planning", "action",
+                "target_class", "target_region"):
+        if not isinstance(obj[key], str):
+            return _fallback_waypoint(
+                f"invalid_type:{key}",
+                reward_bits=REWARD_JSON_VALID | REWARD_REQUIRED_FIELDS,
+            )
+    if not isinstance(obj["stop"], bool):
+        return _fallback_waypoint(
+            "invalid_type:stop",
+            reward_bits=REWARD_JSON_VALID | REWARD_REQUIRED_FIELDS,
+        )
+    if obj["stair"] is not False and obj["stair"] not in ("up", "down"):
+        return _fallback_waypoint(
+            "invalid_type:stair",
+            reward_bits=REWARD_JSON_VALID | REWARD_REQUIRED_FIELDS,
+        )
+
+    progress = obj["progress_analysis"][:512]
+    reasoning = obj["reasoning_plan_action"][:512]
+    planning = obj["planning"][:512]
+    action = obj["action"].strip()
+    stop = obj["stop"]
+    stair = obj["stair"]
+    raw_target = obj["target_class"]
+    target_region = obj["target_region"].strip().lower()
+    if target_region not in TARGET_REGIONS:
+        return _fallback_waypoint(
+            f"invalid_target_region:{target_region}",
+            reward_bits=REWARD_SCHEMA_BITS,
+        )
+
+    if stop:
+        if raw_target.strip() or target_region != "any":
+            return _fallback_waypoint(
+                "stop_target_not_empty", reward_bits=REWARD_SCHEMA_BITS
+            )
+        return ParsedAction(
+            actions=[ACTION_STOP], stop=True, stair=stair, progress=progress,
+            reasoning=reasoning, raw_dir=action if action else None, ok=True,
+            schema_ok=True, geometry_ok=True, reward_bits=REWARD_SCHEMA_BITS,
+            action_type="STOP", target="", raw_target=raw_target,
+            target_region=target_region, planning=planning,
+            reasoning_action=reasoning, reasoning_plan_action=reasoning,
+        )
+
+    backtrack = _BACKTRACK_RE.match(action)
+    if backtrack:
+        if raw_target.strip() or target_region != "any":
+            return _fallback_waypoint(
+                "backtrack_target_not_empty", reward_bits=REWARD_SCHEMA_BITS
+            )
+        return ParsedAction(
+            actions=[], stop=False, stair=stair, progress=progress,
+            reasoning=reasoning, raw_dir=action, ok=True, schema_ok=True,
+            geometry_ok=True, reward_bits=REWARD_SCHEMA_BITS,
+            action_type="BACKTRACK", waypoint_id=int(backtrack.group(1)),
+            target="", raw_target=raw_target, target_region=target_region,
+            planning=planning, reasoning_action=reasoning,
+            reasoning_plan_action=reasoning,
+        )
+
+    if action not in _WAYPOINT_NAV_DIRECTIONS:
+        return _fallback_waypoint(
+            f"unknown_direction:{action}", schema_ok=True,
+            reward_bits=REWARD_JSON_VALID | REWARD_REQUIRED_FIELDS,
+        )
+    canonical, status = normalize_target(raw_target)
+    if canonical is None:
+        return _fallback_waypoint(
+            f"unknown_target:{raw_target}", schema_ok=True,
+            reward_bits=REWARD_SCHEMA_BITS,
+        )
+    return ParsedAction(
+        actions=list(DIRECTION_TO_ACTIONS[action]), stop=False, stair=stair,
+        progress=progress, reasoning=reasoning, raw_dir=action, ok=True,
+        schema_ok=True, geometry_ok=False, reward_bits=REWARD_SCHEMA_BITS,
+        action_type="NAVIGATE", target=canonical, raw_target=raw_target,
+        target_region=target_region, planning=planning,
+        reasoning_action=reasoning, reasoning_plan_action=reasoning,
     )
 
 

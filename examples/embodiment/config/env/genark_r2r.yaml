@@ -15,17 +15,37 @@ video_cfg:
   save_video: True
   video_base_dir: ${runner.logger.log_path}/video/train
 
-# Genesis simulator params (mirror genark configs/uninavid_r2r.yaml)
-camera_height: 1.25
+# Genesis simulator params aligned with Habitat R2R/LaViRA. ``fov`` is the
+# horizontal FOV; GenesisLocalBackend converts it to the renderer's vertical
+# FOV when constructing the camera.
+camera_height: 0.88
 step_move: 0.25
 step_turn: 0.5236  # 30 degrees in radians
 allow_sliding: true
 max_step_height: 0.5
-agent_radius: 0.18
-light_scale: 4.0
-fov: 105
+agent_radius: 0.1
+# Fitted on matched Habitat/Genesis RGB-D captures for QUCTc6BB5sX episode 609.
+# The report records a held-out improvement in linear RGB, sRGB, luminance
+# histogram, and spatial colour metrics.
+light_scale: 4.654899435110308
+ambient_light: [1.0, 1.0, 1.0]
+# gs-madrona returns linear RGB. Habitat observations consumed by LaViRA are
+# sRGB-encoded, so encode after exposure before converting to uint8.
+rgb_linear_to_srgb: true
+# Linear-domain affine correction, applied after exposure and before sRGB.
+rgb_color_matrix: [[1.0770543813705444, 0.0755029246211052, 0.0593072772026062], [0.0, 1.0094290971755981, 0.055043842643499374], [0.0, 0.0, 1.0089589357376099]]
+rgb_color_bias: [-0.009992859326303005, 0.005113284103572369, 0.019223930314183235]
+fov: 79
 cam_res: [640, 480]
+depth_min: 0.1
+depth_max: 5.0
 max_seq_len: 256
+
+# Render depth for left/right/behind in addition to front. Required only by the
+# new LaViRA runtime; disabled by default because it adds renderer work.
+# LaViRA-RFT evaluates blocked directions from the four cardinal depth views.
+# Keep these aligned with the RGB panorama whenever the LaViRA runtime is used.
+enable_4dir_depth_obs: true
 
 # Multi-pass scene traversal offset (rank i picks unique_scenes[(scene_offset+i) % N])
 # Used only when genesis_backend != "multiscene".
@@ -63,7 +83,14 @@ sr_coef:   10.0
 
 # 4-dir rendering: render left/right/behind in addition to front (3× cost).
 # Required by QwenNavPolicy lavira-style prompt; outputs go to extra_view_images.
-enable_4dir_render: false
+# Source LaViRA builds its decision panorama from four cardinal RGB-D views.
+enable_4dir_render: true
+
+# Default-off cumulative wall-time profiling for physics, rendering, and the
+# complete environment step. No observations or simulator calls are changed.
+rollout_profile:
+  enabled: false
+  flush_every: 25
 
 # Phase B1: extra format reward when policy outputs valid bbox_2d (lavira_merged mode).
 # Set >0 to enable. Communicated via action sentinel ACTION_PARSE_OK_HAS_BBOX_BASE=10.
@@ -76,4 +103,11 @@ enable_depth_obs: true
 init_params:
   episodes_file: /home/nvme03/lck/genark/data/datasets/OpenNav_R2R-CE_100_bertidx.json
   scene_datasets: /home/nvme03/lck/genark/scene_datasets
+  # Original MP3D GLBs with Basis textures transcoded for Genesis. Converted
+  # scenes are preferred; missing scenes fall back to glb_cache_dir below.
+  mp3d_glb_cache_dir: /home/clk/workspace/genark/mp3d_original_glb_cache
   glb_cache_dir: /home/clk/workspace/genark/glb_cache
+  # Optional atlas fallback. Native GLBs are preferred with gs-madrona's
+  # texture descriptor capacity raised to 256.
+  glb_atlas_dir: null
+  glb_atlas_scans: []

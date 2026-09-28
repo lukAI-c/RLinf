@@ -104,7 +104,17 @@ def calculate_adv_and_returns(**kwargs) -> tuple[torch.Tensor, Optional[torch.Te
     task_type = kwargs["task_type"]
     if task_type == "embodied":
         kwargs = preprocess_embodied_advantages_inputs(**kwargs)
-        if adv_type != "gae":
+        # Decision-level methods consume the full [decision, batch] reward sequence.
+        # Other non-GAE embodied methods use one trajectory score per sample.
+        if adv_type not in (
+            "gae",
+            "decision_grpo",
+            "decision_maxrl",
+            "decision_rloo",
+            "decision_maxrl_aux_rloo",
+            "decision_rloo_aux_rloo",
+            "decision_terminal_grpo",
+        ):
             kwargs = calculate_scores(**kwargs)
         advantages, returns = fn(**kwargs)
         res = postprocess_embodied_advantages_outputs(

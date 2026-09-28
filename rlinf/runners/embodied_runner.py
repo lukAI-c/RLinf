@@ -267,8 +267,258 @@ class EmbodiedRunner:
                 ranked_metrics_list[rank] = compute_evaluate_metrics(metrics_list)
         return aggregated_metrics, ranked_metrics_list
 
+    def _reinforce_ada_cfg(self):
+        cfg = self.cfg.algorithm.get("reinforce_ada", None)
+        if cfg is None or not bool(cfg.get("enabled", False)):
+            return None
+        return cfg
+
+    def _validate_reinforce_ada_setup(self, cfg) -> None:
+        """Keep v1's channel protocol intentionally narrow and group-safe."""
+        if self.reward is not None:
+            raise ValueError("Reinforce-Ada v1 does not support an external reward worker")
+        if bool(self.cfg.env.train.get("enable_offload", False)):
+            raise ValueError("Reinforce-Ada v1 does not support env.enable_offload")
+        if self.cfg.rollout.pipeline_stage_num != 1:
+            raise ValueError("Reinforce-Ada v1 requires rollout.pipeline_stage_num=1")
+        if len(self.env.worker_info_list) != 1 or len(self.actor.worker_info_list) != 1:
+            raise ValueError(
+                "Reinforce-Ada v1 requires one EnvWorker and one actor rank so a "
+                "success-anchored GRPO group is never split across channels."
+            )
+        overfit_cfg = self.cfg.env.train.get("episode_overfit", None)
+        if bool(cfg.get("only_episode_overfit", True)) and not bool(
+            overfit_cfg and overfit_cfg.get("enabled", False)
+        ):
+            raise ValueError("Reinforce-Ada v1 requires env.train.episode_overfit.enabled=true")
+        if not bool(cfg.get("skip_on_exhaustion", True)):
+            raise ValueError("Reinforce-Ada v1 currently requires skip_on_exhaustion=true")
+        group_size = int(self.cfg.algorithm.group_size)
+        train_group_size = int(cfg.get("train_group_size", group_size))
+        if group_size != train_group_size or train_group_size != 4:
+            raise ValueError(
+                "Reinforce-Ada v1 requires algorithm.group_size=train_group_size=4"
+            )
+        mode = str(cfg.get("mode", "adaptive_pos"))
+        total_envs = int(self.cfg.env.train.total_num_envs)
+        if mode == "static_pos":
+            expected = int(cfg.get("initial_candidates", total_envs))
+        else:
+            expected = int(cfg.get("initial_candidates", 4))
+            retry_batch_size = int(cfg.get("retry_batch_size", expected))
+            if retry_batch_size != expected:
+                raise ValueError(
+                    "Reinforce-Ada v1 uses a fixed physical rollout batch; "
+                    "retry_batch_size must equal initial_candidates."
+                )
+        if total_envs != expected:
+            raise ValueError(
+                f"Reinforce-Ada {mode} requires env.train.total_num_envs={expected}; "
+                f"got {total_envs}."
+            )
+
+    @staticmethod
+    def _merge_attempt_env_metrics(attempt_results: list[dict]) -> dict:
+        metric_dicts = [result for result in attempt_results if result]
+        return compute_evaluate_metrics(metric_dicts) if metric_dicts else {}
+
+    @staticmethod
+    def _curriculum_checkpoint_requested(env_results: list[dict]) -> bool:
+        for result in env_results:
+            if not isinstance(result, dict):
+                continue
+            value = result.get("rft_curriculum_advance_pending")
+            if value is None:
+                continue
+            try:
+                if bool((value > 0).any().item()):
+                    return True
+            except (AttributeError, TypeError):
+                if bool(value):
+                    return True
+        return False
+
+    def _finish_run(self) -> None:
+        self.metric_logger.finish()
+        self.stop_logging = True
+        self.log_queue.join()
+        self.log_thread.join(timeout=1.0)
+
+    def _run_reinforce_ada(self, cfg) -> None:
+        """Collect success-anchored candidates before each actor update.
+
+        An exhausted pool deliberately consumes rollout compute without advancing
+        ``global_step``. This preserves the invariant that one RL step means one
+        actual actor update, not one failed attempt to find a positive example.
+        """
+        self._validate_reinforce_ada_setup(cfg)
+        start_time = time.time()
+        start_step = self.global_step
+        exhausted_groups = 0
+        max_exhausted_groups = int(cfg.get("max_exhausted_groups", 10))
+
+        while self.global_step < self.max_steps:
+            step = self.global_step
+            self.actor.set_global_step(step)
+            self.rollout.set_global_step(step)
+            self.env.set_global_step(step)
+
+            if step % self.weight_sync_interval == 0:
+                with self.timer("sync_weights"):
+                    self.update_rollout_weights()
+
+            attempt_results: list[dict] = []
+            while True:
+                # Retry samples must be fresh draws from the same frozen policy.
+                self.rollout.set_sampling_seed_offset(
+                    step * 10_000 + len(attempt_results)
+                ).wait()
+                attempt_idx = len(attempt_results) + 1
+                with self.timer(f"generate_rollouts_attempt_{attempt_idx}"):
+                    env_handle: Handle = self.env.interact(
+                        input_channel=self.env_channel,
+                        rollout_channel=self.rollout_channel,
+                        reward_channel=None,
+                        actor_channel=None,
+                        candidate_collection=True,
+                    )
+                    rollout_handle: Handle = self.rollout.generate(
+                        input_channel=self.rollout_channel,
+                        output_channel=self.env_channel,
+                    )
+                    payloads = env_handle.wait()
+                    rollout_handle.wait()
+
+                payloads = [payload for payload in payloads if payload is not None]
+                if len(payloads) != 1:
+                    raise RuntimeError(
+                        "Reinforce-Ada v1 expected exactly one EnvWorker outcome, "
+                        f"got {len(payloads)}"
+                    )
+                payload = payloads[0]
+                if not isinstance(payload, dict) or "candidate_outcome" not in payload:
+                    raise RuntimeError("EnvWorker did not return a Reinforce-Ada outcome")
+                attempt_results.append(payload.get("metrics", {}))
+                outcome = payload["candidate_outcome"]
+                status = str(outcome.get("status", ""))
+                if status == "retry":
+                    self.env.reset_reinforce_ada_candidates().wait()
+                    continue
+                if status not in {"ready_train", "exhausted"}:
+                    raise RuntimeError(f"Unknown Reinforce-Ada candidate status: {status!r}")
+                break
+
+            env_metrics_raw = self._merge_attempt_env_metrics(attempt_results)
+            env_metrics = {f"env/{key}": value for key, value in env_metrics_raw.items()}
+
+            if status == "exhausted":
+                exhausted_groups += 1
+                self.env.discard_reinforce_ada_pool().wait()
+                skip_durations = self.timer.consume_durations()
+                rollout_attempt_keys = [
+                    key
+                    for key in skip_durations
+                    if key.startswith("generate_rollouts_attempt_")
+                ]
+                if rollout_attempt_keys:
+                    skip_durations["generate_rollouts"] = sum(
+                        skip_durations.pop(key) for key in rollout_attempt_keys
+                    )
+                skip_time_metrics = {
+                    f"time/{key}": value for key, value in skip_durations.items()
+                }
+                skip_metrics = {
+                    **env_metrics,
+                    **skip_time_metrics,
+                    "grpo/group_skipped_rate": 1.0,
+                    "grpo/hard_prompt_rate": 1.0,
+                    "grpo/exhausted_groups": float(exhausted_groups),
+                }
+                self.metric_logger.log(skip_metrics, step)
+                print(
+                    "[ReinforceAda][skip] "
+                    f"rl_step={step} exhausted_groups={exhausted_groups}/{max_exhausted_groups} "
+                    f"attempts={outcome.get('candidate_attempts')} "
+                    f"candidates={outcome.get('candidate_count')}",
+                    flush=True,
+                )
+                if exhausted_groups >= max_exhausted_groups:
+                    print("[ReinforceAda] exhausted-group budget reached; ending validation run.", flush=True)
+                    break
+                self.env.reset_reinforce_ada_candidates().wait()
+                continue
+
+            exhausted_groups = 0
+            actor_recv_handle: Handle = self.actor.recv_rollout_trajectories(
+                input_channel=self.actor_channel
+            )
+            self.env.emit_reinforce_ada_trajectories(self.actor_channel).wait()
+            actor_recv_handle.wait()
+
+            with self.timer("cal_adv_and_returns"):
+                actor_rollout_metrics = self.actor.compute_advantages_and_returns().wait()
+            actor_training_handle: Handle = self.actor.run_training()
+            actor_training_metrics = actor_training_handle.wait()
+            self.global_step += 1
+
+            rollout_metrics = {
+                f"rollout/{key}": value
+                for key, value in self._aggregate_numeric_metrics(actor_rollout_metrics).items()
+            }
+            training_metrics = {
+                f"train/{key}": value
+                for key, value in self._aggregate_numeric_metrics(actor_training_metrics).items()
+            }
+            durations = self.timer.consume_durations()
+            rollout_attempt_keys = [
+                key for key in durations if key.startswith("generate_rollouts_attempt_")
+            ]
+            if rollout_attempt_keys:
+                durations["generate_rollouts"] = sum(
+                    durations.pop(key) for key in rollout_attempt_keys
+                )
+            time_metrics = {f"time/{key}": value for key, value in durations.items()}
+            self.metric_logger.log(env_metrics, step)
+            self.metric_logger.log(rollout_metrics, step)
+            self.metric_logger.log(training_metrics, step)
+            self.metric_logger.log(time_metrics, step)
+            self.print_metrics_table_async(
+                step,
+                self.max_steps,
+                start_time,
+                {**env_metrics, **rollout_metrics, **training_metrics, **time_metrics},
+                start_step,
+            )
+
+            run_val, save_model, _ = check_progress(
+                self.global_step,
+                self.max_steps,
+                self.cfg.runner.val_check_interval,
+                self.cfg.runner.save_interval,
+                1.0,
+                run_time_exceeded=False,
+            )
+            if run_val:
+                self.update_rollout_weights()
+                eval_metrics = {f"eval/{key}": value for key, value in self.evaluate().items()}
+                self.metric_logger.log(eval_metrics, step)
+            if save_model:
+                self._save_checkpoint()
+
+        self._finish_run()
+
     def run(self):
         if self.cfg.runner.get("only_eval", False):
+            if (
+                self.cfg.runner.get("resume_dir", None)
+                and self.actor is not None
+            ):
+                # Load FSDP weights into vLLM before the frozen rollout.
+                self.update_rollout_weights()
+                # Keep eval sampling identity independent of the resume step
+                # so checkpoint-1200 and global_step_N share the same seeds.
+                self.global_step = 0
+                self.rollout.set_global_step(0)
             eval_metrics = self.evaluate()
             eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
             self.metric_logger.log(data=eval_metrics, step=0)
@@ -290,6 +540,10 @@ class EmbodiedRunner:
             self.log_queue.join()
             self.log_thread.join(timeout=1.0)
             return
+
+        reinforce_ada_cfg = self._reinforce_ada_cfg()
+        if reinforce_ada_cfg is not None:
+            return self._run_reinforce_ada(reinforce_ada_cfg)
 
         start_step = self.global_step
         start_time = time.time()
@@ -338,6 +592,10 @@ class EmbodiedRunner:
                 actor_training_metrics = actor_training_handle.wait()
 
                 self.global_step += 1
+                env_results = env_handle.wait()
+                curriculum_checkpoint = self._curriculum_checkpoint_requested(
+                    env_results
+                )
 
                 run_val, save_model, is_train_end = check_progress(
                     self.global_step,
@@ -371,7 +629,11 @@ class EmbodiedRunner:
                         with open(_metrics_json, "w") as _f:
                             json.dump(_history, _f, indent=2)
 
-                if save_model:
+                if curriculum_checkpoint and not save_model:
+                    self.logger.info(
+                        "Saving checkpoint at curriculum advancement boundary."
+                    )
+                if save_model or curriculum_checkpoint:
                     self._save_checkpoint()
 
             time_metrics = self.timer.consume_durations()
@@ -402,7 +664,6 @@ class EmbodiedRunner:
                     {f"time/reward/{k}": v for k, v in reward_time_metrics.items()}
                 )
 
-            env_results = env_handle.wait()
             env_results_list = [
                 results for results in env_results if results is not None
             ]

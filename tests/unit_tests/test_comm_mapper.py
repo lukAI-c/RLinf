@@ -29,6 +29,10 @@ def _make_obs(start: int, batch_size: int) -> dict:
         "task_descriptions": [
             f"task-{idx}" for idx in range(start, start + batch_size)
         ],
+        "episode_ids": [
+            f"episode-{idx}" for idx in range(start, start + batch_size)
+        ],
+        "trial_ids": list(range(start + 1, start + batch_size + 1)),
     }
 
 
@@ -75,6 +79,23 @@ def test_setup_src_ranks_matches_expected_receive_sizes():
     assert CommMapper.get_src_ranks(
         batch_size=12, src_world_size=2, dst_world_size=3, dst_rank=2
     ) == [(1, 4)]
+
+
+def test_four_env_workers_share_one_rollout_batch():
+    """Habitat shared eval: four one-slot env ranks feed one model rank."""
+    for env_rank in range(4):
+        assert CommMapper.get_dst_ranks(
+            batch_size=4,
+            src_world_size=4,
+            dst_world_size=1,
+            src_rank=env_rank,
+        ) == [(0, 1)]
+    assert CommMapper.get_src_ranks(
+        batch_size=4,
+        src_world_size=4,
+        dst_world_size=1,
+        dst_rank=0,
+    ) == [(0, 1), (1, 1), (2, 1), (3, 1)]
 
 
 def test_build_channel_key_is_stable():
@@ -126,6 +147,10 @@ def test_merge_env_outputs_with_partial_optional_fields():
 
     assert merged["obs"]["states"].shape[0] == 5
     assert len(merged["obs"]["task_descriptions"]) == 5
+    assert merged["obs"]["episode_ids"] == [
+        "episode-0", "episode-1", "episode-100", "episode-101", "episode-102"
+    ]
+    assert merged["obs"]["trial_ids"] == [1, 2, 101, 102, 103]
     assert merged["rewards"].shape[0] == 5
     assert merged["final_obs"] is not None
     assert torch.equal(merged["final_obs"]["states"][:2], env_output_0["obs"]["states"])

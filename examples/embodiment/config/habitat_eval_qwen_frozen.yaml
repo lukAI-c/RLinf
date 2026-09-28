@@ -1,0 +1,214 @@
+# Frozen RLinf QwenNavPolicy evaluation on the Habitat 0.1.7 bridge.
+defaults:
+  - env/genark_r2r@env.train
+  - env/habitat_qwen_remote_r2r@env.eval
+  - model/qwen_nav@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor:
+      placement: "3"
+    rollout:
+      placement: "3"
+    env:
+      placement: "6:0"
+
+runner:
+  task_type: embodied
+  only_eval: true
+  eval_policy_path: null
+  val_check_interval: -1
+  save_interval: 999999
+  max_epochs: 1
+  max_steps: -1
+  logger:
+    log_path: "/home/clk/workspace/results/rlinf_habitat_qwen_frozen"
+    project_name: rlinf
+    experiment_name: "rlinf_habitat_qwen_frozen"
+    logger_backends: ["tensorboard"]
+
+algorithm:
+  rollout_epoch: 1
+  eval_rollout_epoch: 1
+  group_size: 1
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  entropy_type: token_level
+  normalize_advantages: true
+  loss_type: embodied_dagger
+  adv_type: gae
+  recompute_logprobs: false
+  kl_penalty: kl
+  kl_beta: 0.0
+  entropy_bonus: 0.0
+  update_epoch: 1
+  sampling_params:
+    # LHX navigate_or_backtrack() uses temperature=0.0; Genesis frozen eval
+    # uses the same deterministic policy distribution.
+    do_sample: false
+    temperature_train: 0.0
+    temperature_eval: 0.0
+    top_k: 50
+    top_p: 1.0
+    repetition_penalty: 1.0
+    add_BOS: false
+  length_params:
+    max_new_token: null
+    max_length: null
+    min_length: 1
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 1
+  global_batch_size: 1
+  enable_offload: true
+  model:
+    model_type: qwen_nav
+    # Same checkpoint served by LaViRA's opennav_r2r.sh.
+    model_path: /home/lhx/workspace/test_model/output/qwen3.5_v2_unfreeze_vit_nav_target/v0-20260709-081633/checkpoint-1200
+    prompt_style: lavira_waypoint
+    attn_implementation: sdpa
+    history_max_frames: 1
+    min_pixels: 4096
+    max_pixels: 122500
+    # Enables eval-only LHX STOP/retry/backtrack/fallback behavior. The main
+    # seven-field prompt remains VLM_example_ep1799-compatible.
+    lavira_source_prompt_alignment: true
+    use_4dir: true
+    max_new_tokens: 8192
+    chunk_size: 8
+    do_sample: false
+    temperature: 0.0
+    # Match LaViRA's Qwen chat-template invocation.
+    add_vision_id: true
+    json_retry_enabled: true
+    json_retry_max_retries: 5
+    stop_double_check_enabled: true
+    stop_double_check_max_failures: 3
+    stop_double_check_distance_threshold: 1.0
+    history_action_aware: false
+    history_forward_interval: 5
+    history_turn_interval: 2
+    is_lora: false
+    collect_forward_inputs: false
+    skip_rollout_logprobs: true
+    lavira_runtime:
+      enabled: true
+      map_backend: source
+      map_device: cuda
+      initial_scan_turns: 12
+      map_resolution_cm: 5
+      map_size_cm: 2400
+      map_frame_width: 160
+      map_frame_height: 120
+      fmm_goal_threshold_m: 0.75
+      max_steps_to_target: 15
+      hfov_deg: 79.0
+      camera_height: 0.88
+      layered_history: true
+      history_wp_max: 8
+      layered_backtrack_radius_m: 6.0
+      backtrack_second_chance: true
+    grounded_sam:
+      enabled: true
+      dino_config_path: /home/clk/workspace/RLinf/assets/grounded_sam/GroundingDINO_SwinT_OGC.py
+      dino_checkpoint_path: /home/clk/workspace/RLinf/assets/grounded_sam/groundingdino_swint_ogc.pth
+      repvit_sam_checkpoint_path: /home/nvme01/uni-lavira/data/grounded_sam/repvit_sam.pt
+      device: cuda
+      box_threshold: 0.25
+      text_threshold: 0.25
+      max_box_area_ratio: 0.95
+      min_mask_area_px: 16
+      fail_fast_on_missing_assets: true
+      remote:
+        enabled: false
+        endpoints: []
+        slots_per_service: 4
+        timeout_s: 300.0
+      visualize: false
+      visualization_dir: ''
+  fsdp_config:
+    use_orig_params: true
+    cpu_offload: true
+
+rollout:
+  group_name: RolloutGroup
+  backend: vllm_embodied
+  enable_offload: false
+  pipeline_stage_num: 1
+  tensor_parallel_size: 1
+  # Match LaViRA's vLLM server.
+  gpu_memory_utilization: 0.85
+  max_model_len: 32768
+  max_num_seqs: 4
+  mm_processor_kwargs:
+    max_pixels: 122500
+    min_pixels: 4096
+  limit_mm_per_prompt:
+    image: 100
+  mm_encoder_tp_mode: data
+  enforce_eager: true
+  model:
+    model_type: qwen_nav
+    model_path: ${actor.model.model_path}
+    precision: ${actor.model.precision}
+    collect_forward_inputs: false
+    skip_rollout_logprobs: true
+    max_new_tokens: ${actor.model.max_new_tokens}
+    history_every_k: ${actor.model.history_every_k}
+    history_max_frames: ${actor.model.history_max_frames}
+    lavira_source_prompt_alignment: ${actor.model.lavira_source_prompt_alignment}
+    use_4dir: ${actor.model.use_4dir}
+    add_vision_id: ${actor.model.add_vision_id}
+    json_retry_enabled: ${actor.model.json_retry_enabled}
+    json_retry_max_retries: ${actor.model.json_retry_max_retries}
+    stop_double_check_enabled: ${actor.model.stop_double_check_enabled}
+    stop_double_check_max_failures: ${actor.model.stop_double_check_max_failures}
+    stop_double_check_distance_threshold: ${actor.model.stop_double_check_distance_threshold}
+    history_action_aware: ${actor.model.history_action_aware}
+    history_forward_interval: ${actor.model.history_forward_interval}
+    history_turn_interval: ${actor.model.history_turn_interval}
+    chunk_size: ${actor.model.chunk_size}
+    temperature: ${actor.model.temperature}
+    do_sample: ${actor.model.do_sample}
+    trust_remote_code: ${actor.model.trust_remote_code}
+    attn_implementation: ${actor.model.attn_implementation}
+    image_size: ${actor.model.image_size}
+    min_pixels: ${actor.model.min_pixels}
+    max_pixels: ${actor.model.max_pixels}
+    prompt_style: ${actor.model.prompt_style}
+    lavira_runtime: ${actor.model.lavira_runtime}
+    grounded_sam: ${actor.model.grounded_sam}
+    is_lora: false
+
+reward:
+  use_reward_model: false
+critic:
+  use_critic_model: false
+
+# QwenNavPolicy uses one action chunk per decision.  EnvWorker's eval loop
+# counts these chunks from env.eval.max_steps_per_rollout_epoch.
+env:
+  group_name: EnvGroup
+  train:
+    total_num_envs: 1
+    max_decisions_per_rollout_epoch: 20
+  eval:
+    # One action chunk is one policy request.  Keep this aligned with the
+    # dedicated launcher and the Genesis frozen-eval horizon.
+    max_steps_per_rollout_epoch: 300
+    # Habitat's native primitive-action horizon.  The all-episode driver
+    # verifies this value as part of its strict evaluation fingerprint.
+    max_episode_steps: 300

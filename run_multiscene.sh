@@ -53,7 +53,7 @@ if [[ "$1" == "--resume" ]]; then
     fi
 fi
 
-PYTHON=${PYTHON:-/home/clk/miniconda3/envs/genesis/bin/python}
+PYTHON=${PYTHON:-/home/clk/miniconda3/envs/genesis-vllm/bin/python}
 CMD="${PYTHON} ${SRC_FILE} \
     --config-path ${EMBODIED_PATH}/config/ \
     --config-name ${CONFIG_NAME} \

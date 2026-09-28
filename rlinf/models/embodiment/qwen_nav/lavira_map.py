@@ -1,5 +1,10 @@
 """
-P3: occupancy-only map + FMM planner for LaViRA-style navigation.
+LEGACY/DIAGNOSTIC: occupancy-only map + FMM planner for LaViRA-style navigation.
+
+Production LaViRA navigation now runs the byte-identical LHX mapping, Policy,
+and FMM modules vendored in ``rlinf.third_party.lavira_rft.source``. Do not
+extend this file to reproduce LHX behavior. It remains for older Genesis code
+and the explicit ``map_backend=sparse_ab`` diagnostic path only.
 
 Self-contained — no LaViRA or Habitat imports.
 Ported from:
@@ -106,17 +111,21 @@ def _angle_and_direction(
     Returns (angle_degrees, action).
     action: 1=forward, 2=turn_left, 3=turn_right  (GenArk codes)
     """
-    unit_h = heading_vec / (np.linalg.norm(heading_vec) + 1e-8)
-    unit_w = waypoint_vec / (np.linalg.norm(waypoint_vec) + 1e-8)
+    # Keep this body source-identical to lavira-code's
+    # ``utils.map_utils.angle_and_direction``. In particular, the 1e-5
+    # normalization and exact 180-degree branch are part of its action rule.
+    unit_h = heading_vec / (np.linalg.norm(heading_vec) + 1e-5)
+    unit_w = waypoint_vec / (np.linalg.norm(waypoint_vec) + 1e-5)
     cross = float(np.cross(unit_h, unit_w))
-    dot   = float(np.dot(unit_h, unit_w))
-    angle_deg = math.degrees(math.acos(max(-1.0, min(1.0, dot))))
-    half = turn_angle_deg / 2.0
-    if cross > 0 and angle_deg >= (half + 0.01):
-        return angle_deg, 3   # right
-    if cross < 0 and angle_deg >= half:
-        return angle_deg, 2   # left
-    return angle_deg, 1       # forward
+    dot = float(np.dot(unit_h, unit_w))
+    angle_deg = float(np.degrees(np.arccos(dot)))
+    if cross > 0 and angle_deg >= (turn_angle_deg / 2.0 + 0.01):
+        return angle_deg, 3
+    if cross < 0 and angle_deg >= turn_angle_deg / 2.0:
+        return angle_deg, 2
+    if cross == 0 and angle_deg == 180:
+        return angle_deg, 3
+    return angle_deg, 1
 
 
 def _get_nearest_nonzero(arr: np.ndarray, start: np.ndarray) -> np.ndarray:
@@ -296,11 +305,12 @@ class OccupancyMap:
         cam_z_up = (self._cy - v_g) * d / self._fy   # positive = up
         height   = cam_z_up + self._cam_h             # metres above ground
 
-        # World XZ (Habitat) — same formula as lavira_depth_utils.project_bbox_to_world
+        # World XZ (Habitat) — same reflected-right convention as
+        # lavira_depth_utils.project_bbox_to_world.
         heading = -gen_yaw_rad
         cos_h, sin_h = math.cos(heading), math.sin(heading)
-        world_x = hab_x + cam_y * cos_h + cam_x * sin_h
-        world_z = hab_z + cam_y * sin_h - cam_x * cos_h
+        world_x = hab_x + cam_y * cos_h - cam_x * sin_h
+        world_z = hab_z + cam_y * sin_h + cam_x * cos_h
 
         row, col = self._world_to_map(world_x, world_z)
         in_bounds = (
@@ -348,6 +358,32 @@ class OccupancyMap:
         traversible = (self._explored > 0.1).astype(np.float32)
         traversible[obs_dilated > 0] = 0.0
         return traversible
+
+    def mark_forward_collision(
+        self,
+        hab_x: float,
+        hab_z: float,
+        gen_yaw_rad: float,
+        width_m: float = 0.4,
+        length_m: float = 1.5,
+    ) -> None:
+        """Write a forward collision footprint into the accumulated map.
+
+        This is the Genesis adaptation of LaViRA's ``collision_check_fmm``:
+        position is already metric Habitat X/Z, so we paint the local footprint
+        directly instead of reconstructing a Habitat simulator pose.
+        """
+        if not self._initialized:
+            return
+        heading = np.array([math.cos(gen_yaw_rad), math.sin(gen_yaw_rad)])
+        right = np.array([-heading[1], heading[0]])
+        for forward_m in np.arange(0.0, length_m + 1e-6, 0.10):
+            for lateral_m in np.arange(-width_m, width_m + 1e-6, 0.10):
+                point = np.array([hab_x, hab_z]) + heading * forward_m + right * lateral_m
+                row, col = self._single_world_to_map(float(point[0]), float(point[1]))
+                if 0 <= row < GRID_SIZE and 0 <= col < GRID_SIZE:
+                    self._obstacle[row, col] = max(self._obstacle[row, col], 3.0)
+                    self._explored[row, col] = 1.0
 
     # ---- FMM action planning -----------------------------------------------
 

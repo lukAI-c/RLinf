@@ -25,6 +25,11 @@ use_4dir: true                      # build 4 view labels in prompt
 # Must match the blank images used in _init_padding_params.
 # All env renders and history images are resized to this before tokenisation.
 image_size: [448, 448]
+# Fixed replay-buffer capacity is profiled at the real Habitat/Genesis camera
+# aspect ratio. This does not resize source-aligned VLM images.
+forward_input_profile_image_size: [640, 480]
+min_pixels: null
+max_pixels: null
 
 # Inference batching (lower = less VRAM, more generate calls)
 chunk_size: 4 # 4
@@ -46,38 +51,126 @@ collect_forward_inputs: false
 # MUST keep algorithm.recompute_prev_logprobs=True when this is True.
 skip_rollout_logprobs: false
 
-# Phase A: LaViRA merged LA+VA schema (gated, default=off to protect running baseline).
-# Enable merged bbox mode:
-#   ++actor.model.prompt_style=lavira_merged ++actor.model.lavira_controller=true
-# Enable waypoint macro-action mode:
-#   ++actor.model.prompt_style=lavira_waypoint ++actor.model.lavira_controller=true
-prompt_style: "default"        # "default" | "lavira_merged" | "lavira_waypoint"
-merged_la_va: false            # reserved for Phase B API routing (unused in Phase A)
+# LaViRA prompt schema. The semantic-map/FMM implementation is configured by
+# ``lavira_runtime`` below; there is no legacy controller switch.
+prompt_style: "default"        # "default" | "lavira_merged" | "lavira_waypoint" | "canonical_v1"
 record_bbox_diagnostics: true  # log bbox_2d / action_type in diagnostics
 
-# Phase B2: eval-only bbox heading correction (replaces fixed 30° macro, default off)
-# Enable: ++actor.model.bbox_heading_correction=true
-bbox_heading_correction: false
+# Default-off cumulative wall-time profiling. This records only aggregate
+# timing counters and does not alter policy/controller execution order.
+rollout_profile:
+  enabled: false
+  flush_every: 25
 
-# Phase B3 / P1: hybrid-gated controller (train+eval). A geometrically-valid bbox_2d
-# drives a goal-directed primitive queue (placeholder = bbox-center heading until FMM
-# lands in P3); an invalid bbox falls back to the discrete direction macro. Routes
-# through the verified pending_actions variable-length replay path. Default off.
-# Enable: ++actor.model.lavira_controller=true (with prompt_style=lavira_merged)
-lavira_controller: false
+# DITA-style read-only termination judge. The shadow prompt and oracle labels
+# never enter the navigation action/reward path. Enable only for diagnostic runs
+# because its actor-side multimodal forward adds substantial compute.
+termination_shadow:
+  enabled: false
+  collect_only: false
+  output_dir: ""
 
-# Optional Stage-1 LaViRA alignment: GroundingDINO + SAM refines the waypoint
-# target emitted by lavira_waypoint before depth projection / FMM planning.
+# Full LaViRA-RFT semantic-map / waypoint / FMM runtime.
+lavira_runtime:
+  enabled: false
+  # Production uses the pinned LHX mapper and FMM. ``sparse_ab`` is retained
+  # only for same-frame migration diagnostics.
+  map_backend: source
+  # CUDA preserves the original single-environment evaluator default.
+  map_device: cuda
+  initial_scan_turns: 12
+  map_resolution_cm: 5
+  map_size_cm: 2400
+  map_frame_width: 160
+  map_frame_height: 120
+  # LHX outer waypoint lifecycle: 0.75m arrival and 15 primitive-step timeout.
+  target_reached_threshold_m: 0.75
+  fmm_goal_threshold_m: 1.0
+  max_steps_to_target: 15
+  hfov_deg: 105.0
+  camera_height: 1.25
+  # Source evaluator behavior, adapted to RLinf's fixed image-token budget.
+  layered_history: true
+  history_wp_max: 8
+  layered_backtrack_radius_m: 6.0
+  backtrack_second_chance: true
+  # Area targets use free-space RGB-D geometry before falling back to the
+  # unchanged DINO -> LHX bbox/depth-backoff path.
+  area_goal_min_distance_m: 1.5
+  area_goal_max_distance_m: 3.0
+  area_goal_preferred_distance_m: 2.1
+  area_goal_min_ray_ratio: 0.8
+  map_visualization:
+    enabled: false
+    output_dir: ""
+    fmm_fields_output_dir: ""
+    save_raw_every: 0
+    # Rendering is diagnostics-only. Zero preserves legacy every-call output;
+    # training launchers should set a positive interval (for example 50).
+    save_every: 0
+
+# Optional Stage-1 LaViRA alignment: GroundingDINO + SAM supplies semantic-map
+# masks. The model's own point_2d/bbox_2d remains the local FMM target.
 # Default off so Qwen-only eval/RFT does not require DINO/SAM dependencies.
 grounded_sam:
   enabled: false
+  # Execution-only alias normalization for the seven-field LaViRA schema.
+  # This changes only the DINO text query; source bbox selection, projection,
+  # depth backoff, mapper and FMM behavior remain unchanged.
+  canonicalize_lavira_waypoint_query: false
   dino_config_path: ""
   dino_checkpoint_path: ""
-  sam_checkpoint_path: ""
-  sam_encoder_version: "vit_h"
+  repvit_sam_checkpoint_path: ""
   device: "cuda"
   box_threshold: 0.25
   text_threshold: 0.25
   max_box_area_ratio: 0.95
+  waypoint_scene_box_area_ratio: 0.65
+  waypoint_scene_edge_margin_ratio: 0.02
+  # Robust adapter only. Keep false for strict LHX bbox selection.
+  reject_scene_region_source_waypoint: false
   min_mask_area_px: 16
   fail_fast_on_missing_assets: true
+  # Optional standalone service pool. The shared Habitat launcher maps one
+  # service to each scene worker and keeps local inference as the default.
+  remote:
+    enabled: false
+    endpoints: []
+    slots_per_service: 1
+    timeout_s: 300.0
+  # Eval-only diagnostics. When enabled, write source/overlay PNGs and the
+  # model decision plus target/label/bbox/confidence as JSON per LLM decision.
+  visualize: false
+  visualization_dir: ""
+  # Zero means no PNGs; JSON/projection audits remain independent.
+  visualize_every: 0
+
+# Counterfactual foresight research path. All stages are default-off and are
+# intentionally not read by the normal policy/controller execution path.
+cf_foresight:
+  enabled: false
+  shadow_enabled: false
+  actor_aux_enabled: false
+  teacher_endpoint: ""
+  teacher_checkpoint_id: ""
+  confidence_threshold: 1.0e9
+  beta: 0.1
+  clip_eps: 0.2
+  max_candidates: 4
+
+# Immutable V6 decision-state collection. Disabled unless an explicit
+# collector run requests it. P0 additionally enables policy snapshots.
+data_collection:
+  enabled: false
+  output_dir: ""
+  save_source_snapshot: true
+  save_policy_snapshot: false
+  max_decisions_per_episode: 12
+  history_length: 8
+  run_id: ""
+  contract_id: ""
+  policy_do_sample: false
+  policy_sampling_temperature: 0.0
+  policy_sampling_seed: 42
+  policy_history_max_frames: 8
+  guidance_policy_id: ""

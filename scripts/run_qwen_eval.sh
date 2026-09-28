@@ -20,7 +20,7 @@ SCENE_OFFSET=${4:-0}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RLINF_ROOT="$(dirname "$SCRIPT_DIR")"
-CONDA_PYTHON="/home/clk/miniconda3/envs/genesis/bin/python"
+CONDA_PYTHON="/home/clk/miniconda3/envs/genesis-vllm/bin/python"
 EMBODIED_PATH="$RLINF_ROOT/examples/embodiment"
 
 # Pre-flight cleanup

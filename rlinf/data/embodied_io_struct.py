@@ -91,25 +91,29 @@ class EnvOutput:
         )
 
     def prepare_observations(self, obs: dict[str, Any]) -> dict[str, Any]:
-        image_tensor = obs["main_images"] if "main_images" in obs else None
-        wrist_image_tensor = obs["wrist_images"] if "wrist_images" in obs else None
-        extra_view_image_tensor = (
-            obs["extra_view_images"] if "extra_view_images" in obs else None
+        observation_keys = (
+            "main_images",
+            "wrist_images",
+            "extra_view_images",
+            "states",
+            "task_descriptions",
+            "scan_images",
+            "scan_depth_images",
+            "scan_states",
+            "scan_valid",
+            "episode_active",
+            "episode_ids",
+            "trial_ids",
+            # Read-only NavigationWM collection metadata. These fields are
+            # never consumed by the actor loss or environment transition.
+            "scene_ids",
+            "simulator_positions",
         )
-        states = obs["states"] if "states" in obs else None
-        task_descriptions = (
-            list(obs["task_descriptions"])
-            if "task_descriptions" in obs and obs["task_descriptions"] is not None
-            else None
-        )
-
-        return {
-            "main_images": image_tensor,  # [N_ENV, H, W, C]
-            "wrist_images": wrist_image_tensor,  # [N_ENV, H, W, C] or [N_ENV, N_IMG, H, W, C]
-            "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
-            "states": states,
-            "task_descriptions": task_descriptions,
-        }
+        prepared = {key: obs.get(key) for key in observation_keys}
+        for key in ("task_descriptions", "episode_ids", "trial_ids", "scene_ids"):
+            if prepared[key] is not None:
+                prepared[key] = list(prepared[key])
+        return prepared
 
     @staticmethod
     def merge_env_outputs(env_outputs: list[dict]) -> dict[str, Any]:
@@ -390,6 +394,12 @@ class Trajectory:
     prev_logprobs: torch.Tensor = None
     prev_values: torch.Tensor = None
     versions: torch.Tensor = None
+    # [1, B, 1] binary terminal verifier outcome. For navigation MaxRL this is
+    # strictly clean STOP success, never proximity at timeout.
+    episode_success: torch.Tensor = None
+    # [1, B, 1] Euclidean terminal navigation score. Optional; required by
+    # decision_terminal_grpo. Never a geodesic / navmesh quantity.
+    episode_terminal_score: torch.Tensor = None
     forward_inputs: dict[str, Any] = field(default_factory=dict)
 
     curr_obs: dict[str, Any] = field(default_factory=dict)
@@ -535,6 +545,11 @@ class EmbodiedRolloutResult:
         default_factory=list
     )  # trajectory_length + rollout_epoch
     versions: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
+    # [1, B, 1] binary terminal verifier outcome. Navigation assigns one only
+    # for an explicit STOP inside the success radius.
+    episode_success: torch.Tensor = None
+    # [1, B, 1] Euclidean terminal navigation score, frozen with episode_success.
+    episode_terminal_score: torch.Tensor = None
     forward_inputs: list[dict[str, Any]] = field(
         default_factory=list
     )  # trajectory_length
@@ -665,6 +680,12 @@ class EmbodiedRolloutResult:
             )
         if len(self.versions) > 0:
             trajectory.versions = torch.stack(self.versions, dim=0).cpu().contiguous()
+        if self.episode_success is not None:
+            trajectory.episode_success = self.episode_success.cpu().contiguous()
+        if self.episode_terminal_score is not None:
+            trajectory.episode_terminal_score = (
+                self.episode_terminal_score.cpu().contiguous()
+            )
         if len(self.forward_inputs) > 0:
             trajectory.forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
             for key in trajectory.forward_inputs.keys():

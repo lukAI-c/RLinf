@@ -401,6 +401,27 @@ class _RecordingSub:
         self._maybe_crash("4dir")
         return np.zeros((self._k, 3, self._cam_h, self._cam_w, 3), dtype=np.uint8)
 
+    def render_panorama_with_depth_async(self, k_s):
+        self.log.append(("submit", self.idx))
+        return ("panorama", self.idx)
+
+    def fetch_render_panorama_with_depth(self, ref):
+        self.log.append(("fetch", self.idx))
+        self._maybe_crash("panorama")
+        return (
+            np.full(
+                (self._k, 12, self._cam_h, self._cam_w, 3),
+                self.idx,
+                dtype=np.uint8,
+            ),
+            np.full(
+                (self._k, 12, self._cam_h, self._cam_w),
+                self.idx,
+                dtype=np.float32,
+            ),
+            np.full((self._k, 12), self.idx, dtype=np.float32),
+        )
+
 
 def _bare_multiscene(layout, subs, cam_h=4, cam_w=4):
     """Construct a MultiSceneBackend without running __init__ (which needs Ray)."""
@@ -438,6 +459,27 @@ class TestConcurrentDispatch:
         ms.step_physics(torch.zeros(12, dtype=torch.int64),
                         torch.ones(12, dtype=torch.bool), 12)
         self._assert_submit_before_fetch(log, 3)
+
+    def test_panorama_parallel_dispatch_and_scatter(self):
+        layout = SceneLayout.build(
+            ["s0", "s1", "s2"], [50, 50, 50], num_envs=12, group_size=2
+        )
+        log = []
+        subs = [_RecordingSub(s, log, layout.sizes[s]) for s in range(3)]
+        ms = _bare_multiscene(layout, subs)
+
+        rgb, depth, yaw = ms.render_panorama_with_depth(12)
+
+        self._assert_submit_before_fetch(log, 3)
+        assert rgb.shape == (12, 12, 4, 4, 3)
+        assert depth.shape == (12, 12, 4, 4)
+        assert yaw.shape == (12, 12)
+        for scene_idx, (offset, size) in enumerate(
+            zip(layout.offsets, layout.sizes)
+        ):
+            assert np.all(rgb[offset:offset + size] == scene_idx)
+            assert np.all(depth[offset:offset + size] == scene_idx)
+            assert np.all(yaw[offset:offset + size] == scene_idx)
 
     def test_render_main_parallel_dispatch(self):
         layout = SceneLayout.build(["s0", "s1", "s2"], [50, 50, 50],
